@@ -1,4 +1,4 @@
-"""GET /api/window - the propagated future, in one request.
+"""The propagated future, in one request. Served by GET /api/window.
 
 WHY A WINDOW INSTEAD OF A LIVE FEED. The obvious design for a moving map is a
 WebSocket pushing positions at 1 Hz. That is not available here: this runs on
@@ -24,14 +24,11 @@ and compares a clock against given intervals, which is presentation, not physics
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
 
-from _lib import passes as passlib
-from _lib import satellites as satlib
-from _lib import seed
+from . import passes as passlib
+from . import satellites as satlib
+from . import seed
 
 # Sampling step for satellite positions. A 780 km satellite moves ~70 km in 10 s,
 # which sounds like a lot until you convert it: 0.63 degrees along track, with a
@@ -97,45 +94,3 @@ def build_window(start: datetime, minutes: float) -> dict:
         "tracks": tracks,
         "passes": links,
     }
-
-
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 - name fixed by the runtime
-        query = parse_qs(urlparse(self.path).query)
-
-        raw_from = (query.get("from") or [None])[0]
-        try:
-            start = (
-                datetime.fromisoformat(raw_from.replace("Z", "+00:00"))
-                if raw_from
-                else datetime.now(timezone.utc)
-            )
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return self._send(400, {"error": "from must be an ISO 8601 instant"})
-
-        try:
-            minutes = float((query.get("minutes") or [DEFAULT_WINDOW_MINUTES])[0])
-        except ValueError:
-            return self._send(400, {"error": "minutes must be a number"})
-        minutes = max(1.0, min(MAX_WINDOW_MINUTES, minutes))
-
-        try:
-            payload = build_window(start, minutes)
-        except satlib.PropagationError as exc:
-            return self._send(500, {"error": str(exc)})
-
-        return self._send(200, payload)
-
-    def _send(self, status: int, body: dict):
-        raw = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("cache-control", "no-store")
-        self.send_header("content-length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def log_message(self, *args):  # keep function logs clean
-        pass

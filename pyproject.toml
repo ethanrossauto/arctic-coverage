@@ -1,0 +1,23 @@
+[project]
+name = "arctic-coverage"
+version = "0.1.0"
+# Vercel's Python builder reads BOTH the interpreter version and the dependency
+# list from here, not from requirements.txt. The first deploy built "successfully"
+# with an empty dependency list and would have failed at import time.
+requires-python = ">=3.12"
+dependencies = [
+    "sgp4==2.27",
+    "fastapi==0.141.1",
+]
+
+[project.optional-dependencies]
+# skyfield is the independent implementation the hand-written transforms are
+# verified against. It is a TEST dependency on purpose and must never reach the
+# deployed bundle: shipping it would mean the thing being checked and the thing
+# checking it were installed together.
+dev = ["skyfield", "pytest", "uvicorn[standard]", "httpx"]
+
+# Vercel's current Python runtime wants ONE ASGI entrypoint rather than a handler
+# per file under api/. See the note in api/index.py.
+[tool.vercel]
+entrypoint = "api.index:app"

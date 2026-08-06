@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Arctic Coverage - runtime check</title>
+<style>body{background:#0b0f14;color:#c9d6e2;font:14px/1.5 ui-monospace,monospace;margin:2rem}pre{white-space:pre-wrap}</style>
+</head>
+<body>
+<h1>Arctic Coverage</h1>
+<p>Stage 0 runtime check: does the Python function propagate real TLEs on Vercel?</p>
+<pre id="out">requesting /api/window ...</pre>
+<script>
+fetch('/api/window?minutes=30').then(r=>r.json()).then(w=>{
+  const t=w.tracks[0], s=t.samples[0];
+  document.getElementById('out').textContent =
+    `mask: ${w.mask_deg} deg\nsites: ${w.sites.length}\nsatellites: ${w.tracks.length}`+
+    `\nsamples per satellite: ${t.samples.length}\npass intervals: ${w.passes.length}`+
+    `\n\nfirst sample of ${t.name}: t+${s[0]}s  lat ${s[1]}  lon ${s[2]}  alt ${s[3]} km`+
+    `\n\nfirst pass:\n${JSON.stringify(w.passes[0],null,2)}`;
+}).catch(e=>{document.getElementById('out').textContent='FAILED: '+e});
+</script>
+</body></html>

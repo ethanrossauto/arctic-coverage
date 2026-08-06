@@ -1,0 +1,48 @@
+/* Plain CSS, one file, no framework. An operations display, not a website:
+   monospace throughout, dense, high contrast, nothing decorative. */
+:root {
+  --bg: #050a10;
+  --panel: #0b1219e6;
+  --line: #1d2d3a;
+  --text: #c9d6e2;
+  --dim: #6b8296;
+  --accent: #7fe3c0;
+  --warn: #ffd166;
+  --err: #ff6b6b;
+}
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  -webkit-font-smoothing: antialiased;
+}
+.app { position: relative; height: 100%; }
+.map { position: absolute; inset: 0; }
+.maplibregl-canvas { outline: none; }
+
+.strip {
+  position: absolute; left: 0; right: 0;
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 12px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--line);
+  z-index: 5;
+}
+.strip.bottom { top: auto; bottom: 0; border-bottom: 0; border-top: 1px solid var(--line); }
+.brand { color: var(--accent); letter-spacing: 0.14em; font-weight: 600; }
+.sep { flex: 0 0 1px; height: 14px; background: var(--line); }
+.clock { color: var(--warn); letter-spacing: 0.06em; }
+.dim { color: var(--dim); margin-left: auto; }
+.err { color: var(--err); }
+b { color: #fff; font-weight: 600; }
+
+button {
+  font: inherit; color: var(--text);
+  background: #0f1a24; border: 1px solid var(--line);
+  padding: 4px 10px; cursor: pointer; letter-spacing: 0.06em;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: default; }

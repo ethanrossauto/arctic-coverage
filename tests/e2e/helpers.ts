@@ -48,15 +48,25 @@ export function collectPageProblems(page: Page): PageProblems {
 }
 
 /**
- * Wait until the server's window has arrived and reached the UI.
+ * Wait until the world has arrived from the server and reached the UI.
  *
- * Keyed on the satellite count in the status strip rather than on a timeout,
- * because that number can only be non-zero once the fetch resolved, the payload
- * parsed and React rendered. It is the shortest honest proof that the whole
- * chain from Python to the DOM is intact.
+ * Keyed on the asset count in the status strip rather than on a timeout, because
+ * that number can only be non-zero once the fetch resolved, the payload parsed and
+ * React rendered. It is the shortest honest proof that the whole chain from Python
+ * through Postgres to the DOM is intact.
  */
-export async function waitForWindowLoaded(page: Page): Promise<void> {
-  await page.getByText(/sats\s+\d+/).waitFor({ state: "visible", timeout: 30_000 });
+export async function waitForAppLoaded(page: Page): Promise<void> {
+  await page.getByText(/assets\s+\d+/).waitFor({ state: "visible", timeout: 30_000 });
+}
+
+/**
+ * Wait until the vendored ice measurements have been decoded and drawn.
+ *
+ * Separate from the asset wait on purpose: the two load independently, and a test
+ * about the ice must not pass merely because the assets arrived.
+ */
+export async function waitForIceLoaded(page: Page): Promise<void> {
+  await page.locator(".timebar .icedate").waitFor({ state: "visible", timeout: 30_000 });
 }
 
 /** The playback clock as the UI renders it, parsed back into a Date. */

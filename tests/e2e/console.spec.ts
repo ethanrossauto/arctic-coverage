@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { collectPageProblems, waitForWindowLoaded } from "./helpers";
+import { collectPageProblems, waitForAppLoaded } from "./helpers";
 
 /**
  * The cheapest high-value test in the repo.
@@ -17,7 +17,7 @@ test("the page loads with no console errors and no failed requests", async ({ pa
   const problems = collectPageProblems(page);
 
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
 
   // Give MapLibre a beat past first paint: style validation errors surface during
   // source and layer setup, which happens after the DOM is ready.
@@ -28,7 +28,7 @@ test("the page loads with no console errors and no failed requests", async ({ pa
   expect(problems.failedRequests, "failed network requests").toEqual([]);
 });
 
-test("the basemap and window data both load, and nothing is fetched off-origin", async ({
+test("the basemap and the world both load, and nothing is fetched off-origin", async ({
   page,
 }) => {
   /**
@@ -48,19 +48,24 @@ test("the basemap and window data both load, and nothing is fetched off-origin",
   const gotBasemap = page.waitForResponse(
     (r) => r.url().includes("/data/land.json") && r.status() === 200,
   );
-  const gotWindow = page.waitForResponse(
-    (r) => r.url().includes("/api/window") && r.status() === 200,
+  const gotEntities = page.waitForResponse(
+    (r) => r.url().includes("/api/entities") && r.status() === 200,
+  );
+  // The ice is a vendored file rather than an endpoint, and that is the point: the
+  // measurements ship with the app, so no service can be down for them.
+  const gotIce = page.waitForResponse(
+    (r) => r.url().includes("/data/ice.json") && r.status() === 200,
   );
 
   pageOrigin = new URL(test.info().project.use.baseURL!).origin;
   await page.goto("/");
   await gotBasemap;
-  const windowRes = await gotWindow;
+  const entities = await (await gotEntities).json();
+  const ice = await (await gotIce).json();
 
-  const body = await windowRes.json();
-  expect(body.tracks.length, "satellites in the window").toBeGreaterThan(0);
-  expect(body.sites.length, "ground sites").toBe(5);
-  expect(body.mask_deg, "the project-wide elevation mask").toBe(15);
+  expect(entities.entities.length, "seeded entities").toBe(68);
+  expect(ice.kind, "the ice layer must be measured, never modelled").toBe("measured");
+  expect(ice.dates.length, "vendored measurement dates").toBeGreaterThan(50);
 
   await page.waitForTimeout(1000);
   expect(offOrigin, "requests to third-party hosts").toEqual([]);

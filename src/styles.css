@@ -52,21 +52,121 @@ button:disabled { opacity: 0.4; cursor: default; }
 b.warn { color: var(--warn); }
 b.alert { color: var(--err); }
 
-/* The season control. `color-scheme: dark` is what makes a native date input render
-   dark; without it Chromium draws a white box with a white calendar icon on a dark
-   strip, which looks like a rendering bug rather than a control. */
-.datectl {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3em;
-  color-scheme: dark;
-}
-.datectl input {
-  background: #10202c;
-  color: #cfe3ee;
-  border: 1px solid #24404f;
-  border-radius: 2px;
-  font: inherit;
-  padding: 1px 4px;
-}
 .ok { color: #bcdff0; }
+
+/* ---- the historical ice timebar ----------------------------------------------
+   Sits directly above the status strip rather than inside it. It needs the full
+   width to be scrubbable, and a control you drag wants more room than one you read.
+   `color-scheme: dark` makes the native range thumb render dark; without it
+   Chromium draws a light thumb that looks like a rendering fault on this palette. */
+.timebar {
+  position: absolute; left: 0; right: 0; bottom: 33px;
+  display: flex; align-items: center; gap: 12px;
+  padding: 7px 12px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border-top: 1px solid var(--line);
+  color-scheme: dark;
+  z-index: 5;
+}
+.timebar .scrub { position: relative; flex: 1 1 auto; }
+.timebar input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+/* Year labels under the track. Absolutely positioned by fraction, and translated
+   back by half their own width so the text centres on the tick rather than
+   starting at it. The first and last are nudged inward by the clamp so neither
+   runs off the end of the bar. */
+.timebar .ticks {
+  position: relative; height: 11px; margin-top: 2px;
+}
+.timebar .ticks span {
+  position: absolute; top: 0;
+  transform: translateX(-50%);
+  font-size: 9px; letter-spacing: 0.08em;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.timebar .icedate {
+  color: var(--accent);
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  min-width: 8.5em;      /* fixed so the bar does not twitch as the month changes */
+  text-align: right;
+}
+.timebar .caveat { margin-left: 0; flex: 0 0 auto; }
+.timebar .play, .timebar .stepbtn { padding: 3px 9px; }
+.timebar .play { min-width: 3em; }
+
+/* ---- the command surface -----------------------------------------------------
+   Bottom left, above the timebar, and deliberately the widest thing on screen that
+   is not the map: it is the primary interface, and a command line squeezed into a
+   corner reads as an afterthought. */
+.cmdwrap {
+  position: absolute; left: 12px; bottom: 78px;
+  width: min(560px, calc(100% - 24px));
+  display: flex; flex-direction: column; gap: 6px;
+  z-index: 6;
+}
+
+.activity {
+  display: flex; flex-direction: column; gap: 3px;
+  max-height: 40vh; overflow-y: auto;
+  padding: 8px 10px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+}
+.activity .entry { display: flex; gap: 7px; align-items: baseline; line-height: 1.45; }
+.activity .marker { color: var(--dim); flex: 0 0 auto; }
+.activity .etext { flex: 1 1 auto; overflow-wrap: anywhere; }
+.activity .entry.user .etext { color: var(--accent); }
+.activity .entry.system .etext { color: var(--text); }
+.activity .entry.bad .etext { color: var(--err); }
+
+/* 🔑 The tier is shown per line because "the model is only called when it earns its
+   latency" is the central design claim. On screen it is checkable by anyone using the
+   thing, rather than a sentence in a README that has to be taken on trust. */
+.activity .tier {
+  flex: 0 0 auto;
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 1px 5px; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--dim);
+}
+.activity .tier.llm { color: var(--warn); border-color: #4a3f22; }
+
+.cmdbar {
+  display: flex; gap: 8px; align-items: center;
+  padding: 7px 8px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+}
+.cmdinput {
+  flex: 1 1 auto;
+  font: inherit;
+  background: #0b141c; color: var(--text);
+  border: 1px solid var(--line);
+  padding: 5px 8px;
+}
+.cmdinput:focus { outline: none; border-color: var(--accent); }
+.cmdinput::placeholder { color: var(--dim); }
+.cmdinput:disabled { opacity: 0.6; }
+
+.cmdbar .mic { padding: 4px 9px; }
+/* Recording is the one state that must be unmistakable, since it means a microphone
+   is live. Red plus a pulse, and the same red used for the alert case elsewhere. */
+.cmdbar .mic.live {
+  border-color: var(--err); color: var(--err);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse { 50% { opacity: 0.45; } }
+
+.micerr { color: var(--err); padding-left: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cmdbar .mic.live { animation: none; }
+}

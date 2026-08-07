@@ -64,13 +64,32 @@ X0, Y0 = -3850000.0, 5850000.0
 EARTH_R = 6378273.0
 ECC = 0.081816153
 
-# ⚠️ THE OUTPUT GRID IS NOT THE SOURCE GRID. Reprojecting 136,192 polar-stereographic cells
-# into lat/lon per date and shipping them all would be both large and pointless: this app
-# looks at one corner of the Arctic. The source is resampled onto the same lat/lon grid the
-# renderer already draws, so the client's decoder is unchanged from the modelled version.
+# ⚠️ THE OUTPUT GRID IS NOT THE SOURCE GRID. The source is resampled onto a lat/lon grid
+# the renderer can draw directly, so the client decodes one byte per cell and no more.
+#
+# 🔴 IT IS CIRCUMPOLAR, AND THAT IS NOT GREED. An earlier version covered only the Canadian
+# sector, 55N to 84N and 170W to 45W, on the reasoning that this app looks at one corner of
+# the Arctic. Both bounds turned out to be visible defects on a pole-centred camera, which
+# is the default view:
+#
+#   * Stopping at 84N left an unexplained void at the centre of the screen. Worse, it meant
+#     the real pole hole (the region the instrument genuinely cannot see, above about 87N)
+#     never appeared in the data at all, so the legend explained something that was not
+#     being drawn.
+#   * Stopping at 45W and 170W cut the ice off along two straight meridians, which reads as
+#     a rendering fault to anyone who has seen an ice chart.
+#
+# Full longitude coverage is required near the pole regardless: every meridian converges
+# there, so a partial box can only ever draw a wedge.
+# ⚠️ THESE ARE CELL ORIGINS, NOT EDGES, and each cell spans one further step north and
+# east. So the northern bound is 89.5 rather than 90.0: the top row then covers 89.5 to
+# exactly 90.0 and stops at the pole. Setting it to 90.0 produces a final row spanning
+# 90.0 to 90.5, which is not a latitude, and polygons past the pole render as garbage in
+# the middle of the default camera view.
+# The eastern bound closes the circle the same way: 178.5 spans to exactly 180.0.
 OUT_LAT_STEP, OUT_LON_STEP = 0.5, 1.5
-OUT_SOUTH, OUT_NORTH = 55.0, 84.0
-OUT_WEST, OUT_EAST = -170.0, -45.0
+OUT_SOUTH, OUT_NORTH = 55.0, 89.5
+OUT_WEST, OUT_EAST = -180.0, 178.5
 
 
 def grid_to_latlon(col: int, row: int) -> tuple[float, float]:

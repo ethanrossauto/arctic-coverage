@@ -9,6 +9,14 @@
 #
 # ⚠️ python-dotenv is deliberately absent. Only scripts/ reads .env.local; nothing under
 # api/ imports it, and the runtime bundle should not carry what it never calls.
-sgp4==2.27
+#
+# 🔴 anthropic AND google-genai ARE RUNTIME DEPENDENCIES, NOT OPTIONAL EXTRAS. Both are
+# imported lazily inside the functions that use them, so a missing one degrades to
+# "that layer is unavailable" instead of crashing the app. That soft failure is correct
+# behaviour and it is also very good at hiding this exact mistake: `anthropic` was
+# absent from both manifests for the whole life of the reasoning layer, so tier 2 could
+# never have answered anything, anywhere, and reported itself merely "unavailable".
 fastapi==0.141.1
 psycopg[binary]==3.3.4
+anthropic==0.120.2
+google-genai==2.17.0

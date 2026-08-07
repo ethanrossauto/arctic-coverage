@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { landPixelFraction, readClock, waitForWindowLoaded } from "./helpers";
+import { landPixelFraction, readClock, waitForAppLoaded, waitForIceLoaded } from "./helpers";
 
 /**
  * Does the console actually work? Six questions, none of which any other test in
@@ -24,7 +24,7 @@ test("the map paints real geometry, not a flat background", async ({ page }) => 
    * appear unless the source loaded, the worker parsed it and the GPU drew it.
    */
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
   // A healthy polar view is roughly a quarter land. A broken one is zero.
   await expect
     .poll(() => landPixelFraction(page), { timeout: 30_000, intervals: [500] })
@@ -33,23 +33,20 @@ test("the map paints real geometry, not a flat background", async ({ page }) => 
 
 test("server data reaches the UI", async ({ page }) => {
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
 
   const footer = page.locator(".strip.bottom");
-  await expect(footer).toContainText("mask");
-  await expect(footer).toContainText("15");
-  await expect(footer).toContainText("sats 3");
-  // The window must contain passes, or the demo has nothing to show. This is the
-  // UI-side echo of the Python scenario test that guards the constellation's
-  // inclination.
-  await expect(footer).toContainText(/\d+ in window/);
-  const text = (await footer.innerText()).match(/(\d+) in window/);
-  expect(Number(text?.[1] ?? 0), "pass intervals in the window").toBeGreaterThan(0);
+  // The mesh is computed per request rather than stored, so its arrival in the UI
+  // proves the derivation ran, not that a column was read back.
+  await expect(footer).toContainText(/mesh \d+ links/);
+  const text = await footer.innerText();
+  expect(Number(text.match(/mesh (\d+) links/)?.[1] ?? 0), "computed radio links").toBeGreaterThan(0);
+  expect(Number(text.match(/(\d+) groups/)?.[1] ?? 0), "connected groups").toBeGreaterThan(0);
 });
 
 test("the playback clock advances", async ({ page }) => {
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
 
   const first = await readClock(page);
   await page.waitForTimeout(2500);
@@ -61,29 +58,74 @@ test("the playback clock advances", async ({ page }) => {
   ).toBeGreaterThan(1000);
 });
 
-test("fast forward jumps the clock to the next event", async ({ page }) => {
+test("the ice timebar scrubs to a different measurement and the map follows", async ({ page }) => {
   /**
-   * The demo-insurance feature, and the one most likely to break silently. It
-   * works because the client already holds every pass interval in the window, so
-   * the jump is a scan of an array rather than a request. If that ever regresses
-   * into a round trip, or the event list arrives empty, this test fails while the
-   * page still looks fine.
+   * 🥇 The assertion that guards the layer's one claim. Moving the control has to
+   * change BOTH the date shown and the extent reported, because those come from
+   * different places: the date is the snapped measurement, the extent was computed
+   * on the source grid at build time. A decoder that silently returned the same
+   * frame for every date would still move the label and would fail here.
+   *
+   * March against September is chosen deliberately. The Arctic maximum is roughly
+   * four times the minimum, so this is a gap no rounding or off-by-one can produce.
    */
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForIceLoaded(page);
 
-  await page.getByRole("button", { name: /PAUSE/ }).click(); // freeze real advance
-  const before = await readClock(page);
+  const slider = page.locator(".timebar input[type=range]");
+  const dateLabel = page.locator(".timebar .icedate");
+  const footer = page.locator(".strip.bottom");
 
-  const nextEvent = page.getByRole("button", { name: /NEXT EVENT/ });
-  await expect(nextEvent).toBeEnabled();
-  await nextEvent.click();
+  const extentNow = async () =>
+    Number((await footer.innerText()).match(/ice ([\d.]+)M/)?.[1] ?? 0);
 
-  const after = await readClock(page);
-  const jumpS = (after.getTime() - before.getTime()) / 1000;
-  // A jump, not a tick: the clock is paused, so any movement at all is the
-  // feature working, and a real gap to the next AOS or LOS is seconds to minutes.
-  expect(jumpS, "clock should jump forward").toBeGreaterThan(1);
+  // Walk to a March and to a September by reading the label rather than by
+  // assuming an index, so the test survives the vendored range being extended.
+  const max = Number(await slider.getAttribute("max"));
+  let march = -1;
+  let september = -1;
+  for (let i = 0; i <= max; i++) {
+    await slider.fill(String(i));
+    const label = await dateLabel.innerText();
+    if (march < 0 && label.startsWith("MAR")) march = i;
+    if (september < 0 && label.startsWith("SEP")) september = i;
+    if (march >= 0 && september >= 0) break;
+  }
+  expect(march, "a March measurement must be reachable").toBeGreaterThanOrEqual(0);
+  expect(september, "a September measurement must be reachable").toBeGreaterThanOrEqual(0);
+
+  await slider.fill(String(march));
+  await expect(dateLabel).toContainText("MAR");
+  const winter = await extentNow();
+
+  await slider.fill(String(september));
+  await expect(dateLabel).toContainText("SEP");
+  const summer = await extentNow();
+
+  expect(winter, "March extent").toBeGreaterThan(12);
+  expect(summer, "September extent").toBeLessThan(7);
+  expect(winter, "winter must carry far more ice than summer").toBeGreaterThan(summer * 1.5);
+});
+
+test("the timebar only ever offers dates that were actually measured", async ({ page }) => {
+  /**
+   * The control is an index into the vendored list, not a date picker, so every
+   * position on it is a day a satellite flew. This asserts the property that makes
+   * the layer's claim honest: you cannot land on a date nobody observed.
+   */
+  await page.goto("/");
+  await waitForIceLoaded(page);
+
+  const gotIce = await page.evaluate(async () => {
+    const r = await fetch("/data/ice.json");
+    return (await r.json()).dates as string[];
+  });
+
+  const slider = page.locator(".timebar input[type=range]");
+  expect(Number(await slider.getAttribute("max")) + 1, "one stop per measurement").toBe(
+    gotIce.length,
+  );
+  expect(await slider.getAttribute("step"), "the control must snap").toBe("1");
 });
 
 test("the projection toggle switches between globe and mercator without erroring", async ({
@@ -96,7 +138,7 @@ test("the projection toggle switches between globe and mercator without erroring
    * silently does nothing if made at the wrong moment.
    */
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
 
   const toggle = page.getByRole("button", { name: /GLOBE|MERCATOR/ });
   await expect(toggle).toHaveText("GLOBE");
@@ -124,11 +166,11 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
    * would start dropping assets.
    */
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
   await expect(page.locator(".strip.bottom")).toContainText("view all longitudes");
 });
 
-test("all six asset kinds load and reach the map", async ({ page }) => {
+test("all seven asset kinds load and reach the map", async ({ page }) => {
   /**
    * The asset picture is the point of the application, so its arrival is asserted
    * end to end rather than inferred from the map not being blank.
@@ -145,9 +187,17 @@ test("all six asset kinds load and reach the map", async ({ page }) => {
 
   const counts: Record<string, number> = {};
   for (const a of body.entities) counts[a.kind] = (counts[a.kind] ?? 0) + 1;
-  expect(counts).toEqual({ node: 24, patrol: 3, uas: 5, hydrophone: 10, vessel: 8, radar: 12 });
+  expect(counts).toEqual({
+    node: 24,
+    patrol: 3,
+    uas: 5,
+    hydrophone: 10,
+    vessel: 8,
+    radar: 12,
+    launch_site: 6,
+  });
 
-  await expect(page.locator(".strip.bottom")).toContainText("assets 62");
+  await expect(page.locator(".strip.bottom")).toContainText("assets 68");
 });
 
 test("the two non-broadcasting contacts are surfaced and are the only ones", async ({ page }) => {
@@ -180,7 +230,7 @@ test("overdue assets are counted, and it is neither none nor all of them", async
    * is overdue makes it meaningless. This asserts the designed middle.
    */
   await page.goto("/");
-  await waitForWindowLoaded(page);
+  await waitForAppLoaded(page);
   const footer = page.locator(".strip.bottom");
   await expect(footer).toContainText(/overdue \d+/);
   const text = await footer.innerText();

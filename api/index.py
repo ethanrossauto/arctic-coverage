@@ -23,8 +23,6 @@ grep finds it.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -35,15 +33,13 @@ from ._lib import llm as llmlib
 from ._lib import ratelimit
 from ._lib import parser
 from ._lib import tools as toollib
-from ._lib import satellites as satlib
 from ._lib import mesh as meshlib
-from ._lib import seed
-from ._lib import window_builder
+from ._lib import transcribe
 
 app = FastAPI(
     title="Arctic Coverage",
     description=(
-        "Satellite coverage planning for deployable Arctic sensor nodes."
+        "Situational awareness for deployable Arctic sensor networks."
     ),
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
@@ -54,8 +50,8 @@ app = FastAPI(
 def healthz() -> dict:
     """Liveness, plus enough detail to tell WHICH build answered.
 
-    The seed counts are here deliberately: during the first deploys the useful
-    question was never "is it up" but "is it running the code I think it is".
+    During the first deploys the useful question was never "is it up" but "is it
+    running the code I think it is", so this says enough to tell builds apart.
     """
     return {
         "ok": True,
@@ -63,47 +59,8 @@ def healthz() -> dict:
         # database is not" apart from "the app is down", which was exactly the gap that made
         # a broken deploy on 2026-08-07 diagnosable only from provider logs.
         "database": db.status(),
-        "sites": len(seed.SEED_SITES),
-        "seed_satellites": len(seed.SEED_TLES),
         "spend": ratelimit.status(),
-        "mask_deg": seed.DEFAULT_MASK_DEG,
-        "tle_epoch": seed.TLE_EPOCH.date().isoformat(),
     }
-
-
-@app.get("/api/window")
-def window(
-    from_: str | None = Query(
-        None,
-        alias="from",
-        description="ISO 8601 instant to start the window at. Defaults to now.",
-    ),
-    minutes: float = Query(
-        window_builder.DEFAULT_WINDOW_MINUTES,
-        ge=1,
-        le=window_builder.MAX_WINDOW_MINUTES,
-        description="Window length. Clamped at the endpoint, not in the tool layer, "
-        "because this is a raw GET that anything can call.",
-    ),
-) -> JSONResponse:
-    """Sampled satellite positions plus exact pass intervals for a time window."""
-    if from_:
-        try:
-            start = datetime.fromisoformat(from_.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(400, "from must be an ISO 8601 instant")
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-    else:
-        start = datetime.now(timezone.utc)
-
-    try:
-        payload = window_builder.build_window(start, minutes)
-    except satlib.PropagationError as exc:
-        # A propagation failure is a real answer about the orbit, not a crash.
-        raise HTTPException(500, str(exc)) from exc
-
-    return JSONResponse(payload, headers={"cache-control": "no-store"})
 
 
 @app.get("/api/entities")
@@ -333,6 +290,62 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
     outcome["tier"] = tier
     outcome["plan"] = plan
     return JSONResponse(outcome, headers={"cache-control": "no-store"})
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(request: Request) -> JSONResponse:
+    """Audio in, one line of text out. The text then goes to /api/command like any other.
+
+    🔑 METERED BY THE SAME GUARD AS TIER 2, and for the same reason: this is the other
+    path that costs money per call. The deterministic command path stays free, so nothing
+    a visitor does with the keyboard can be throttled.
+
+    ⚠️ Takes a raw body rather than multipart. The browser has the blob already and
+    multipart would mean a parser dependency for one field.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else None)
+
+    if not ratelimit.origin_allowed(request.headers.get("origin")):
+        return JSONResponse(
+            {"ok": False, "detail": "voice is not available from this origin"},
+            status_code=200, headers={"cache-control": "no-store"},
+        )
+    verdict = ratelimit.check(client_ip)
+    if not verdict.allowed:
+        db.log_event(
+            tool="rate_limited", source="voice", result="rejected",
+            params={"scope": verdict.scope, "used": verdict.used, "limit": verdict.limit},
+            detail=verdict.reason,
+        )
+        return JSONResponse(
+            {"ok": False, "detail": verdict.reason},
+            status_code=200, headers={"cache-control": "no-store"},
+        )
+
+    audio = await request.body()
+    try:
+        out = transcribe.transcribe(audio, request.headers.get("content-type"))
+    except transcribe.TranscriptionError as exc:
+        # An honest "voice is unavailable" rather than a 500. Typing still works, and the
+        # attempt is logged because "the microphone did not work" is worth being able to
+        # see afterwards.
+        db.log_event(
+            tool="transcribe", source="voice", result="rejected",
+            params={"audio_bytes": len(audio)}, detail=str(exc)[:400],
+        )
+        return JSONResponse(
+            {"ok": False, "detail": str(exc)},
+            status_code=200, headers={"cache-control": "no-store"},
+        )
+
+    db.log_event(
+        tool="transcribe", source="voice", tier="llm", result="ok",
+        params={k: v for k, v in out.items() if k != "text"},
+        detail=out["text"],
+        latency_ms=out["latency_ms"],
+    )
+    return JSONResponse({"ok": True, "text": out["text"]}, headers={"cache-control": "no-store"})
 
 
 @app.get("/api/tools")

@@ -9,7 +9,7 @@
  *      limit us, no key to expire, no third party to be down at the wrong moment.
  *   2. Over the Canadian Arctic a street-level basemap shows almost nothing. What
  *      carries meaning here is the coastline, the grid, and where the assets are.
- *   3. It reads as an operations display rather than as a web map with satellites
+ *   3. It reads as an operations display rather than as a web map with markers
  *      drawn on top, which is what it is.
  *
  * ⚠️ MAPLIBRE 6.1+ IS REQUIRED, NOT PREFERRED. Every v5 release rendered GeoJSON
@@ -50,8 +50,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // broken build ship.
 maplibreConfig.WORKER_URL = "/maplibre/maplibre-gl-worker.mjs";
 
-import { linksAt, useStore } from "../store";
-import { positionAt } from "../playback";
+import { useStore } from "../store";
 import { viewportBbox } from "./bounds";
 import { buildIcons, iconImageExpression, ICON_PIXEL_RATIO } from "./icons";
 
@@ -84,10 +83,6 @@ const COLOR = {
   // The satellite cannot see the pole. Its own colour, because rendering an unmeasured
   // area as either ice or ocean would be inventing a measurement.
   icePoleHole: "#3a3f52",
-  site: "#7fe3c0",
-  siteDown: "#4a6b7c",
-  satellite: "#ffd166",
-  link: "#7fe3c0",
 };
 
 /** Where the camera starts: straight down at the pole, the whole Arctic in frame. */
@@ -204,30 +199,6 @@ export function GlobeMap() {
 
       // Live layers. Added here rather than in the style so their data can be
       // replaced every frame from the store.
-      for (const [id, spec] of [
-        ["links", { type: "line", paint: { "line-color": COLOR.link, "line-width": 1.4, "line-opacity": 0.85 } }],
-        ["ground-tracks", { type: "line", paint: { "line-color": COLOR.satellite, "line-width": 1, "line-opacity": 0.35, "line-dasharray": [2, 2] } }],
-      ] as const) {
-        m.addSource(id, { type: "geojson", data: emptyFC() });
-        m.addLayer({ id, source: id, ...(spec as object) } as never);
-      }
-      for (const [id, color, radius] of [
-        ["sites", COLOR.site, 5],
-        ["satellites", COLOR.satellite, 4],
-      ] as const) {
-        m.addSource(id, { type: "geojson", data: emptyFC() });
-        m.addLayer({
-          id,
-          type: "circle",
-          source: id,
-          paint: {
-            "circle-radius": radius,
-            "circle-color": ["case", ["get", "linked"], color, COLOR.siteDown],
-            "circle-stroke-width": 1,
-            "circle-stroke-color": "#0b1219",
-          },
-        });
-      }
       // ---- asset layers -------------------------------------------------
       // TWO layers for five kinds, not five layers, driven by data expressions.
       // A layer per kind would mean five sources to keep in step and five style
@@ -425,65 +396,33 @@ export function GlobeMap() {
     m.setProjection({ type: projection === "globe" ? "globe" : "mercator" });
   }, [projection]);
 
+  // ---- a command asked the camera to move ----------------------------------
+  /**
+   * 🔑 The store carries a DOMAIN target (a latitude, a longitude, a zoom), never a
+   * MapLibre camera object. That is the same rule the rest of the store follows, and it
+   * is what lets the executor decide where to look without knowing what draws it.
+   *
+   * `flyTo` rather than `jumpTo` deliberately: when the camera moves in response to a
+   * command, the movement is the feedback. A jump leaves the operator working out
+   * whether the view changed or the data did.
+   */
+  const camera = useStore((s) => s.camera);
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !camera) return;
+    m.flyTo({
+      center: camera.center,
+      zoom: camera.zoom ?? m.getZoom(),
+      duration: 1200,
+      essential: true,
+    });
+  }, [camera]);
+
   // ---- redraw the live layers whenever the clock moves ---------------------
   useEffect(() => {
     const unsub = useStore.subscribe((s) => {
       const m = map.current;
-      if (!m || !ready.current || !s.window) return;
-
-      const elapsed = (s.simClock - s.window.start) / 1000;
-      const active = linksAt(s.window, s.simClock);
-      const linkedSites = new Set(active.map((p) => p.siteId));
-
-      const satPositions = new globalThis.Map<string, { lat: number; lon: number }>();
-      const satFeatures = [];
-      for (const track of s.window.tracks) {
-        const pos = positionAt(track, elapsed);
-        if (!pos) continue;
-        satPositions.set(track.satelliteId, pos);
-        satFeatures.push(
-          point([pos.lon, pos.lat], {
-            id: track.satelliteId,
-            name: track.name,
-            linked: active.some((p) => p.satelliteId === track.satelliteId),
-          }),
-        );
-      }
-      setData(m, "satellites", satFeatures);
-
-      setData(
-        m,
-        "sites",
-        s.window.sites.map((site) =>
-          point([site.lon, site.lat], {
-            id: site.id,
-            name: site.name,
-            linked: linkedSites.has(site.id),
-          }),
-        ),
-      );
-
-      // A link is drawn only while it is up, and "up" comes from exact interval
-      // boundaries rather than from sampled elevation, so it appears on the frame
-      // the pass actually begins.
-      setData(
-        m,
-        "links",
-        active.flatMap((p) => {
-          const site = s.window!.sites.find((x) => x.id === p.siteId);
-          const sat = satPositions.get(p.satelliteId);
-          if (!site || !sat) return [];
-          return [
-            line(
-              [
-                [site.lon, site.lat],
-                [sat.lon, sat.lat],
-              ],
-              { siteId: p.siteId, satelliteId: p.satelliteId },
-            ),
-          ];
-        }),
-      );
+      if (!m || !ready.current) return;
 
       // Assets. Converted from domain objects to GeoJSON here and nowhere else,
       // which is what keeps the store free of map-library shapes.
@@ -551,13 +490,6 @@ export function GlobeMap() {
         );
       }
 
-      // Ground tracks: the whole window's path, so the shape of the orbit reads
-      // even when nothing is currently linked.
-      setData(
-        m,
-        "ground-tracks",
-        s.window.tracks.flatMap((t) => splitAtAntimeridian(t.samples.map((x) => [x.lon, x.lat]))),
-      );
     });
     return unsub;
   }, []);

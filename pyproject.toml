@@ -12,18 +12,18 @@ version = "0.1.0"
 # must be kept in step with requirements.txt, and requirements.txt is what ships.
 requires-python = ">=3.12"
 dependencies = [
-    "sgp4==2.27",
     "fastapi==0.141.1",
     "psycopg[binary]==3.3.4",
+    "anthropic==0.120.2",
+    "google-genai==2.17.0",
     "python-dotenv==1.2.2",
 ]
 
 [project.optional-dependencies]
-# skyfield is the independent implementation the hand-written transforms are
-# verified against. It is a TEST dependency on purpose and must never reach the
-# deployed bundle: shipping it would mean the thing being checked and the thing
-# checking it were installed together.
-dev = ["skyfield", "pytest", "uvicorn[standard]", "httpx"]
+# skyfield was the independent implementation the hand-written orbital transforms were
+# checked against. Both it and sgp4 went when the satellite layer did; nothing imports
+# either now, and a dependency nobody imports is one more thing to install and audit.
+dev = ["pytest", "uvicorn[standard]", "httpx"]
 
 # Vercel's current Python runtime wants ONE ASGI entrypoint rather than a handler
 # per file under api/. See the note in api/index.py.

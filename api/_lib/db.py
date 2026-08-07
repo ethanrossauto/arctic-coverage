@@ -20,10 +20,20 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
-import psycopg
-from psycopg.rows import dict_row
+if TYPE_CHECKING:  # import only for the type annotation on connect()
+    import psycopg
+
+# ⚠️ psycopg IS IMPORTED LAZILY, INSIDE connect(). It used to be imported here at module
+# scope, and on 2026-08-07 that took the entire deployed API down: the driver was missing
+# from requirements.txt, so importing this module raised ModuleNotFoundError, which meant
+# `api/index.py` failed to import, which meant EVERY route returned 500 including
+# /api/healthz and /api/window, neither of which touches the database.
+#
+# A database problem should degrade the database endpoints and nothing else. Deferring the
+# import to the first connection is what makes that true, and it costs one dict lookup per
+# call.
 
 
 def _database_url() -> str:
@@ -45,10 +55,32 @@ def _database_url() -> str:
 
 
 @contextmanager
-def connect() -> Iterator[psycopg.Connection]:
+def connect() -> Iterator["psycopg.Connection"]:
     """A connection with dict rows and prepared statements disabled."""
+    import psycopg
+    from psycopg.rows import dict_row
+
     with psycopg.connect(_database_url(), prepare_threshold=None, row_factory=dict_row) as conn:
         yield conn
+
+
+def status() -> dict[str, Any]:
+    """Is the database reachable, and does it have the world in it?
+
+    Exists because the outage above was diagnosable only from Vercel's runtime logs. One
+    curl of /api/healthz should be able to tell "the app is up but the database is not"
+    apart from "the app is down", and before this it could not.
+
+    Never raises: a health endpoint that fails when the thing it reports on fails is not a
+    health endpoint.
+    """
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("select count(*) as n from entities")
+            row = cur.fetchone()
+        return {"reachable": True, "entities": int(row["n"])}
+    except Exception as exc:  # noqa: BLE001 - deliberately broad; see the docstring
+        return {"reachable": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 def fetch_entities(kind: str | None = None) -> list[dict[str, Any]]:

@@ -52,6 +52,10 @@ def healthz() -> dict:
     """
     return {
         "ok": True,
+        # Reported rather than assumed: this endpoint exists to tell "the app is up but the
+        # database is not" apart from "the app is down", which was exactly the gap that made
+        # a broken deploy on 2026-08-07 diagnosable only from provider logs.
+        "database": db.status(),
         "sites": len(seed.SEED_SITES),
         "seed_satellites": len(seed.SEED_TLES),
         "mask_deg": seed.DEFAULT_MASK_DEG,

@@ -1,9 +1,15 @@
 [project]
 name = "arctic-coverage"
 version = "0.1.0"
-# Vercel's Python builder reads BOTH the interpreter version and the dependency
-# list from here, not from requirements.txt. The first deploy built "successfully"
-# with an empty dependency list and would have failed at import time.
+# ⚠️ CORRECTION, 2026-08-07. An earlier version of this comment claimed Vercel reads the
+# dependency list from here rather than from requirements.txt. That is WRONG, and it cost a
+# broken production deploy: psycopg was listed below, absent from requirements.txt, and the
+# build installed exactly the requirements.txt set. Every route then 500'd on
+# ModuleNotFoundError at import.
+#
+# What is true: Vercel takes the INTERPRETER VERSION and the ENTRYPOINT from here, and
+# installs from requirements.txt. The list below is for local tooling and for humans; it
+# must be kept in step with requirements.txt, and requirements.txt is what ships.
 requires-python = ">=3.12"
 dependencies = [
     "sgp4==2.27",

@@ -1,2 +1,14 @@
+# 🔴 THIS FILE IS WHAT VERCEL ACTUALLY INSTALLS. Verified the hard way: pyproject.toml
+# listed psycopg and this file did not, the build reported "Resolved 11 packages" (exactly
+# the set below with its transitive deps, and no psycopg), and every route in the deployed
+# app then returned 500 with ModuleNotFoundError at import time.
+#
+# So the two files have different jobs and BOTH have to be right:
+#   requirements.txt  what the deployed function gets
+#   pyproject.toml    the interpreter version, the Vercel entrypoint, and local tooling
+#
+# ⚠️ python-dotenv is deliberately absent. Only scripts/ reads .env.local; nothing under
+# api/ imports it, and the runtime bundle should not carry what it never calls.
 sgp4==2.27
 fastapi==0.141.1
+psycopg[binary]==3.3.4

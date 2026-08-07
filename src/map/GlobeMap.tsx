@@ -25,20 +25,22 @@ import { useEffect, useRef } from "react";
 // MapLibre v6 removed the default export; everything is a named import now.
 import { config as maplibreConfig, Map as MapLibreMap, type GeoJSONSource } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-// 🔴 MapLibre parses ALL geometry in a web worker, and v6 loads that worker by a
-// relative URL resolved against its own dist directory. A bundler that inlines the
-// main entry does not emit the worker file, so the request 404s at runtime, no
-// geometry is ever parsed, and the map renders NOTHING while the rest of the page
-// works perfectly and no exception is thrown.
+// 🔴 MapLibre parses ALL geometry in a web worker, and it must be told where that
+// worker lives. Get this wrong and the map renders NOTHING while the rest of the
+// page works perfectly and no exception is thrown, which is how a blank globe
+// reached the live site once already.
 //
-// This bit twice, in dev and then again in the production bundle, and the second
-// time it reached the live site. Vite's `?url` suffix emits the worker as a real
-// asset and hands back its hashed path; config.WORKER_URL is MapLibre's supported
-// way to be told about it. Excluding maplibre-gl from optimizeDeps fixes dev only,
-// so it is not a substitute for this.
-import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
-
-maplibreConfig.WORKER_URL = workerUrl;
+// v6 ships the worker as TWO files: maplibre-gl-worker.mjs imports
+// maplibre-gl-shared.mjs by a relative path at runtime. Neither is reachable via
+// the package's main entry, so a bundler that inlines the entry emits neither.
+// scripts/copy-maplibre-worker.mjs copies both into public/maplibre/ side by side,
+// so the worker's own import resolves. Read that file for the two approaches that
+// failed first.
+//
+// The path is absolute and identical in dev and production, deliberately: the
+// earlier fixes behaved differently in the two, and that difference is what let a
+// broken build ship.
+maplibreConfig.WORKER_URL = "/maplibre/maplibre-gl-worker.mjs";
 
 import { linksAt, useStore } from "../store";
 import { positionAt } from "../playback";

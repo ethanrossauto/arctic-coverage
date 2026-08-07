@@ -11,7 +11,10 @@
     "test:py": "pytest tests/ -q",
     "test": "npm run test:js && npm run test:py && npm run test:e2e",
     "test:e2e": "playwright test",
-    "test:e2e:prod": "PLAYWRIGHT_BASE_URL=https://coverage.skryer.ca playwright test"
+    "test:e2e:prod": "PLAYWRIGHT_BASE_URL=https://coverage.skryer.ca playwright test",
+    "copy:worker": "node scripts/copy-maplibre-worker.mjs",
+    "predev": "npm run copy:worker",
+    "prebuild": "npm run copy:worker"
   },
   "dependencies": {
     "maplibre-gl": "^6.1.0",

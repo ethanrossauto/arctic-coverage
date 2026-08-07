@@ -15,9 +15,9 @@ The chain, in order:
     station geodetic -> ECEF            forward transform
     (target_ECEF - station_ECEF) -> ENU -> azimuth / elevation / slant range
 
-WHAT IS DELIBERATELY OMITTED, and what it costs. Stated here because a reviewer
-will ask, and because "I didn't know" and "I decided it didn't matter" are very
-different answers:
+WHAT IS DELIBERATELY OMITTED, and what it costs. Written down because "I didn't
+know" and "I decided it didn't matter" are very different answers, and only one of
+them is still true a year later:
 
   * Polar motion (the x_p, y_p wobble of the rotation axis in the crust). This
     is the ONLY real omission in TEME->ECEF. Worth about 15 m of ground

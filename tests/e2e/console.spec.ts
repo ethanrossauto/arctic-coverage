@@ -60,7 +60,7 @@ test("the basemap and window data both load, and nothing is fetched off-origin",
   const body = await windowRes.json();
   expect(body.tracks.length, "satellites in the window").toBeGreaterThan(0);
   expect(body.sites.length, "ground sites").toBe(5);
-  expect(body.mask_deg, "the mask from the brief").toBe(15);
+  expect(body.mask_deg, "the project-wide elevation mask").toBe(15);
 
   await page.waitForTimeout(1000);
   expect(offOrigin, "requests to third-party hosts").toEqual([]);

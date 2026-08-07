@@ -1,8 +1,8 @@
 /**
  * The viewport bounding box contract, and why it is not just `map.getBounds()`.
  *
- * "Show me assets in the current zoom window" is one of the example commands in
- * the brief, and it is unanswerable unless the client tells the server what it is
+ * "Show me assets in the current zoom window" is one of the commands this app
+ * supports, and it is unanswerable unless the client tells the server what it is
  * currently looking at. That makes this small file part of the command pipeline,
  * not part of the map.
  *

@@ -117,7 +117,7 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
   /**
    * The viewport contract, asserted end to end.
    *
-   * "Show me assets in the current zoom window" is one of the brief's own example
+   * "Show me assets in the current zoom window" is one of the supported example
    * commands, and on a globe looking down at the pole the honest answer for
    * longitude is "all of them". MapLibre returns exactly that, and the command
    * layer has to carry it rather than treat it as a bug. This is the app's DEFAULT

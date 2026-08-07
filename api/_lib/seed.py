@@ -3,7 +3,7 @@
 🔴 WHY THESE SATELLITES, AND WHY IT IS NOT A COSMETIC CHOICE.
 
 A satellite's ground track never reaches further from the equator than its
-inclination, and at the brief's 15 degree elevation mask a satellite at 780 km
+inclination, and at a 15 degree elevation mask a satellite at 780 km
 is only visible within about 1737 km of a site. Put those together against the
 seeded sites:
 
@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from .geometry import Geodetic
 from .satellites import Satellite, from_tle
 
-# The mask the brief specifies. One definition, referenced everywhere.
+# The project-wide elevation mask. One definition, referenced everywhere.
 DEFAULT_MASK_DEG = 15.0
 
 TLE_EPOCH = datetime(2026, 8, 6, tzinfo=timezone.utc)

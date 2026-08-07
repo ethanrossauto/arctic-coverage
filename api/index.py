@@ -35,8 +35,7 @@ from ._lib import window_builder
 app = FastAPI(
     title="Arctic Coverage",
     description=(
-        "Satellite coverage planning for deployable Arctic sensor nodes. "
-        "Declared assessment scenario: Problem 3, LLM-based user interface."
+        "Satellite coverage planning for deployable Arctic sensor nodes."
     ),
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",

@@ -1,7 +1,7 @@
 """Pass finding: when can a given site actually see a given satellite.
 
 A "pass" here is a contiguous interval during which the satellite sits above the
-site's elevation mask. The brief sets that mask at 15 degrees.
+site's elevation mask, which this project fixes at 15 degrees.
 
 Method, and why it is two-part:
 
@@ -253,5 +253,5 @@ def _dedupe(passes: list[Pass]) -> list[Pass]:
 
 
 def cumulative_link_seconds(passes: list[Pass]) -> float:
-    """Total time above the mask. The 'cumulative link-up time' the brief asks for."""
+    """Total time above the mask, i.e. cumulative link-up time for the window."""
     return sum(p.duration_s for p in passes)

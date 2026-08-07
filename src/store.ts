@@ -16,7 +16,7 @@
  */
 import { create } from "zustand";
 
-import type { Asset } from "./assets";
+import type { Asset, IceLayer, MeshStatus } from "./assets";
 import type { Site, Window } from "./api";
 import type { PassInterval } from "./playback";
 import type { ViewportBbox } from "./map/bounds";
@@ -25,8 +25,21 @@ export type Projection = "globe" | "mercator";
 
 interface State {
   window: Window | null;
-  /** The five asset kinds, straight from the database. Domain objects, never map shapes. */
+  /** Every asset kind, straight from the database. Domain objects, never map shapes. */
   assets: Asset[];
+  /** The computed radio link graph. Derived server-side, never stored anywhere. */
+  mesh: MeshStatus | null;
+  /** The sea ice picture for `iceDate`. Null until the first fetch returns. */
+  ice: IceLayer | null;
+  /**
+   * The date the ice layer is drawn for, as YYYY-MM-DD.
+   *
+   * Separate from `simClock` on purpose. The clock is a playback position measured in
+   * milliseconds and moved by fast-forward; this is a SEASON, and the thing it controls
+   * changes over weeks. Tying them together would mean fast-forwarding four minutes to
+   * watch a satellite pass also nudged the ice.
+   */
+  iceDate: string;
   loading: boolean;
   error: string | null;
 
@@ -42,6 +55,9 @@ interface State {
 
   setWindow: (w: Window) => void;
   setAssets: (a: Asset[]) => void;
+  setMesh: (m: MeshStatus) => void;
+  setIce: (i: IceLayer) => void;
+  setIceDate: (d: string) => void;
   setLoading: (v: boolean) => void;
   setError: (e: string | null) => void;
   setClock: (ms: number) => void;
@@ -55,6 +71,9 @@ interface State {
 export const useStore = create<State>((set) => ({
   window: null,
   assets: [],
+  mesh: null,
+  ice: null,
+  iceDate: new Date().toISOString().slice(0, 10),
   loading: true,
   error: null,
   simClock: Date.now(),
@@ -70,6 +89,9 @@ export const useStore = create<State>((set) => ({
 
   setWindow: (w) => set({ window: w, loading: false, error: null, simClock: w.start }),
   setAssets: (a) => set({ assets: a }),
+  setMesh: (m) => set({ mesh: m }),
+  setIce: (i) => set({ ice: i }),
+  setIceDate: (d) => set({ iceDate: d }),
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e, loading: false }),
   setClock: (ms) => set({ simClock: ms }),

@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 import { fetchWindow } from "./api";
-import { fetchAssets, isOverdue } from "./assets";
+import { fetchAssets, fetchIce, fetchMesh, isOverdue } from "./assets";
 import { GlobeMap } from "./map/GlobeMap";
 import { nextEvent } from "./playback";
 import { linksAt, useStore } from "./store";
@@ -23,9 +23,12 @@ import { linksAt, useStore } from "./store";
 const WINDOW_MINUTES = 90;
 
 export default function App() {
-  const { window: win, assets, loading, error, simClock, running, projection, bbox } = useStore();
+  const { window: win, assets, mesh, ice, iceDate, loading, error, simClock, running, projection, bbox } = useStore();
   const setWindow = useStore((s) => s.setWindow);
   const setAssets = useStore((s) => s.setAssets);
+  const setMesh = useStore((s) => s.setMesh);
+  const setIce = useStore((s) => s.setIce);
+  const setIceDate = useStore((s) => s.setIceDate);
   const setError = useStore((s) => s.setError);
   const setClock = useStore((s) => s.setClock);
   const advance = useStore((s) => s.advance);
@@ -46,6 +49,25 @@ export default function App() {
       .then(setAssets)
       .catch((e) => setError(String(e)));
   }, [setAssets, setError]);
+
+  // The link graph loads independently too, and a failure here is deliberately NOT
+  // fatal: an operator can still see where everything is without knowing what can talk
+  // to what. Losing the whole picture because one derived layer failed would be the
+  // wrong trade.
+  useEffect(() => {
+    fetchMesh()
+      .then(setMesh)
+      .catch((e) => console.error("mesh graph unavailable", e));
+  }, [setMesh]);
+
+  // Ice refetches whenever the selected date changes. Server-side the answer is cached
+  // per day of year, so dragging the control is cheap after the first pass through a
+  // season.
+  useEffect(() => {
+    fetchIce(iceDate)
+      .then(setIce)
+      .catch((e) => console.error("ice layer unavailable", e));
+  }, [iceDate, setIce]);
 
   // Advance the clock against real elapsed time.
   const last = useRef<number | null>(null);
@@ -98,6 +120,29 @@ export default function App() {
         <button onClick={() => setProjection(projection === "globe" ? "mercator" : "globe")}>
           {projection === "globe" ? "GLOBE" : "MERCATOR"}
         </button>
+
+        {/* The season control. Separate from the playback clock on purpose: this moves
+            the ice, which changes over weeks, and the clock moves satellites, which
+            change over minutes. */}
+        <span className="sep" />
+        <label className="datectl" title="Sea ice is modelled from climate normals, so only the day of year matters">
+          ICE&nbsp;
+          <input
+            type="date"
+            value={iceDate}
+            min={ice?.dates[0]}
+            max={ice?.dates[ice.dates.length - 1]}
+            onChange={(e) => setIceDate(e.target.value)}
+          />
+        </label>
+        {ice && (
+          /* 🔑 The caveat rides on the readout itself, not buried in a README. What is
+             shown is a measurement and an extent; the tooltip says plainly that
+             concentration is not thickness. */
+          <span className="dim" title={`${ice.caveat}\n\n${ice.citation}`}>
+            measured <b>{ice.date}</b> · {(ice.extentKm2 / 1e6).toFixed(1)}M km² extent
+          </span>
+        )}
       </header>
 
       <footer className="strip bottom">
@@ -139,6 +184,12 @@ export default function App() {
             <span title="contacts held without an AIS broadcast">
               not broadcasting <b className={dark ? "alert" : undefined}>{dark}</b>
             </span>
+            {mesh && (
+              <span title="radio links up, connected groups, and assets on no mesh at all">
+                mesh <b>{mesh.links.length}</b> links · <b>{mesh.groups.length}</b> groups ·{" "}
+                <b className={mesh.isolated.length ? "warn" : undefined}>{mesh.isolated.length}</b> isolated
+              </span>
+            )}
           </>
         )}
       </footer>

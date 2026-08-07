@@ -62,7 +62,7 @@ create table if not exists entities (
     created_by   text        not null default 'seed',
 
     constraint entities_kind_check check (
-        kind in ('node', 'patrol', 'uas', 'hydrophone', 'vessel', 'radar', 'marker')
+        kind in ('node', 'patrol', 'uas', 'launch_site', 'hydrophone', 'vessel', 'radar', 'marker')
     ),
     constraint entities_created_by_check check (
         created_by in ('seed', 'user', 'llm')
@@ -135,3 +135,40 @@ create index if not exists events_entity_idx  on events (entity_id);
 create index if not exists events_command_idx on events (command_id);
 create index if not exists events_ts_idx      on events (ts desc);
 create index if not exists events_tier_idx    on events (tier);
+
+-- --------------------------------------------------------------------------
+-- Migrations
+-- --------------------------------------------------------------------------
+--
+-- 🔴 `create table if not exists` IS A NO-OP ON AN EXISTING TABLE, INCLUDING ITS
+-- CONSTRAINTS. Editing the `entities_kind_check` list above changes what a FRESH
+-- database gets and changes nothing at all about one that already exists. The seed then
+-- fails at the first row of the new kind with a check violation, and the schema file
+-- that appears to permit it is right there in the repo contradicting the error.
+--
+-- Found in review before it was hit, which is the only reason it is a comment and not
+-- an outage.
+--
+-- So constraints that change are dropped and re-added explicitly. This is idempotent and
+-- safe to run on every seed: `if exists` covers the fresh-database case where the
+-- constraint was created by the statement above with the correct definition already.
+alter table entities drop constraint if exists entities_kind_check;
+alter table entities add constraint entities_kind_check check (
+    kind in ('node', 'patrol', 'uas', 'launch_site', 'hydrophone', 'vessel', 'radar', 'marker')
+);
+
+-- --------------------------------------------------------------------------
+-- Spend counters
+-- --------------------------------------------------------------------------
+--
+-- Two integers behind the only endpoint that costs money. See api/_lib/ratelimit.py for
+-- why the meter sits in front of tier 2 and nowhere else.
+--
+-- One row per bucket, where a bucket is an IP and an hour, or the word "global" and a
+-- day. The key carries the window, so expiry is "stop reading old rows" rather than a
+-- sweeper job, and the whole check is one upsert that returns the new count.
+create table if not exists spend_counters (
+    bucket     text primary key,
+    count      integer     not null default 0,
+    updated_at timestamptz not null default now()
+);

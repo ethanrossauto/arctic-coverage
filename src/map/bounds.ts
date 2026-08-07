@@ -76,13 +76,19 @@ function normalizeLon(lon: number): number {
 }
 
 /**
- * Client-side containment, kept identical in behaviour to the server's.
+ * Client-side containment.
  *
- * Duplicated deliberately and narrowly: the frontend needs it to decide what to
- * draw, the backend needs it to answer a command, and the two must agree or a
- * filter will highlight a different set than it reports. Kept to one short
- * function in each language, with this comment on both sides, rather than
- * shipping a shared module for eight lines of arithmetic.
+ * ⚠️ THE SERVER TWIN DOES NOT EXIST YET. This comment previously claimed the two were
+ * "kept identical in behaviour", which was a description of the intended design
+ * written before the backend half was built, and it would not have survived a reader
+ * who grepped for the counterpart. Stated as a gap rather than left as a claim.
+ *
+ * The intent stands and the duplication is deliberate when it arrives: the frontend
+ * needs containment to decide what to draw, the backend needs it to answer a command,
+ * and the two must agree or a filter highlights a different set than it reports. One
+ * short function in each language, with this note on both sides, beats a shared module
+ * for eight lines of arithmetic. **The wraparound and all-longitudes cases are the
+ * part that must match**, since those are the ones a naive implementation gets wrong.
  */
 export function bboxContains(bbox: ViewportBbox, lat: number, lon: number): boolean {
   if (lat < bbox.south || lat > bbox.north) return false;

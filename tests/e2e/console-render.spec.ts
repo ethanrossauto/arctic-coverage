@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { mapColourCount, readClock, waitForWindowLoaded } from "./helpers";
+import { landPixelFraction, readClock, waitForWindowLoaded } from "./helpers";
 
 /**
  * Does the console actually work? Six questions, none of which any other test in
@@ -15,20 +15,20 @@ import { mapColourCount, readClock, waitForWindowLoaded } from "./helpers";
 
 test("the map paints real geometry, not a flat background", async ({ page }) => {
   /**
-   * The blank-canvas guard. A style that fails to load, a source that will not
-   * parse, or a WebGL context that never initialises all leave a canvas holding
-   * one flat colour, and the surrounding UI keeps working perfectly, which is what
-   * makes it so easy to miss.
+   * The blank-map guard, and the test that would have caught a broken production
+   * deploy. A style that fails to load, a source that will not parse, or a
+   * geometry worker that 404s all leave the map empty while the surrounding UI
+   * keeps working perfectly and nothing throws.
    *
-   * Land, the graticule and the ocean are three distinct colours before anything
-   * dynamic is drawn, so a healthy first paint is comfortably above the threshold
-   * and a blank one is at 1.
+   * Asserted on the LAND FILL COLOUR specifically, because that colour cannot
+   * appear unless the source loaded, the worker parsed it and the GPU drew it.
    */
   await page.goto("/");
   await waitForWindowLoaded(page);
+  // A healthy polar view is roughly a quarter land. A broken one is zero.
   await expect
-    .poll(() => mapColourCount(page), { timeout: 30_000, intervals: [500] })
-    .toBeGreaterThan(3);
+    .poll(() => landPixelFraction(page), { timeout: 30_000, intervals: [500] })
+    .toBeGreaterThan(0.05);
 });
 
 test("server data reaches the UI", async ({ page }) => {
@@ -106,8 +106,8 @@ test("the projection toggle switches between globe and mercator without erroring
 
   // Still painting after the switch, which is the part that could break.
   await expect
-    .poll(() => mapColourCount(page), { timeout: 20_000, intervals: [500] })
-    .toBeGreaterThan(3);
+    .poll(() => landPixelFraction(page), { timeout: 20_000, intervals: [500] })
+    .toBeGreaterThan(0.05);
 
   await toggle.click();
   await expect(toggle).toHaveText("GLOBE");

@@ -70,38 +70,49 @@ export async function readClock(page: Page): Promise<Date> {
 }
 
 /**
- * How many distinct colours are visible in the map area?
+ * How much of the map area is painted with the LAND fill colour?
  *
- * This is the assertion that catches a blank map. A style that fails to load, a
- * source that will not parse, or a worker that 404s all leave a flat canvas while
- * the surrounding UI keeps working perfectly, which is what makes that class of
- * bug so easy to miss.
+ * 🔴 THIS ASSERTION USED TO BE "more than three distinct colours", AND THAT WAS
+ * TOO WEAK TO BE WORTH HAVING. A production build with a broken geometry worker
+ * rendered no land, no coastlines and no graticule, yet still scored 191 distinct
+ * colours from subtle gradient and antialiasing noise, so it sailed past a
+ * threshold meant to catch a flat canvas. The suite reported the live site healthy
+ * while it was blank.
  *
- * ⚠️ IT USES A PLAYWRIGHT SCREENSHOT, NOT `canvas.drawImage`, AND THAT MATTERS.
- * The obvious implementation reads the canvas back in the page with drawImage and
- * getImageData. On a WebGL canvas that returns nothing, because the drawing buffer
- * is cleared after compositing unless the context was created with
- * `preserveDrawingBuffer: true`. MapLibre leaves that off for performance, and
- * turning it on to satisfy a test would mean paying a real production cost for a
- * test convenience. A screenshot captures the composited result instead, so it
- * measures exactly what a person would see and costs the application nothing.
+ * Counting pixels of a colour the map can only produce by actually drawing
+ * something is a real assertion rather than a proxy for one. If land renders, the
+ * source loaded, the worker parsed it and the GPU drew it. If it does not, this is
+ * zero, whatever noise is on the canvas.
  *
- * Deliberately NOT a golden-image comparison. A reference screenshot of a WebGL
- * globe fails on any driver difference, needs regenerating after every visual
- * tweak, and answers "something changed" when the useful question is "is it
- * blank". Counting distinct colours answers that one question and leaves how it
- * LOOKS to a human, which is where that judgment belongs.
+ * Uses a Playwright screenshot rather than reading the canvas back in the page:
+ * `drawImage` on a WebGL canvas returns nothing unless the context was created
+ * with `preserveDrawingBuffer`, and turning that on would mean paying a real
+ * production cost for test convenience.
+ *
+ * Still NOT a golden-image comparison. A reference image of a WebGL globe fails on
+ * driver differences and answers "something changed" when the question is "did it
+ * draw". What it LOOKS like stays a human's call.
  */
-export async function mapColourCount(page: Page): Promise<number> {
+export async function landPixelFraction(page: Page): Promise<number> {
   const buf = await page.locator(".map").screenshot();
   const png = PNG.sync.read(buf);
-  const seen = new Set<number>();
-  const step = 4; // sample a grid; full resolution adds cost and no information
-  for (let y = 0; y < png.height; y += step) {
-    for (let x = 0; x < png.width; x += step) {
+  // #111b26, the land fill in GlobeMap.tsx. Tolerance absorbs the globe's subtle
+  // shading without admitting the ocean (#050a10) or the graticule (#16242f).
+  const [tr, tg, tb] = [0x11, 0x1b, 0x26];
+  let hits = 0;
+  let total = 0;
+  for (let y = 0; y < png.height; y += 3) {
+    for (let x = 0; x < png.width; x += 3) {
       const i = (png.width * y + x) << 2;
-      seen.add((png.data[i] << 16) | (png.data[i + 1] << 8) | png.data[i + 2]);
+      total++;
+      if (
+        Math.abs(png.data[i] - tr) <= 6 &&
+        Math.abs(png.data[i + 1] - tg) <= 6 &&
+        Math.abs(png.data[i + 2] - tb) <= 6
+      ) {
+        hits++;
+      }
     }
   }
-  return seen.size;
+  return total === 0 ? 0 : hits / total;
 }

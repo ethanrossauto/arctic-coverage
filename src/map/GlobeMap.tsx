@@ -23,8 +23,22 @@
  */
 import { useEffect, useRef } from "react";
 // MapLibre v6 removed the default export; everything is a named import now.
-import { Map as MapLibreMap, type GeoJSONSource } from "maplibre-gl";
+import { config as maplibreConfig, Map as MapLibreMap, type GeoJSONSource } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+// 🔴 MapLibre parses ALL geometry in a web worker, and v6 loads that worker by a
+// relative URL resolved against its own dist directory. A bundler that inlines the
+// main entry does not emit the worker file, so the request 404s at runtime, no
+// geometry is ever parsed, and the map renders NOTHING while the rest of the page
+// works perfectly and no exception is thrown.
+//
+// This bit twice, in dev and then again in the production bundle, and the second
+// time it reached the live site. Vite's `?url` suffix emits the worker as a real
+// asset and hands back its hashed path; config.WORKER_URL is MapLibre's supported
+// way to be told about it. Excluding maplibre-gl from optimizeDeps fixes dev only,
+// so it is not a substitute for this.
+import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
+
+maplibreConfig.WORKER_URL = workerUrl;
 
 import { linksAt, useStore } from "../store";
 import { positionAt } from "../playback";

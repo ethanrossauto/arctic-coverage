@@ -1,0 +1,26 @@
+# .public-cloud — this repo is PUBLIC CLOUD and has NO PRIVATE TWIN.
+#
+# Read by hygiene's hy_repo_type(). Its presence is what makes this repo classify as public cloud;
+# without it, a GitHub repo that no .mirror-manifest names reads as PRIVATE CLOUD, which is the
+# right fail-closed default for a mirror and the wrong answer for this one. The effect of getting
+# it wrong was silent: every save ran Set G, the unpublished-GitHub gate, on a world-readable repo.
+#
+# ⚠️ A REASON IS MANDATORY. An empty marker is not a decision, same rule as .no-backup.
+
+REASON  Born public. There is no private repo behind this one: it was created as a public
+        Vercel-deployed project on 2026-08-06, not curated out of private work. So there is no
+        .mirror-manifest, nothing to derive an allowlist from, and no twin to save first.
+
+# 🔒 WHAT THIS COSTS, STATED PLAINLY, BECAUSE IT IS LESS PROTECTION THAN A MIRROR GETS.
+#
+# A mirror publishes a SUBSET: a manifest names every file on both sides, a derived allowlist is
+# enforced by pre-push, and deny patterns in the private twin back it up. None of that exists here,
+# and none of it can, because all three are derived from a private side.
+#
+# So for this repo:
+#   • Everything committed publishes. There is no "not for publication" path.
+#   • Set A is the only MECHANICAL guard on content — secrets, file size and kind, identity.
+#   • Set B's judgement half is entirely human: G1-G5 asked at the world-readable bar, every save.
+#
+# ▶ If this ever needs to hold something back, that is the signal to give it a private twin and
+#   demote this repo to a real mirror, not to add exceptions here.

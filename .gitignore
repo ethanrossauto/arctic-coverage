@@ -9,3 +9,8 @@ dist/
 .DS_Store
 .vercel
 .build/
+.env*
+test-results/
+playwright-report/
+blob-report/
+.playwright/

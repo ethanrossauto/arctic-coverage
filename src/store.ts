@@ -16,6 +16,7 @@
  */
 import { create } from "zustand";
 
+import type { Asset } from "./assets";
 import type { Site, Window } from "./api";
 import type { PassInterval } from "./playback";
 import type { ViewportBbox } from "./map/bounds";
@@ -24,6 +25,8 @@ export type Projection = "globe" | "mercator";
 
 interface State {
   window: Window | null;
+  /** The five asset kinds, straight from the database. Domain objects, never map shapes. */
+  assets: Asset[];
   loading: boolean;
   error: string | null;
 
@@ -38,6 +41,7 @@ interface State {
   selectedId: string | null;
 
   setWindow: (w: Window) => void;
+  setAssets: (a: Asset[]) => void;
   setLoading: (v: boolean) => void;
   setError: (e: string | null) => void;
   setClock: (ms: number) => void;
@@ -50,6 +54,7 @@ interface State {
 
 export const useStore = create<State>((set) => ({
   window: null,
+  assets: [],
   loading: true,
   error: null,
   simClock: Date.now(),
@@ -64,6 +69,7 @@ export const useStore = create<State>((set) => ({
   selectedId: null,
 
   setWindow: (w) => set({ window: w, loading: false, error: null, simClock: w.start }),
+  setAssets: (a) => set({ assets: a }),
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e, loading: false }),
   setClock: (ms) => set({ simClock: ms }),

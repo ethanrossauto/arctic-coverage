@@ -48,6 +48,18 @@ import { viewportBbox } from "./bounds";
 
 const COLOR = {
   ocean: "#050a10",
+  // Asset palette. Own assets sit in the green/blue family; CONTACTS are
+  // deliberately outside it, and a contact that is not broadcasting is the only
+  // thing on the display allowed to be red. Colour carries meaning here rather
+  // than decoration, which is why it is one table read top to bottom.
+  node: "#7fe3c0",
+  patrol: "#9be15d",
+  uas: "#5ec8f2",
+  hydrophone: "#6c8cff",
+  vesselAis: "#d8dee9",
+  vesselDark: "#ff5c5c",
+  degraded: "#ffd166",
+  silent: "#8a4a4a",
   land: "#111b26",
   coast: "#2b4258",
   graticule: "#16242f",
@@ -154,6 +166,65 @@ export function GlobeMap() {
           },
         });
       }
+      // ---- asset layers -------------------------------------------------
+      // TWO layers for five kinds, not five layers, driven by data expressions.
+      // A layer per kind would mean five sources to keep in step and five style
+      // blocks that drift apart; the kind is data, so it belongs in the paint
+      // expression rather than in the layer list.
+      m.addSource("asset-lines", { type: "geojson", data: emptyFC() });
+      m.addLayer({
+        id: "asset-lines",
+        type: "line",
+        source: "asset-lines",
+        paint: {
+          "line-color": [
+            "match",
+            ["get", "kind"],
+            "patrol", COLOR.patrol,
+            "vessel", ["case", ["get", "dark"], COLOR.vesselDark, COLOR.vesselAis],
+            COLOR.node,
+          ],
+          "line-width": ["case", ["get", "dark"], 1.6, 1.0],
+          // A track held only by a sensor is drawn dashed, because it is inferred
+          // rather than reported. The distinction is the whole point of the contact.
+          "line-dasharray": ["case", ["get", "dark"], ["literal", [2, 2]], ["literal", [1, 0]]],
+          "line-opacity": 0.55,
+        },
+      });
+
+      m.addSource("asset-points", { type: "geojson", data: emptyFC() });
+      m.addLayer({
+        id: "asset-points",
+        type: "circle",
+        source: "asset-points",
+        paint: {
+          "circle-radius": [
+            "match", ["get", "kind"],
+            "patrol", 5.5, "uas", 5, "vessel", 4.5, "hydrophone", 4, 3.5,
+          ],
+          "circle-color": [
+            "match", ["get", "kind"],
+            "node", COLOR.node,
+            "patrol", COLOR.patrol,
+            "uas", COLOR.uas,
+            "hydrophone", COLOR.hydrophone,
+            "vessel", ["case", ["get", "dark"], COLOR.vesselDark, COLOR.vesselAis],
+            COLOR.node,
+          ],
+          // Status overrides kind colour, because "this one is in trouble" must beat
+          // "this one is a node" at a glance.
+          "circle-stroke-color": [
+            "match", ["get", "status"],
+            "silent", COLOR.silent,
+            "degraded", COLOR.degraded,
+            "warning", COLOR.vesselDark,
+            "#0b1219",
+          ],
+          "circle-stroke-width": ["match", ["get", "status"], "nominal", 1, 2.5],
+          "circle-opacity": ["match", ["get", "status"], "silent", 0.35, 1],
+        },
+      });
+
       ready.current = true;
       setBbox(viewportBbox(m));
     });
@@ -234,6 +305,37 @@ export function GlobeMap() {
             ),
           ];
         }),
+      );
+
+      // Assets. Converted from domain objects to GeoJSON here and nowhere else,
+      // which is what keeps the store free of map-library shapes.
+      const dark = (a: (typeof s.assets)[number]) => a.aisReporting === false;
+      setData(
+        m,
+        "asset-points",
+        s.assets
+          .filter((a) => a.lat !== null && a.lon !== null)
+          .map((a) =>
+            point([a.lon as number, a.lat as number], {
+              id: a.id,
+              name: a.name,
+              kind: a.kind,
+              status: a.status,
+              dark: dark(a),
+            }),
+          ),
+      );
+      setData(
+        m,
+        "asset-lines",
+        s.assets
+          .filter((a) => a.geometry !== null)
+          .flatMap((a) =>
+            splitAtAntimeridian(a.geometry!.coordinates).map((f) => ({
+              ...f,
+              properties: { id: a.id, kind: a.kind, dark: dark(a) },
+            })),
+          ),
       );
 
       // Ground tracks: the whole window's path, so the shape of the orbit reads

@@ -1,0 +1,137 @@
+-- Arctic Coverage schema. Two tables, and the shape of them is a design position
+-- rather than a default, so the reasoning is here rather than in a wiki nobody reads.
+--
+-- THE CORE DECISION: one entities table for six kinds, not six tables.
+--
+-- The kinds differ a lot. A mesh node is a static point with a battery. A Ranger
+-- patrol is a route with a position along it. A vessel is a moving contact that may
+-- or may not be broadcasting. Three ways to model that:
+--
+--   * A table per kind. Honest about the differences, and then every query that
+--     asks "what is near here" becomes a six-way union, which is most queries.
+--   * One table with every field as a nullable column. One query surface, and
+--     twenty mostly-null columns that no constraint can keep honest.
+--   * One table, a shared core as real columns, per-kind detail in jsonb.
+--
+-- The third, because the shared core is genuinely shared: everything has an id, a
+-- kind, a name, a position and a status. That is what almost every query filters
+-- on, and what the map draws.
+--
+-- TWO EXCEPTIONS, PROMOTED OUT OF jsonb ON PURPOSE:
+--
+--   last_heard      when this asset last reported. Applies to nearly every kind and
+--                   drives the single most operationally important question there
+--                   is: what has gone quiet.
+--   ais_reporting   whether a contact is broadcasting its identity. Vessel-only, so
+--                   null everywhere else, and promoted anyway because "show me
+--                   what is not broadcasting" is the question this whole system
+--                   exists to answer.
+--
+-- Promoting a type-specific field to a column is not schema purity. It is chosen
+-- because indexing and query clarity beat purity for the two fields you actually
+-- filter on, and left in jsonb they would need a GIN index and a cast at every
+-- call site.
+
+create table if not exists entities (
+    id           text primary key,
+    kind         text        not null,
+    name         text        not null,
+
+    -- Position. Nullable because a route-based entity's position is derived from
+    -- its geometry and the clock, not stored.
+    lat          double precision,
+    lon          double precision,
+    alt_m        double precision,
+
+    status       text        not null default 'nominal',
+
+    -- GeoJSON LineString for anything with a path: patrol routes, UAS orbits,
+    -- vessel tracks. Null for point entities. Stored as jsonb rather than PostGIS
+    -- geometry because nothing here does spatial joins, and requiring a PostGIS
+    -- extension to draw a line would be a dependency bought for nothing.
+    geometry     jsonb,
+
+    -- Per-kind detail. Documented per kind in api/_lib/assets.py.
+    props        jsonb       not null default '{}'::jsonb,
+
+    -- See the note above on why these two are columns.
+    last_heard   timestamptz,
+    ais_reporting boolean,
+
+    created_at   timestamptz not null default now(),
+    created_by   text        not null default 'seed',
+
+    constraint entities_kind_check check (
+        kind in ('node', 'patrol', 'uas', 'hydrophone', 'vessel', 'marker')
+    ),
+    constraint entities_created_by_check check (
+        created_by in ('seed', 'user', 'llm')
+    ),
+    -- A point entity needs a position; a route entity needs a route. Enforced here
+    -- rather than trusted to the seed script, because the failure mode is an
+    -- invisible entity, which reads as a rendering bug for an hour before anyone
+    -- checks the row.
+    constraint entities_has_a_place check (
+        (lat is not null and lon is not null) or geometry is not null
+    )
+);
+
+-- ⚠️ THESE INDEXES DO NOTHING AT THE CURRENT ROW COUNT, and that is stated here
+-- rather than glossed over. `explain` on the last_heard filter returns a Seq Scan,
+-- because with 50 rows a sequential scan genuinely is cheaper than an index lookup
+-- and the planner is right to pick it. They are declared for the SHAPE of the
+-- queries, so that the filters the application leans on stay cheap if the table
+-- grows by three orders of magnitude. Claiming they make anything faster today
+-- would be a claim I checked and found false.
+create index if not exists entities_kind_idx        on entities (kind);
+create index if not exists entities_last_heard_idx  on entities (last_heard);
+create index if not exists entities_ais_idx         on entities (ais_reporting)
+    where ais_reporting is not null;
+create index if not exists entities_created_by_idx  on entities (created_by);
+
+-- The audit log. Every tool invocation lands here before its effects are visible,
+-- which is what makes "the log is complete" a property of the code rather than a
+-- promise.
+create table if not exists events (
+    id                bigserial primary key,
+    ts                timestamptz not null default now(),
+
+    -- Groups every step of one utterance or one button press.
+    command_id        uuid,
+    -- Set when a clarification re-submits a resolved command, so a vague ask and
+    -- its resolution read as one interaction instead of two unrelated ones.
+    parent_command_id uuid,
+
+    actor             text        not null default 'operator',
+    source            text        not null,
+    -- Which tier produced the plan. This column is why "the model is only called
+    -- when it earns its latency" is a query rather than a claim.
+    tier              text,
+
+    tool              text        not null,
+    params            jsonb       not null default '{}'::jsonb,
+    result            text        not null,
+    detail            text,
+    latency_ms        integer,
+
+    -- ⚠️ DELIBERATELY NOT A FOREIGN KEY. An audit log that cascades or nulls when
+    -- an entity is deleted is an audit log that forgets what you deleted, which is
+    -- the opposite of the job. The id is kept as text even after the row it names
+    -- is gone.
+    entity_id         text,
+
+    constraint events_source_check check (
+        source in ('ui_button', 'typed', 'voice', 'system')
+    ),
+    constraint events_result_check check (
+        result in ('ok', 'rejected', 'error')
+    ),
+    constraint events_tier_check check (
+        tier is null or tier in ('parser', 'llm')
+    )
+);
+
+create index if not exists events_entity_idx  on events (entity_id);
+create index if not exists events_command_idx on events (command_id);
+create index if not exists events_ts_idx      on events (ts desc);
+create index if not exists events_tier_idx    on events (tier);

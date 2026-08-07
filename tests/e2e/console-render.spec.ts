@@ -39,7 +39,6 @@ test("server data reaches the UI", async ({ page }) => {
   await expect(footer).toContainText("mask");
   await expect(footer).toContainText("15");
   await expect(footer).toContainText("sats 3");
-  await expect(footer).toContainText("sites 5");
   // The window must contain passes, or the demo has nothing to show. This is the
   // UI-side echo of the Python scenario test that guards the constellation's
   // inclination.
@@ -127,4 +126,65 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
   await page.goto("/");
   await waitForWindowLoaded(page);
   await expect(page.locator(".strip.bottom")).toContainText("view all longitudes");
+});
+
+test("all five asset kinds load and reach the map", async ({ page }) => {
+  /**
+   * The asset picture is the point of the application, so its arrival is asserted
+   * end to end rather than inferred from the map not being blank.
+   *
+   * Counts are exact, not "greater than zero". A seed that silently drops a kind
+   * would still satisfy a loose assertion, and a missing kind is invisible on a
+   * globe covered in dots.
+   */
+  const gotAssets = page.waitForResponse(
+    (r) => r.url().includes("/api/entities") && r.status() === 200,
+  );
+  await page.goto("/");
+  const body = await (await gotAssets).json();
+
+  const counts: Record<string, number> = {};
+  for (const a of body.entities) counts[a.kind] = (counts[a.kind] ?? 0) + 1;
+  expect(counts).toEqual({ node: 24, patrol: 3, uas: 5, hydrophone: 10, vessel: 8 });
+
+  await expect(page.locator(".strip.bottom")).toContainText("assets 50");
+});
+
+test("the two non-broadcasting contacts are surfaced and are the only ones", async ({ page }) => {
+  /**
+   * 🥇 The most important assertion about the data. A contact held without an AIS
+   * broadcast is the case the whole system exists for, and the count is exactly two
+   * by design: one anomaly reads as a fluke, five reads as a game. If a seed change
+   * ever makes it zero, the demo loses its point silently.
+   */
+  const gotAssets = page.waitForResponse(
+    (r) => r.url().includes("/api/entities") && r.status() === 200,
+  );
+  await page.goto("/");
+  const body = await (await gotAssets).json();
+
+  const dark = body.entities.filter((a: { ais_reporting: boolean | null }) => a.ais_reporting === false);
+  expect(dark.map((a: { name: string }) => a.name).sort()).toEqual(["UNKNOWN 01", "UNKNOWN 02"]);
+  // Each is held by a named sensor, not by its own report. Provenance is what makes
+  // an unidentified contact actionable rather than just alarming.
+  for (const d of dark) {
+    expect(d.props.first_detected_by, `${d.name} should name the sensor holding it`).toMatch(/^hyd-/);
+  }
+  await expect(page.locator(".strip.bottom")).toContainText("not broadcasting 2");
+});
+
+test("overdue assets are counted, and it is neither none nor all of them", async ({ page }) => {
+  /**
+   * "What has gone quiet" is only a real question if the answer is a subset. A seed
+   * where nothing is overdue makes the feature undemonstrable; one where everything
+   * is overdue makes it meaningless. This asserts the designed middle.
+   */
+  await page.goto("/");
+  await waitForWindowLoaded(page);
+  const footer = page.locator(".strip.bottom");
+  await expect(footer).toContainText(/overdue \d+/);
+  const text = await footer.innerText();
+  const overdue = Number(text.match(/overdue (\d+)/)?.[1] ?? -1);
+  expect(overdue).toBeGreaterThan(0);
+  expect(overdue).toBeLessThan(50);
 });

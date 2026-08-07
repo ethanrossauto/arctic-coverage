@@ -46,3 +46,8 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 button:disabled { opacity: 0.4; cursor: default; }
+
+/* Two states worth colouring in the status strip, and only two. Everything else
+   stays neutral so that these read instantly. */
+b.warn { color: var(--warn); }
+b.alert { color: var(--err); }

@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from ._lib import db
 from ._lib import satellites as satlib
 from ._lib import seed
 from ._lib import window_builder
@@ -91,3 +92,56 @@ def window(
         raise HTTPException(500, str(exc)) from exc
 
     return JSONResponse(payload, headers={"cache-control": "no-store"})
+
+
+@app.get("/api/entities")
+def entities(
+    kind: str | None = Query(
+        None,
+        description="Filter to one asset kind: node, patrol, uas, hydrophone, vessel, marker.",
+    ),
+) -> JSONResponse:
+    """Every asset in the world, or every asset of one kind.
+
+    Read-only, and deliberately NOT logged to the audit trail. The log records
+    actions taken, and hydrating a client is not an action: logging it would bury
+    every real event under a wall of page loads and make the trail useless for the
+    thing it exists for. Writes and tool invocations are logged without exception.
+    """
+    try:
+        rows = db.fetch_entities(kind)
+    except RuntimeError as exc:
+        # A missing connection string is a configuration failure, not an empty
+        # world, and it must not render as one.
+        raise HTTPException(503, str(exc)) from exc
+    return JSONResponse(
+        {"entities": rows, "count": len(rows)},
+        headers={"cache-control": "no-store"},
+    )
+
+
+@app.get("/api/events")
+def events(
+    since_id: int = Query(0, ge=0, description="Return only events newer than this id."),
+    limit: int = Query(200, ge=1, le=1000),
+    entity_id: str | None = None,
+    command_id: str | None = None,
+) -> JSONResponse:
+    """The audit log, oldest first, optionally filtered.
+
+    `since_id` is a cursor rather than a timestamp because a client polling for new
+    rows is asking "what have I not seen", which is an id question. ⚠️ Ids are
+    assigned in request order but can COMMIT out of order, so a client that must not
+    miss a row should overlap its cursor rather than trust strict monotonicity.
+    """
+    try:
+        rows = db.fetch_events(
+            since_id=since_id, limit=limit, entity_id=entity_id, command_id=command_id
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    max_id = rows[-1]["id"] if rows else since_id
+    return JSONResponse(
+        {"events": rows, "count": len(rows), "max_id": max_id},
+        headers={"cache-control": "no-store"},
+    )

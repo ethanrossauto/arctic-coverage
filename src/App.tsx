@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 import { fetchWindow } from "./api";
+import { fetchAssets, isOverdue } from "./assets";
 import { GlobeMap } from "./map/GlobeMap";
 import { nextEvent } from "./playback";
 import { linksAt, useStore } from "./store";
@@ -22,8 +23,9 @@ import { linksAt, useStore } from "./store";
 const WINDOW_MINUTES = 90;
 
 export default function App() {
-  const { window: win, loading, error, simClock, running, projection, bbox } = useStore();
+  const { window: win, assets, loading, error, simClock, running, projection, bbox } = useStore();
   const setWindow = useStore((s) => s.setWindow);
+  const setAssets = useStore((s) => s.setAssets);
   const setError = useStore((s) => s.setError);
   const setClock = useStore((s) => s.setClock);
   const advance = useStore((s) => s.advance);
@@ -35,6 +37,15 @@ export default function App() {
       .then(setWindow)
       .catch((e) => setError(String(e)));
   }, [setWindow, setError]);
+
+  // Assets load independently of the propagation window. Deliberately: a database
+  // hiccup should not blank the map, and a slow propagation call should not delay
+  // the assets, which are the thing an operator is actually looking at.
+  useEffect(() => {
+    fetchAssets()
+      .then(setAssets)
+      .catch((e) => setError(String(e)));
+  }, [setAssets, setError]);
 
   // Advance the clock against real elapsed time.
   const last = useRef<number | null>(null);
@@ -50,6 +61,10 @@ export default function App() {
   }, [running, advance]);
 
   const active = linksAt(win, simClock);
+  // Counted here rather than in the store: it depends on the clock, so caching it
+  // would mean invalidating on every frame for a number that costs nothing.
+  const overdue = assets.filter((a) => isOverdue(a, simClock)).length;
+  const dark = assets.filter((a) => a.aisReporting === false).length;
 
   /**
    * Fast forward to the next AOS or LOS.
@@ -97,13 +112,32 @@ export default function App() {
               links up <b>{active.length}</b> / {win.passes.length} in window
             </span>
             <span>
-              sats <b>{win.tracks.length}</b> · sites <b>{win.sites.length}</b>
+              sats <b>{win.tracks.length}</b>
             </span>
             <span className="dim">
               {/* Proof the viewport contract works under globe projection: a
                   pole-centred camera legitimately reports every longitude. */}
               view {bbox ? (bbox.global ? "all longitudes" : `${bbox.west.toFixed(0)}…${bbox.east.toFixed(0)}°`) : "—"}
               {bbox?.wraps ? " (wraps)" : ""} · {bbox ? `${bbox.south.toFixed(0)}…${bbox.north.toFixed(0)}°` : ""}
+            </span>
+          </>
+        )}
+
+        {/* Outside the `win` guard on purpose. Assets and propagation load
+            independently, so a propagation failure must not take the asset picture
+            off the screen with it. These are the two numbers an operator actually
+            watches, so they get their own slots rather than being folded into a
+            total. */}
+        {assets.length > 0 && (
+          <>
+            <span>
+              assets <b>{assets.length}</b>
+            </span>
+            <span title="assets past the reporting threshold for their kind">
+              overdue <b className={overdue ? "warn" : undefined}>{overdue}</b>
+            </span>
+            <span title="contacts held without an AIS broadcast">
+              not broadcasting <b className={dark ? "alert" : undefined}>{dark}</b>
             </span>
           </>
         )}

@@ -56,6 +56,9 @@ const COLOR = {
   patrol: "#9be15d",
   uas: "#5ec8f2",
   hydrophone: "#6c8cff",
+  // Existing infrastructure, not owned kit: deliberately desaturated so it reads as
+  // background against the deployable layer rather than competing with it.
+  radar: "#5a6b7a",
   vesselAis: "#d8dee9",
   vesselDark: "#ff5c5c",
   degraded: "#ffd166",
@@ -200,7 +203,7 @@ export function GlobeMap() {
         paint: {
           "circle-radius": [
             "match", ["get", "kind"],
-            "patrol", 5.5, "uas", 5, "vessel", 4.5, "hydrophone", 4, 3.5,
+            "patrol", 5.5, "uas", 5, "vessel", 4.5, "hydrophone", 4, "radar", 3, 3.5,
           ],
           "circle-color": [
             "match", ["get", "kind"],
@@ -208,6 +211,7 @@ export function GlobeMap() {
             "patrol", COLOR.patrol,
             "uas", COLOR.uas,
             "hydrophone", COLOR.hydrophone,
+            "radar", COLOR.radar,
             "vessel", ["case", ["get", "dark"], COLOR.vesselDark, COLOR.vesselAis],
             COLOR.node,
           ],

@@ -62,7 +62,7 @@ create table if not exists entities (
     created_by   text        not null default 'seed',
 
     constraint entities_kind_check check (
-        kind in ('node', 'patrol', 'uas', 'hydrophone', 'vessel', 'marker')
+        kind in ('node', 'patrol', 'uas', 'hydrophone', 'vessel', 'radar', 'marker')
     ),
     constraint entities_created_by_check check (
         created_by in ('seed', 'user', 'llm')

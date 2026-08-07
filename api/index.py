@@ -98,7 +98,7 @@ def window(
 def entities(
     kind: str | None = Query(
         None,
-        description="Filter to one asset kind: node, patrol, uas, hydrophone, vessel, marker.",
+        description="Filter to one asset kind: node, patrol, uas, hydrophone, vessel, radar, marker.",
     ),
 ) -> JSONResponse:
     """Every asset in the world, or every asset of one kind.

@@ -8,7 +8,7 @@
  * then every question has two answers.
  */
 
-export type AssetKind = "node" | "patrol" | "uas" | "hydrophone" | "vessel" | "marker";
+export type AssetKind = "node" | "patrol" | "uas" | "hydrophone" | "vessel" | "radar" | "marker";
 
 export type AssetStatus = "nominal" | "degraded" | "warning" | "silent";
 
@@ -87,6 +87,10 @@ export function minutesSinceHeard(asset: Asset, nowMs: number): number | null {
  * dead node. A mesh node beacons continuously; a Ranger patrol checks in when it
  * stops moving.
  */
+// ⚠️ `radar` is absent on purpose, not by omission. Those sites do not report into
+// the mesh at all, which is the interoperability problem stated as data. An asset
+// cannot be overdue to a network it was never on, and giving it a threshold would
+// make twelve sites permanently overdue and drown the four that really are.
 const OVERDUE_MINUTES: Partial<Record<AssetKind, number>> = {
   node: 120,
   hydrophone: 180,
@@ -106,6 +110,7 @@ export const KIND_LABEL: Record<AssetKind, string> = {
   patrol: "Ranger patrol",
   uas: "UAS",
   hydrophone: "Hydrophone",
+  radar: "Early-warning radar",
   vessel: "Vessel",
   marker: "Marker",
 };

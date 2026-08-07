@@ -2,11 +2,12 @@
 
 The world is a Canadian Arctic surveillance picture: a deployable sensor mesh at the
 chokepoints, mobile patrols and drones, under-ice acoustic sensors in the narrows,
-and the maritime contacts they exist to detect.
+the maritime contacts they exist to detect, and the existing early-warning radar
+line they have to work alongside.
 
-WHY FIVE KINDS RATHER THAN ONE. Each has a different geometry, a different mobility
+WHY SIX KINDS RATHER THAN ONE. Each has a different geometry, a different mobility
 and a different set of questions worth asking about it, and that heterogeneity is the
-point: it is what makes a command layer useful rather than decorative. Five kinds
+point: it is what makes a command layer useful rather than decorative. Six kinds
 that were all static points with a name would reduce every command to a search box.
 
     kind        geometry          mobility        the question it answers
@@ -21,6 +22,8 @@ that were all static points with a name would reduce every command to a search b
                                                   without being seen
     vessel      track + position  10-20 kn        who is out there, and which of
                                                   them is not broadcasting
+    radar       point + radius    static          what the existing line already
+                                                  covers, and where it does not
 
 🔴 GEOGRAPHY IS NOT DECORATION HERE. Every position is a real place or a real
 waterway. The mesh sits on the actual Northwest Passage chokepoints, because that is
@@ -434,9 +437,87 @@ def _vessels() -> list[Asset]:
     return out
 
 
+# --------------------------------------------------------------------------
+# 6. Early-warning radar: 12 sites of the existing North Warning System
+# --------------------------------------------------------------------------
+# 🔑 THESE ARE NOT OWNED ASSETS. They are existing government infrastructure that a
+# deployable sensor layer has to work alongside, so they carry `owned: False` and a
+# separate operator. Modelling them earns its place by making the gap visible: the
+# North Warning System is a line roughly 4,800 km long and 320 km wide, and a line
+# is a tripwire. The mesh, the hydrophones and the patrols above are area coverage of
+# the places a transit cannot avoid. Put both on one map and the difference argues
+# itself without a caption.
+#
+# ⚠️ HONEST LIMITS OF THIS DATA, because a reader who knows the system will spot them
+# faster than they will spot a claim that it is exact:
+#
+#   * The SITE NAMES and their DEW Line designators are public and well documented.
+#     The COORDINATES here are approximate placements, good enough to put each site on
+#     the right stretch of coast and not good enough to navigate by.
+#   * Canada operates 47 of these: 11 long-range and 36 short-range gap fillers. Only
+#     12 named sites are modelled. The remaining short-range sites are OMITTED RATHER
+#     THAN INVENTED, because a plausible-looking coordinate for a site I cannot place
+#     is worse than an absent one.
+#   * The long-range versus short-range split below is inferred from the historic "-M"
+#     main-station designator rather than from a published per-site list. It is
+#     flagged in props as inferred.
+#
+# Nominal ranges are the published figures for the two radar families: about 470 km
+# for the long-range AN/FPS-117 and about 110 km for the short-range AN/FPS-124.
+
+_NWS_SITES: list[tuple[str, str, float, float, bool]] = [
+    # designator, place, lat, lon, is_main ("-M" historically meant a main station)
+    ("BAR-1", "Komakuk Beach", 69.60, -140.18, False),
+    ("BAR-3", "Shingle Point", 68.95, -137.22, False),
+    ("PIN-M", "Cape Parry", 70.17, -124.72, True),
+    ("PIN-3", "Tuktoyaktuk", 69.44, -133.03, False),
+    ("CAM-M", "Cambridge Bay", 69.11, -105.14, True),
+    ("CAM-3", "Gladman Point", 68.67, -97.80, False),
+    ("CAM-4", "Jenny Lind Island", 68.65, -101.73, False),
+    ("FOX-M", "Hall Beach", 68.78, -81.24, True),
+    ("FOX-3", "Longstaff Bluff", 68.90, -75.13, False),
+    ("FOX-5", "Dewar Lakes", 68.65, -71.17, False),
+    ("DYE-M", "Cape Dyer", 66.58, -61.62, True),
+    ("BAF-3", "Brevoort Island", 63.33, -64.13, False),
+]
+
+
+def _radars() -> list[Asset]:
+    out = []
+    for designator, place, lat, lon, is_main in _NWS_SITES:
+        out.append(
+            Asset(
+                id=f"radar-{designator.lower()}",
+                kind="radar",
+                name=f"{designator} {place}",
+                lat=lat,
+                lon=lon,
+                alt_m=None,
+                status="nominal",
+                # No last_heard: this layer does not report into the mesh, which is
+                # the interoperability problem in one field. Leaving it null rather
+                # than inventing a heartbeat keeps "what has gone quiet" honest,
+                # since a radar site cannot be overdue to a network it is not on.
+                last_heard_minutes_ago=None,
+                props={
+                    "designator": designator,
+                    "place": place,
+                    "operator": "NORAD",
+                    "owned": False,
+                    "radar_type": "AN/FPS-117" if is_main else "AN/FPS-124",
+                    "range_km": 470 if is_main else 110,
+                    "coverage_class": "long_range" if is_main else "short_range",
+                    "class_inferred_from": "historic -M main-station designator",
+                    "position_accuracy": "approximate",
+                },
+            )
+        )
+    return out
+
+
 def seed_assets() -> list[Asset]:
-    """The whole seeded world: 24 nodes, 3 patrols, 5 UAS, 10 hydrophones, 8 vessels."""
-    return [*_nodes(), *_patrols(), *_uas(), *_hydrophones(), *_vessels()]
+    """The whole seeded world: 24 nodes, 3 patrols, 5 UAS, 10 hydrophones, 8 vessels, 12 radars."""
+    return [*_nodes(), *_patrols(), *_uas(), *_hydrophones(), *_vessels(), *_radars()]
 
 
 def seed_rows(now: datetime | None = None) -> list[dict[str, Any]]:
@@ -444,4 +525,4 @@ def seed_rows(now: datetime | None = None) -> list[dict[str, Any]]:
     return [a.row(now) for a in seed_assets()]
 
 
-KIND_COUNTS = {"node": 24, "patrol": 3, "uas": 5, "hydrophone": 10, "vessel": 8}
+KIND_COUNTS = {"node": 24, "patrol": 3, "uas": 5, "hydrophone": 10, "vessel": 8, "radar": 12}

@@ -128,7 +128,7 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
   await expect(page.locator(".strip.bottom")).toContainText("view all longitudes");
 });
 
-test("all five asset kinds load and reach the map", async ({ page }) => {
+test("all six asset kinds load and reach the map", async ({ page }) => {
   /**
    * The asset picture is the point of the application, so its arrival is asserted
    * end to end rather than inferred from the map not being blank.
@@ -145,9 +145,9 @@ test("all five asset kinds load and reach the map", async ({ page }) => {
 
   const counts: Record<string, number> = {};
   for (const a of body.entities) counts[a.kind] = (counts[a.kind] ?? 0) + 1;
-  expect(counts).toEqual({ node: 24, patrol: 3, uas: 5, hydrophone: 10, vessel: 8 });
+  expect(counts).toEqual({ node: 24, patrol: 3, uas: 5, hydrophone: 10, vessel: 8, radar: 12 });
 
-  await expect(page.locator(".strip.bottom")).toContainText("assets 50");
+  await expect(page.locator(".strip.bottom")).toContainText("assets 62");
 });
 
 test("the two non-broadcasting contacts are surfaced and are the only ones", async ({ page }) => {
@@ -187,4 +187,34 @@ test("overdue assets are counted, and it is neither none nor all of them", async
   const overdue = Number(text.match(/overdue (\d+)/)?.[1] ?? -1);
   expect(overdue).toBeGreaterThan(0);
   expect(overdue).toBeLessThan(50);
+});
+
+test("the radar layer is present, unowned, and never counted as overdue", async ({ page }) => {
+  /**
+   * The existing early-warning line is modelled as infrastructure to work alongside,
+   * not as owned kit, and it reports into nothing. Two properties follow, and both
+   * are easy to break silently:
+   *
+   *   - `owned: false`, so a count of "my assets" never quietly includes twelve sites
+   *     belonging to somebody else.
+   *   - no `last_heard`, so it cannot be overdue. Giving radar a reporting threshold
+   *     would make all twelve permanently overdue and bury the four assets that
+   *     genuinely are.
+   */
+  const gotAssets = page.waitForResponse(
+    (r) => r.url().includes("/api/entities") && r.status() === 200,
+  );
+  await page.goto("/");
+  const body = await (await gotAssets).json();
+
+  const radars = body.entities.filter((a: { kind: string }) => a.kind === "radar");
+  expect(radars).toHaveLength(12);
+  for (const r of radars) {
+    expect(r.props.owned, `${r.name} must not be marked as owned`).toBe(false);
+    expect(r.props.operator).toBe("NORAD");
+    expect(r.last_heard, `${r.name} must not report a heartbeat`).toBeNull();
+    // The approximation is declared in the data, not just in a comment, so a
+    // consumer cannot mistake these for surveyed positions.
+    expect(r.props.position_accuracy).toBe("approximate");
+  }
 });

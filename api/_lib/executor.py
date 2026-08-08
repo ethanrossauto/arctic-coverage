@@ -128,6 +128,39 @@ def _in_range(value: Any, lo: float, hi: float) -> bool:
         return False
 
 
+def _valid_bbox(bbox: Any) -> bool:
+    """Is this actually a viewport, or merely something the browser said was one?
+
+    🔒 THE ONE PLACE UNTRUSTED CLIENT DATA BECOMES A TOOL ARGUMENT. Every other parameter in
+    a plan is produced by the parser or by a schema-validated model call, so it arrives with
+    a shape somebody has already vouched for. The viewport does not: it is lifted out of the
+    request's `context` dict, which is free-form by design because it carries deixis, and
+    handed straight to `tools.bbox_contains`.
+
+    ⚠️ WITHOUT THIS, A MALFORMED BOX SURFACES AS A KeyError FROM INSIDE A TOOL, three frames
+    below anything that knows what the operator asked. The user then gets an internal error
+    for a request that was merely unanswerable, and the audit row records a crash rather than
+    a refusal. The two are different facts about the same command.
+
+    Bounds rather than types alone, because a box is not a pair of numbers, it is a claim
+    about where on Earth someone is looking, and there is no latitude of 300.
+    """
+    if not isinstance(bbox, dict):
+        return False
+    if not all(_in_range(bbox.get(k), -90.0, 90.0) for k in ("south", "north")):
+        return False
+    if float(bbox["south"]) > float(bbox["north"]):
+        return False
+    # ⚠️ A GLOBAL VIEW LEGITIMATELY HAS NO MEANINGFUL WEST OR EAST, so it is checked before
+    # they are required. A pole-centred camera spans every longitude, which is the case that
+    # made this field necessary in the first place.
+    if bbox.get("global"):
+        return True
+    # West may exceed east: that is what `wraps` means, and rejecting it would refuse the
+    # oblique views this box exists to describe.
+    return all(_in_range(bbox.get(k), -180.0, 180.0) for k in ("west", "east"))
+
+
 def _required(fn: Any) -> list[str]:
     """The parameters a tool cannot run without, read off the function itself.
 
@@ -317,6 +350,12 @@ def resolve_context(
                     raise PlanRejected(
                         ["I cannot tell what is on screen right now, so 'the current "
                          "window' has nothing to mean. Try naming a kind instead"]
+                    )
+                if not _valid_bbox(bbox):
+                    raise PlanRejected(
+                        ["the viewport my browser sent does not describe a box I can use, "
+                         "so 'the current window' has nothing to mean. Move the map and "
+                         "try again"]
                     )
                 params[key] = bbox
             elif value == RESULT or (

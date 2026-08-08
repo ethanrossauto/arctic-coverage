@@ -1048,6 +1048,47 @@ def test_an_unresolvable_reference_is_refused_with_a_reason():
     assert "on screen" in caught.value.reasons[0]
 
 
+def test_a_malformed_viewport_is_refused_rather_than_crashing_a_tool(world, log):
+    """🔒 THE ONE PLACE UNTRUSTED CLIENT DATA BECOMES A TOOL ARGUMENT.
+
+    Every other parameter in a plan comes from the parser or from a schema-validated model
+    call, so its shape has already been vouched for. The viewport is lifted out of the
+    request's free-form `context` and handed to `tools.bbox_contains`, which indexes it
+    directly. Unchecked, a malformed box surfaces as a KeyError three frames below anything
+    that knows what was asked, so the operator gets an internal error for a request that was
+    merely unanswerable and the audit row records a crash instead of a refusal.
+    """
+    plan = parser.parse("show me assets in the current view")
+
+    for bad in (
+        {"south": 80, "north": 60, "west": -1, "east": 1},   # south above north
+        {"south": 60, "north": 300, "west": -1, "east": 1},  # there is no latitude of 300
+        {"south": 60, "north": 80},                          # no longitudes at all
+        {"south": None, "north": 80, "west": 0, "east": 1},  # null where a number belongs
+        "not a box",
+    ):
+        with pytest.raises(executor.PlanRejected) as caught:
+            executor.resolve_context(plan, {"bbox": bad})
+        assert "viewport" in caught.value.reasons[0]
+
+
+def test_the_two_awkward_viewports_are_still_accepted(world, log):
+    """⚠️ THE VALIDATION MUST NOT REFUSE THE CASES THE FIELD EXISTS FOR.
+
+    A pole-centred globe view legitimately spans every longitude and carries no meaningful
+    west or east, and an oblique view produces west greater than east. Both look malformed
+    to a naive check, and both are exactly what an Arctic display shows.
+    """
+    plan = parser.parse("show me assets in the current view")
+
+    resolved = executor.resolve_context(plan, {"bbox": {"south": 60, "north": 90, "global": True}})
+    assert resolved[0]["params"]["bbox"]["global"] is True
+
+    wraps = {"south": 60, "north": 80, "west": 170, "east": -170, "wraps": True}
+    resolved = executor.resolve_context(plan, {"bbox": wraps})
+    assert resolved[0]["params"]["bbox"]["west"] == 170
+
+
 def test_one_request_performs_several_actions(world, log):
     """One request has to adjust the frame, filter the picture, isolate the asset and open
     its detail. Every parser branch returned exactly one step until this landed."""

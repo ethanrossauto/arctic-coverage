@@ -23,6 +23,7 @@
 import { create } from "zustand";
 
 import type { Asset, IceLayer, MeshStatus } from "./assets";
+import type { WorldStatus } from "./world";
 import type { ViewportBbox } from "./map/bounds";
 
 export type Projection = "globe" | "mercator";
@@ -141,16 +142,6 @@ interface State {
 
   projection: Projection;
   /**
-   * Whether the radio link graph is drawn.
-   *
-   * 🔑 A VIEW SETTING, NOT A DOMAIN FACT. Hiding the lines does not stop the mesh being
-   * computed, does not change what the footer counts, and does not change what a command
-   * about connectivity answers. The mesh is one layer among several now rather than the
-   * subject of the display, and on a dense cluster its lines are what you turn off to
-   * read anything else.
-   */
-  showMesh: boolean;
-  /**
    * Whether the sea-ice layer is drawn.
    *
    * "Show me the weather overlays" turns this on. 🔒 No server code reads the ice data and
@@ -159,14 +150,21 @@ interface State {
    */
   showIce: boolean;
   /**
-   * Whether contacts the network cannot confirm are drawn.
+   * Whether contacts the console cannot honestly claim are being WITHHELD from the map.
    *
-   * 🔒 DEFAULT OFF, AND THAT IS THE POINT RATHER THAN A PREFERENCE. The default picture
-   * shows what actually reached us. Revealing what it cannot confirm has to be a deliberate
-   * act, because one of those buckets is a contact nothing is holding, which the console
-   * has no honest basis for knowing about at all.
+   * 🔒 DEFAULT ON, AND THAT IS THE POINT RATHER THAN A PREFERENCE. The default picture shows
+   * what actually reached us. Revealing what it did not has to be a deliberate act, because
+   * one of those buckets is a contact nothing is holding, which the console has no honest
+   * basis for knowing about at all.
+   *
+   * 🔑 PHRASED AS "HIDE", NOT "SHOW", AND THE DOUBLE NEGATIVE IS DELIBERATE. A box labelled
+   * SHOW that sits unchecked says nothing to a viewer who never ticks it: the display looks
+   * complete and quietly is not. A box labelled HIDE that sits checked admits, on the face
+   * of the control, that something is deliberately being kept off the map. This display's
+   * whole argument is about not claiming more than it can support, and a control that
+   * advertises the withholding argues it better than one that merely permits the reveal.
    */
-  showUndetected: boolean;
+  hideUndetected: boolean;
   /** Last computed viewport box. What a command means by "the current window". */
   bbox: ViewportBbox | null;
   selectedId: string | null;
@@ -202,6 +200,27 @@ interface State {
    */
   highlightIds: string[];
 
+  /**
+   * Where the shared world's idle clock stands, as the server reports it.
+   *
+   * 🔑 THE WORLD IS SHARED AND THIS IS HOW THE DISPLAY ADMITS IT. One database, one world,
+   * every viewer looking at the same thing, so a reset is always global: it lands on
+   * everyone, not only on whoever triggered it. That cannot be prevented without giving
+   * each visitor their own world, so it is disclosed instead.
+   */
+  world: WorldStatus | null;
+  /**
+   * A reset that has just happened and has not been acknowledged.
+   *
+   * 🔑 KEYED OFF `generation`, NOT OFF A TIMER, which is what makes it cover the case with
+   * no warning attached. An idle reset is announced by the countdown beforehand. Another
+   * viewer pressing the button is not announced by anything, and from this browser's point
+   * of view the two are identical: the world simply changed. One mechanism catches both.
+   */
+  resetNotice: string | null;
+  /** Whether the audit log panel is open. Closed until asked for. */
+  auditOpen: boolean;
+
   setAssets: (a: Asset[]) => void;
   setMesh: (m: MeshStatus) => void;
   setIce: (i: IceLayer) => void;
@@ -210,9 +229,11 @@ interface State {
   setLoading: (v: boolean) => void;
   setError: (e: string | null) => void;
   setProjection: (p: Projection) => void;
-  setShowMesh: (v: boolean) => void;
   setShowIce: (v: boolean) => void;
-  setShowUndetected: (v: boolean) => void;
+  setHideUndetected: (v: boolean) => void;
+  setWorld: (w: WorldStatus) => void;
+  setResetNotice: (n: string | null) => void;
+  setAuditOpen: (v: boolean) => void;
   setBbox: (b: ViewportBbox) => void;
   select: (id: string | null) => void;
   appendCommand: (e: CommandEntry) => void;
@@ -245,9 +266,8 @@ export const useStore = create<State>((set) => ({
   projection: (new URLSearchParams(location.search).get("proj") === "mercator"
     ? "mercator"
     : "globe") as Projection,
-  showMesh: true,
   showIce: true,
-  showUndetected: false,
+  hideUndetected: true,
   bbox: null,
   selectedId: null,
   commandLog: [],
@@ -256,6 +276,9 @@ export const useStore = create<State>((set) => ({
   track: null,
   picker: null,
   highlightIds: [],
+  world: null,
+  resetNotice: null,
+  auditOpen: false,
 
   setAssets: (a) => set({ assets: a, loading: false, error: null }),
   setMesh: (m) => set({ mesh: m }),
@@ -265,9 +288,11 @@ export const useStore = create<State>((set) => ({
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e, loading: false }),
   setProjection: (p) => set({ projection: p }),
-  setShowMesh: (v) => set({ showMesh: v }),
   setShowIce: (v) => set({ showIce: v }),
-  setShowUndetected: (v) => set({ showUndetected: v }),
+  setHideUndetected: (v) => set({ hideUndetected: v }),
+  setWorld: (w) => set({ world: w }),
+  setResetNotice: (n) => set({ resetNotice: n }),
+  setAuditOpen: (v) => set({ auditOpen: v }),
   setBbox: (b) => set({ bbox: b }),
   select: (id) => set({ selectedId: id }),
   appendCommand: (e) => set((s) => ({ commandLog: [...s.commandLog, e].slice(-LOG_LIMIT) })),

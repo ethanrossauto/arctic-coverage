@@ -199,9 +199,20 @@ create table if not exists spend_counters (
 -- a command last ran and decides whether a reset is DUE. `last_reset` is when the world was
 -- last laid back down and decides whether one is ALLOWED yet, which is the floor that stops
 -- a bug in the first field turning every page load into a full reseed.
+-- ⚠️ `last_reset_cause` is not bookkeeping, it is what the display tells the viewer. A world
+-- that changes under someone is alarming when it is unexplained and unremarkable when it is
+-- named, and the two causes need different sentences: an idle timeout is something they were
+-- warned about, another viewer pressing reset is not.
 create table if not exists world_state (
-    id            smallint primary key default 1,
-    last_activity timestamptz not null default now(),
-    last_reset    timestamptz not null default now(),
+    id               smallint primary key default 1,
+    last_activity    timestamptz not null default now(),
+    last_reset       timestamptz not null default now(),
+    last_reset_cause text        not null default 'seed',
     constraint world_state_single_row check (id = 1)
 );
+
+-- 🔴 THE SAME NO-OP TRAP AS THE CONSTRAINT ABOVE, and it bites identically. Adding a column
+-- to the statement above changes what a FRESH database gets and changes nothing at all about
+-- one that already exists, so the first write naming the new column fails against a schema
+-- file that is sitting in the repo appearing to declare it.
+alter table world_state add column if not exists last_reset_cause text not null default 'seed';

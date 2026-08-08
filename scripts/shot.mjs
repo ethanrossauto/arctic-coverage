@@ -37,7 +37,12 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: 1500, height: 940 } });
 await page.goto(url, { waitUntil: "networkidle" });
-await page.getByText(/sats\s+\d+/).waitFor({ timeout: 30_000 });
+// ⚠️ WAIT FOR THE ASSET COUNT, NOT FOR A LAYER THAT MAY NOT EXIST. This waited on
+// `sats \d+` and went on waiting for months after the orbital layer was removed, so the
+// one tool for looking at the display timed out against a display that was rendering
+// perfectly. A readiness probe aimed at an optional feature fails as loudly as a broken
+// app and means something entirely different.
+await page.getByText(/assets\s+\d+/).waitFor({ timeout: 30_000 });
 
 let colours = 0;
 const deadline = Date.now() + 45_000;

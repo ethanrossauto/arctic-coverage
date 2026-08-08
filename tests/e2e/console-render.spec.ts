@@ -388,9 +388,41 @@ test("the non-broadcasting contacts are surfaced, and one is held by nothing", a
     "exactly one contact is held by nothing that reaches us",
   ).toBe(1);
 
-  await expect(page.locator(".strip.bottom")).toContainText(
-    `not broadcasting ${dark.length}`,
+  // 🔑 THE STRIP COUNTS DETECTED UNKNOWN: contacts that reached us and will not say what
+  // they are. It used to count every contact with AIS off, which swept in the ones whose
+  // detections never arrived at all, so the strip reported contacts that were deliberately
+  // absent from the map beside it and nobody reading both could reconcile them.
+  //
+  // ⚠️ AND IT IS NOT A SUBSET OF THE AIS-OFF SET, WHICH IS THE WHOLE REASON THE SERVER
+  // COMPUTES IT. `ais_reporting` is a vessel field, so an aircraft or a ground party that is
+  // not announcing carries null there and falls through to a transponder and then to an
+  // emitting flag. On this seed the obvious client-side rule of
+  // `tracked && ais_reporting === false` gives 2 and the truth is 4, and the two would have
+  // disagreed quietly forever. If anyone is ever tempted to move this arithmetic into the
+  // browser to save a field on the wire, this is the assertion that says no.
+  const detectedUnknown = body.entities.filter(
+    (a: { detected_unknown?: boolean }) => a.detected_unknown,
   );
+  const undetected = body.entities.filter((a: { tracked?: boolean }) => a.tracked === false);
+
+  expect(detectedUnknown.length, "there must be contacts we hold but cannot name").toBeGreaterThan(0);
+  expect(undetected.length, "and some the console never saw at all").toBeGreaterThan(0);
+
+  // Disjoint by construction, and worth pinning: one is what reached this console and the
+  // other is what did not, so nothing can be both.
+  const undetectedIds = new Set(undetected.map((a: { id: string }) => a.id));
+  expect(
+    detectedUnknown.filter((a: { id: string }) => undetectedIds.has(a.id)),
+    "a contact cannot be both detected and undetected",
+  ).toHaveLength(0);
+
+  await expect(page.locator(".strip.bottom")).toContainText(
+    `detected unknown ${detectedUnknown.length}`,
+  );
+
+  // A status strip may only count what it can show, and everything it counts here is on the
+  // map with the default controls untouched.
+  await expect(page.locator('.toggle:has-text("HIDE UNDETECTED UNKNOWN") input')).toBeChecked();
 });
 
 test("overdue assets are counted, and it is neither none nor all of them", async ({ page }) => {
@@ -451,12 +483,12 @@ test("asset names are drawn on the map, and nothing is fetched to draw them", as
   expect(offOrigin, "the map must fetch nothing off-origin, glyphs and fonts included").toEqual([]);
 });
 
-test("hiding the mesh removes the link lines, and putting it back restores them", async ({
+test("the mesh link lines are drawn without anyone asking, and cannot be switched off", async ({
   page,
 }) => {
   /**
-   * The mesh is one layer among several now rather than the subject of the display, so it
-   * has to be possible to get it out of the way.
+   * The mesh is what makes this a network picture rather than a map with icons on it, so it
+   * is always drawn and there is no control that can take it away.
    *
    * Asserted by diffing frames captured in this run, never against a stored image. That
    * distinction matters: a reference screenshot of a WebGL globe fails on driver
@@ -465,7 +497,14 @@ test("hiding the mesh removes the link lines, and putting it back restores them"
    *
    * Zoomed in first, because at the opening pole-centred view the links are a handful of
    * thin antialiased pixels and a real regression would hide inside the noise.
+   *
+   * ⏱️ TWO FULL PAGE LOADS, SO IT NEEDS LONGER THAN THE DEFAULT. It used to toggle a
+   * checkbox, which is nearly free; starving the app of links means loading it again with
+   * the response mocked. The reload cannot be avoided by waiting for the next poll, because
+   * `?live=off` is what stops the world moving between the two frames being compared, and
+   * it stops the poll along with it.
    */
+  test.setTimeout(90_000);
   // ?live=off stops the 5s position poll. These assertions compare one frame to another,
   // and the server advances assets it can hear, so a moving world would make a real
   // difference indistinguishable from ordinary motion.
@@ -512,38 +551,50 @@ test("hiding the mesh removes the link lines, and putting it back restores them"
   await page.waitForTimeout(3000);
   await zoomToCluster(page);
 
-  // ⚠️ Scoped by LABEL, not by position. There are two layer toggles in the strip now and
-  // a bare `.toggle input` matches both; an index would silently start testing the wrong
-  // one the day a third is added.
-  const box = page.locator('.toggle:has-text("MESH LINKS") input[type=checkbox]');
-  await expect(box, "the mesh is on by default").toBeChecked();
+  // 🔑 THE CONTRACT CHANGED AND SO DID THIS TEST. The mesh used to have a header checkbox
+  // and this measured hiding and restoring it. The toggle is gone: the mesh is what makes
+  // this a network picture rather than a map with icons on it, and a control that hides the
+  // subject earns its space only if somebody wants the subject hidden.
+  //
+  // ⚠️ SO THE ASSERTION HAD TO MOVE RATHER THAN BE DELETED. What the old test really proved
+  // was that link lines put ink on the screen, and that is still worth proving. It is now
+  // driven by starving the app of links instead of by a control, which is the same mocking
+  // pattern the clarify tests use and for the same reason: it exercises the rendering half
+  // of a contract without depending on a world that moves.
+  const withLinks = await settledImage(page);
 
-  const on = await settledImage(page);
-  await box.uncheck();
-  const off = await settledImage(page);
-  await box.check();
-  const back = await settledImage(page);
+  // ⚠️ EVERYTHING NEEDING REAL DATA IS ASSERTED HERE, on the first load, rather than after a
+  // third reload to undo the mock. Removing a way to hide the lines changed nothing about
+  // what the mesh IS, and the footer is the readout that says so.
+  await expect(page.locator(".strip.bottom")).toContainText(/mesh \d+ links/);
+  // And the control really is gone, so nothing puts it back by accident.
+  await expect(page.locator('.toggle:has-text("MESH LINKS")')).toHaveCount(0);
 
-  const removed = differingPixels(on, off);
-  const restored = differingPixels(on, back);
+  await page.route("**/api/mesh", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ links: [], groups: [], isolated: [], mesh_capable: 0 }),
+    }),
+  );
+  await page.reload();
+  await waitForAppLoaded(page);
+  await waitForMapPainted(page);
+  await page.waitForTimeout(3000);
+  await zoomToCluster(page);
+  const withoutLinks = await settledImage(page);
 
-  // 🔑 PROPORTIONAL, NOT AN ABSOLUTE PIXEL COUNT, because the absolute number is not
+  // 🔑 PROPORTIONAL RATHER THAN AN ABSOLUTE PIXEL COUNT, because the absolute number is not
   // something this test controls. A link is drawn only when both ends are reachable, and
   // reachability moves as the world does, so how much ink the mesh puts on screen differs
   // run to run. An absolute bar calibrated on one afternoon's seed passed alone and failed
   // in a full run, which is the definition of a flaky test.
-  //
-  // What IS invariant is the shape of the three measurements: hiding changes the picture,
-  // and showing puts it back. So the assertion is about the relationship between them.
-  expect(removed, "hiding the mesh must visibly remove the link lines").toBeGreaterThan(12);
   expect(
-    restored,
-    "showing it again must restore the picture, not merely change it again",
-  ).toBeLessThan(removed / 2);
+    differingPixels(withLinks, withoutLinks),
+    "link lines must be drawn without anyone asking for them",
+  ).toBeGreaterThan(12);
 
-  // Hiding the lines hides the lines. It does not change what the mesh IS, and the footer
-  // is the readout that must keep saying so.
-  await expect(page.locator(".strip.bottom")).toContainText(/mesh \d+ links/);
+  await page.unroute("**/api/mesh");
 });
 
 test("no line is drawn until a command asks for one, and it clears on the next", async ({

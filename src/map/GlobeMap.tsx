@@ -137,9 +137,8 @@ export function GlobeMap() {
   const assets = useStore((s) => s.assets);
   const mesh = useStore((s) => s.mesh);
   const ice = useStore((s) => s.ice);
-  const showMesh = useStore((s) => s.showMesh);
   const showIce = useStore((s) => s.showIce);
-  const showUndetected = useStore((s) => s.showUndetected);
+  const hideUndetected = useStore((s) => s.hideUndetected);
   const track = useStore((s) => s.track);
 
   // ---- create the map once -------------------------------------------------
@@ -801,11 +800,12 @@ export function GlobeMap() {
       "asset-points",
       assets
         .filter((a) => a.lat !== null && a.lon !== null)
-        // 🔒 THE DEFAULT PICTURE CLAIMS ONLY WHAT ARRIVED. A contact the network cannot
-        // confirm is not drawn until the operator asks for it, because one of those buckets
-        // is held by nothing at all and the console has no honest basis for knowing it is
-        // there. Revealing them is a deliberate act, which is what the checkbox makes it.
-        .filter((a) => showUndetected || unknownState(a) === null)
+        // 🔒 THE DEFAULT PICTURE CLAIMS ONLY WHAT ARRIVED. An undetected unknown is not
+        // drawn until the operator asks for it, because the line is whether the detection
+        // reached this console: one of those buckets is held by nothing at all, and the
+        // other is held by a sensor that cannot deliver, which leaves us in the same place.
+        // Revealing them is a deliberate act, which is what the checkbox makes it.
+        .filter((a) => !hideUndetected || unknownState(a) === null)
         .map((a) =>
           point([a.lon as number, a.lat as number], {
             id: a.id,
@@ -824,7 +824,7 @@ export function GlobeMap() {
           }),
         ),
     );
-  }, [assets, mesh, ready, showUndetected]);
+  }, [assets, mesh, ready, hideUndetected]);
 
   // The position history a command asked for, and nothing else. Null clears it, which is
   // what makes a trail belong to the question that produced it rather than accumulating.
@@ -958,11 +958,12 @@ export function GlobeMap() {
   // also contains the header, command bar, timebar and footer drawn on top. Counting
   // those made the checkbox's own pixels and an input focus ring read as map content,
   // and produced a confident, entirely wrong conclusion that this API was broken.
-  useEffect(() => {
-    const m = map.current;
-    if (!m || !ready) return;
-    m.setLayoutProperty("mesh-links", "visibility", showMesh ? "visible" : "none");
-  }, [showMesh, ready]);
+  // 🔑 THE MESH IS ALWAYS DRAWN AND HAS NO TOGGLE. It used to have a checkbox in the header,
+  // on the reasoning that its lines are what you turn off to read a dense cluster. That was
+  // true and it was still the wrong trade: the mesh is what makes this a network picture
+  // rather than a map with icons on it, and a control that hides the subject earns its space
+  // only if somebody actually wants it hidden. The layer is added with no `visibility`
+  // property, so visible is its default and nothing has to assert it.
 
   // The ice layer, toggled the same way and for the same reason. This is what
   // "show me the weather overlays" reaches: a layer the client already draws.

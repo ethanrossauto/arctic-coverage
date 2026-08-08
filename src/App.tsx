@@ -14,11 +14,14 @@ import { useEffect, useState } from "react";
 import { fetchAssets, fetchIce, fetchMesh, isOverdue } from "./assets";
 import { AssetBanner } from "./AssetBanner";
 import { AssetPicker } from "./AssetPicker";
+import { AuditPanel } from "./AuditPanel";
 import { CommandBar } from "./CommandBar";
 import { GlobeMap } from "./map/GlobeMap";
 import { IceTimebar } from "./IceTimebar";
 import { useStore } from "./store";
 import { useNow } from "./useNow";
+import { useWorld } from "./useWorld";
+import { COUNTDOWN_VISIBLE_S, formatCountdown, resetWorld } from "./world";
 
 export default function App() {
   const assets = useStore((s) => s.assets);
@@ -29,16 +32,27 @@ export default function App() {
   const error = useStore((s) => s.error);
   const projection = useStore((s) => s.projection);
   const bbox = useStore((s) => s.bbox);
-  const showMesh = useStore((s) => s.showMesh);
-  const setShowMesh = useStore((s) => s.setShowMesh);
-  const showUndetected = useStore((s) => s.showUndetected);
-  const setShowUndetected = useStore((s) => s.setShowUndetected);
+  const hideUndetected = useStore((s) => s.hideUndetected);
+  const setHideUndetected = useStore((s) => s.setHideUndetected);
+  const world = useStore((s) => s.world);
+  const resetNotice = useStore((s) => s.resetNotice);
+  const setResetNotice = useStore((s) => s.setResetNotice);
+  const auditOpen = useStore((s) => s.auditOpen);
+  const setAuditOpen = useStore((s) => s.setAuditOpen);
 
   const setAssets = useStore((s) => s.setAssets);
   const setMesh = useStore((s) => s.setMesh);
   const setIce = useStore((s) => s.setIce);
   const setError = useStore((s) => s.setError);
   const setProjection = useStore((s) => s.setProjection);
+
+  /** The confirmation, and the cooldown message when the floor has not elapsed. */
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+
+  // The shared world's clock, and the signal that a person is actually here.
+  useWorld();
 
   // Assets are the thing an operator is actually looking at, so they load on their
   // own and a failure in any derived layer below must not blank them.
@@ -117,10 +131,35 @@ export default function App() {
   // count that refreshes when the assets do is as current as the data behind it.
   const now = useNow();
   const overdue = assets.filter((a) => isOverdue(a, now)).length;
-  const dark = assets.filter((a) => a.aisReporting === false).length;
+  // 🔑 DETECTED UNKNOWN, WHICH IS THE ONLY UNKNOWN THIS STRIP MAY COUNT. We hold it and it
+  // will not say what it is: a contact that genuinely arrived, identity missing.
+  //
+  // ⚠️ IT REPLACED A "not broadcasting" COUNT, AND THAT WAS A CORRECTION RATHER THAN A
+  // RENAME. The old number was every contact with AIS off, which swept in the two buckets
+  // whose detections never reached this console at all. So the strip reported contacts that
+  // were deliberately absent from the map beside it, and the count and the picture could not
+  // be reconciled by anyone reading both. A status strip may only count what it can show.
+  const detectedUnknown = assets.filter((a) => a.detectedUnknown).length;
+
+  // The countdown speaks only near the end. An engaged viewer never sees it, because any
+  // deliberate act puts the clock back to the full window.
+  const until = world?.enabled ? world.secondsUntilReset ?? null : null;
+  const counting = until !== null && until <= COUNTDOWN_VISIBLE_S;
+
+  const doReset = async () => {
+    setResetBusy(true);
+    setResetError(null);
+    const r = await resetWorld();
+    setResetBusy(false);
+    if (r.ok) {
+      setConfirmReset(false);
+      return;
+    }
+    setResetError(`the world was reset moments ago; ${r.retryAfterS}s before it can go again`);
+  };
 
   return (
-    <div className="app">
+    <div className={`app${auditOpen ? " auditopen" : ""}`}>
       <GlobeMap />
 
       <header className="strip">
@@ -130,34 +169,31 @@ export default function App() {
           {projection === "globe" ? "GLOBE" : "MERCATOR"}
         </button>
 
-        {/* A view setting, so it sits with the projection toggle rather than with the
-            counts in the footer. The footer keeps reporting the mesh either way: hiding
-            the lines hides the lines, it does not hide the fact. */}
-        <label className="toggle">
-          <input
-            type="checkbox"
-            checked={showMesh}
-            onChange={(e) => setShowMesh(e.target.checked)}
-          />
-          MESH LINKS
-        </label>
-
         {/* ⛔ Deliberately not labelled with a count. One of these buckets is a contact
             nothing is holding, and putting a number for it in the top strip would be the
-            console asserting knowledge it does not have. The checkbox reveals; it does not
-            advertise. */}
-        <label className="toggle" title="contacts the network cannot confirm: held but unable to report, or held by nothing at all">
+            console asserting knowledge it does not have.
+
+            🔑 PHRASED AS HIDE, AND CHECKED BY DEFAULT. It was SHOW, unchecked, which drew
+            the same map and said something weaker: an unticked box a viewer never touches
+            leaves the display looking complete when it is not. A ticked HIDE admits on the
+            face of the control that something is being kept back, which is the argument
+            this display is actually making. */}
+        <label
+          className="toggle"
+          title="contacts whose detection never reached this console: held by a sensor that cannot report, or held by nothing at all"
+        >
           <input
             type="checkbox"
-            checked={showUndetected}
-            onChange={(e) => setShowUndetected(e.target.checked)}
+            checked={hideUndetected}
+            onChange={(e) => setHideUndetected(e.target.checked)}
           />
-          UNCONFIRMED
+          HIDE UNDETECTED UNKNOWN
         </label>
       </header>
 
       <AssetBanner />
       <AssetPicker />
+      <AuditPanel />
 
       <CommandBar />
 
@@ -175,8 +211,9 @@ export default function App() {
             <span title="assets past the reporting threshold for their kind">
               overdue <b className={overdue ? "warn" : undefined}>{overdue}</b>
             </span>
-            <span title="contacts held without an AIS broadcast">
-              not broadcasting <b className={dark ? "alert" : undefined}>{dark}</b>
+            <span title="contacts we hold that are not saying what they are">
+              detected unknown{" "}
+              <b className={detectedUnknown ? "alert" : undefined}>{detectedUnknown}</b>
             </span>
             {mesh && (
               <span title="radio links up, connected groups, and assets on no mesh at all">
@@ -199,7 +236,70 @@ export default function App() {
           view {bbox ? (bbox.global ? "all longitudes" : `${bbox.west.toFixed(0)}…${bbox.east.toFixed(0)}°`) : "—"}
           {bbox?.wraps ? " (wraps)" : ""} · {bbox ? `${bbox.south.toFixed(0)}…${bbox.north.toFixed(0)}°` : ""}
         </span>
+
+        {/* 🔑 THE DISCLOSURE IS ALWAYS ON SCREEN, and the countdown only speaks near the
+            end. Everyone here is looking at one shared world, so a reset lands on all of
+            them; that cannot be prevented without giving each visitor a world of their own,
+            so it is said out loud instead. The number is named rather than described,
+            because "resets when idle" leaves a viewer with no way to judge whether they
+            have time to read something. */}
+        {world?.enabled && (
+          <span className={`worldline${counting ? " due" : ""}`}>
+            shared demo world · resets{" "}
+            {counting ? (
+              <>
+                in {formatCountdown(until as number)} ·{" "}
+                <span className="act">interact to keep this session active</span>
+              </>
+            ) : (
+              `after ${Math.round(world.idleResetMinutes)} min idle`
+            )}
+          </span>
+        )}
+
+        <span className="footbtns">
+          {/* Labelled with the word and nothing else. A panel behind a toggle can still be
+              missed, and the answer to that is a legible label rather than opening it
+              uninvited over somebody's map. */}
+          <button onClick={() => setAuditOpen(!auditOpen)} title="the server-side record of every command">
+            AUDIT
+          </button>
+          <button onClick={() => { setResetError(null); setConfirmReset(true); }}>
+            RESET WORLD
+          </button>
+        </span>
       </footer>
+
+      {/* Announced rather than silent. A world that changes with no explanation reads as a
+          broken display, which is the one impression this build can least afford. */}
+      {resetNotice && (
+        <div className="resetnotice" role="status">
+          <span>{resetNotice}</span>
+          <button onClick={() => setResetNotice(null)}>dismiss</button>
+        </div>
+      )}
+
+      {confirmReset && (
+        <div className="modal" role="dialog" aria-modal="true" aria-label="reset the world">
+          <div className="modalcard">
+            <h2>RESET WORLD TO SEED</h2>
+            {/* ⚠️ IT SAYS "ALL USERS" BECAUSE IT MEANS IT. One database, one world. Someone
+                who reads this as resetting only their own view would be wrong, and would
+                find out by taking somebody else's session down with them. */}
+            <p>
+              <span className="shared">This resets the world for ALL USERS currently viewing,</span>{" "}
+              not just you. Any placed assets and the command history will be cleared.
+            </p>
+            {resetError && <p className="err">{resetError}</p>}
+            <div className="modalactions">
+              <button onClick={() => setConfirmReset(false)}>CANCEL</button>
+              <button className="danger" onClick={doReset} disabled={resetBusy}>
+                {resetBusy ? "RESETTING…" : "RESET"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

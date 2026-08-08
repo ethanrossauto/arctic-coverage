@@ -84,6 +84,16 @@ export interface Asset {
   tracked?: boolean;
   /** Contacts only: how many sensors are holding it, whether or not they can report. */
   held?: number;
+  /**
+   * We hold it and it will not say what it is: on our picture, identity unknown.
+   *
+   * 🔒 SERVER-COMPUTED, and deliberately not derived here even though the inputs are on the
+   * wire. `tracked` means "announcing OR reported", so it covers a contact that is simply
+   * telling us who it is, and "announcing" falls through AIS to a transponder to an
+   * emitting flag. Working it out client-side gets the common case right and disagrees with
+   * the server on the rest, which is the sort of drift this display exists to avoid.
+   */
+  detectedUnknown?: boolean;
   /** The one flag, server-computed. `undefined` until the server ships it. */
   flag?: AssetFlag;
   /** Vessels only. `false` is the interesting case. */
@@ -108,6 +118,7 @@ interface WireAsset {
   mesh_connected?: boolean;
   tracked?: boolean;
   held?: number;
+  detected_unknown?: boolean;
   overdue?: boolean;
   flag?: AssetFlag;
 }
@@ -136,6 +147,7 @@ export async function fetchAssets(kind?: AssetKind): Promise<Asset[]> {
     meshConnected: a.mesh_connected,
     tracked: a.tracked,
     held: a.held,
+    detectedUnknown: a.detected_unknown,
     overdue: a.overdue,
     flag: a.flag,
   }));
@@ -330,7 +342,13 @@ export const KIND_LABEL: Record<AssetKind, string> = {
 };
 
 /**
- * Contacts the console cannot honestly claim to have.
+ * UNDETECTED UNKNOWN: contacts the console cannot honestly claim to have.
+ *
+ * 🔑 THE LINE IS "DID THE DETECTION REACH THIS CONSOLE", NOT "DOES A SENSOR HOLD IT". That
+ * distinction is what puts `detected_not_reported` on this side of it rather than with the
+ * contacts we have. A sensor holding something it cannot tell us about leaves the console in
+ * exactly the position it would be in if nothing held it at all. Different faults, same
+ * honest answer: we do not have this contact.
  *
  * 🔒 THE DEFAULT VIEW CLAIMS ONLY WHAT ACTUALLY ARRIVED, and these two buckets did not.
  * They are different problems with different answers, which is why they are one field with

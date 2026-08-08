@@ -21,7 +21,10 @@ Live: **[coverage.skryer.ca](https://coverage.skryer.ca)**
   call at all. Anything it does not recognise goes to a language model, which proposes a plan as JSON and
   never touches state directly.
 - **An audit log** carrying every command: what was said, which tier answered, the plan, each step and
-  its outcome. Written before any effect is visible.
+  its outcome. Written before any effect is visible, and readable on screen, where the steps of one
+  request stay gathered under the request that caused them. The panel is deliberate about what it is:
+  the transcript in the command bar is one browser's memory and dies with the tab, while the log is
+  what the server committed. If the two ever disagree, the log is right.
 - **A mesh graph** computed from live positions, answering two different questions: who can talk to
   whom, and whose messages can still reach this display.
 - **A detection model**, so a sensor's payload decides what it can actually see and the display can
@@ -138,7 +141,9 @@ grammar is deliberate and narrow.
   last reported and it does not move, because animating it onward would be the display inventing a
   position.
 - **One thing on screen is allowed to be red**: a contact that is not broadcasting. Everything else
-  lives in a green-to-blue family, so the eye goes to the anomaly without being told to.
+  lives in a green-to-blue family, so the eye goes to the anomaly without being told to. Role markings
+  are muted for the same reason: the backhaul badge was measured putting six times as much ink on the
+  default view as the one contact nobody can identify, which is the wrong thing to be loudest.
 - **Existing radar sites are desaturated** and sit behind the deployable layer. They are infrastructure
   to work alongside, not owned assets, and they should read as background.
 - **A track drawn dashed was inferred, not reported.** A contact held only by a sensor gets a dashed
@@ -204,10 +209,21 @@ Worth its own section, because the failures this project most wanted to avoid ar
   polygon set, so within a few kilometres of a shore the data cannot resolve which side a point is on.
   A refusal names a medium and a distance and can be checked. An approval near a coast proves nothing,
   and nothing here claims it does.
-- **The uncovered contacts are simulation ground truth, not an observation.** The coverage view can
-  reveal contacts that no sensor holds. **The console could not legitimately know those exist**, so
-  they sit behind a control that is off by default, and the default view asserts only what the sensor
-  network actually delivered.
+- **The undetected unknowns are simulation ground truth, not an observation.** The coverage view can
+  reveal contacts whose detection never arrived. **The console could not legitimately know those
+  exist**, so they sit behind a control that hides them by default, and the default view asserts only
+  what the sensor network actually delivered. The line is whether the detection reached this console,
+  not whether some sensor holds the contact: a sensor holding something it cannot report leaves the
+  console exactly where nothing holding it would, so both sit on the same side of it. What the status
+  strip counts is the other case, **detected unknown**: contacts we do hold, that will not say what
+  they are.
+- **The world is shared, and it resets.** One database, one world, so every visitor is looking at the
+  same thing and anyone can move or delete an asset. It returns to the seeded scenario after thirty
+  minutes with nobody using it, or when someone presses the reset control, and a reset applies to
+  everyone currently viewing rather than only to whoever triggered it. The display says so on the
+  status strip, counts down before it happens, and says afterwards that it did. **This is disclosed
+  rather than prevented**, because giving each visitor a private world would mean threading a session
+  through every entity and every audit row, which is a different application from this one.
 - **Position history is reconstructed, not recorded.** Positions come from a model of how each asset
   travels. For seeded assets on known routes those are the same thing by construction. For anything a
   person has moved by hand they are not.
@@ -274,6 +290,17 @@ that should not be published.
   scheduling call was deliberate: the finding that matters is that the field naming a polygon's ice
   stage reports the **thickest** stage present, so reading it as "the thickness here" would
   systematically overstate how safe the ice is.
+- **Next: close the loop between the two tiers.** The deterministic parser works out which of your
+  words it could not place, and that finding is shown to you and withheld from the model. There are
+  two routes to the second tier and only one of them carries anything from the first: when the parser
+  produces a plan naming something that does not exist, the retry hands the model the failed name and
+  every real one. When the parser cannot place enough of the sentence to try, the model gets the
+  sentence alone. So an identical misspelling succeeds or fails depending on whether the parser
+  guessed first, which is arbitrary from where the operator is sitting. Passing the parser's trace and
+  the known names on every call would fix it, and is not done here for a reason worth stating: the
+  transcription prompt is built the same way, from live asset names, and on weak audio it inserted
+  names nobody had said. A hint list that dominates is a failure mode this project has already
+  measured once, and doing it to the tier that answers commands deserves the same measurement first.
 
 ---
 

@@ -44,11 +44,23 @@ from . import db
 # Calls per IP per DAY. A day rather than an hour because the thing being protected
 # against is a script grinding away, and an hourly window lets the same script come back
 # twenty-four times.
-PER_IP_DAILY = 50
+#
+# 🔑 RAISED FROM 50, AND THE REASON IS THE ONE CASE THAT MATTERS. Fifty is ample for a
+# visitor having a look, and it is not ample for the author driving the deployed site
+# through a live walkthrough while also having tested it earlier the same day. Meeting a cap
+# in front of an audience is the exact failure the owner exemption was built to prevent, and
+# the exemption only covers the machine this was built on. Raising the ceiling protects that
+# session without depending on an address that can change underneath it.
+PER_IP_DAILY = 100
 
 # Calls across everyone per day. The real backstop: a per-IP limit is no defence at all
 # against a handful of addresses.
-GLOBAL_DAILY = 300
+#
+# ⚠️ THIS IS THE NUMBER THAT BOUNDS THE BILL, so raising it is a spending decision rather
+# than a tuning one. It is deliberately more than five times the per-address cap: a global
+# limit that a single caller could reach on their own would let one visitor close the demo
+# for everybody, which is a denial of service dressed as a safety feature.
+GLOBAL_DAILY = 500
 
 
 @dataclass
@@ -66,6 +78,13 @@ def _owner_ips() -> set[str]:
     🔑 THIS EXISTS FOR ONE CONCRETE REASON: recording the demo video. Hitting a rate limit
     mid-take, on the machine that owns the project, would be a self-inflicted wound at the
     worst moment. Set `OWNER_IPS` to a comma-separated list.
+
+    🔒 DEVELOPMENT ONLY, AND THAT IS A DECISION RATHER THAN AN OMISSION. It is set on the
+    local server and deliberately not in the deployed environment. An exemption there would
+    have to name a home address that changes without warning, and a stale entry is worse
+    than none: it reads as protection while the counter climbs behind it. The deployed site
+    is protected by having caps high enough not to need an exemption instead, which is why
+    they were raised rather than why one was added.
     """
     raw = os.environ.get("OWNER_IPS", "")
     return {ip.strip() for ip in raw.split(",") if ip.strip()}

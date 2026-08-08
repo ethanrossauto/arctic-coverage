@@ -9,6 +9,13 @@
   --accent: #7fe3c0;
   --warn: #ffd166;
   --err: #ff6b6b;
+  /* 🔴 THE BOTTOM STRIP'S HEIGHT, DECLARED ONCE AND READ BY BOTH THINGS THAT DEPEND ON IT.
+     The timebar floats at a fixed offset above the footer, so the two were coupled by a
+     number that appeared in two places and agreed only by luck. Adding a control to the
+     footer broke that agreement: the strip grew, covered the bottom of the timebar, and
+     silently intercepted clicks on its GO button, which failed as a timeout naming no
+     layout at all. Declared here and used by both, they cannot drift apart. */
+  --footer-h: 35px;
 }
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
@@ -31,7 +38,10 @@ body {
   border-bottom: 1px solid var(--line);
   z-index: 5;
 }
-.strip.bottom { top: auto; bottom: 0; border-bottom: 0; border-top: 1px solid var(--line); }
+.strip.bottom {
+  top: auto; bottom: 0; height: var(--footer-h);
+  border-bottom: 0; border-top: 1px solid var(--line);
+}
 .brand { color: var(--accent); letter-spacing: 0.14em; font-weight: 600; }
 .sep { flex: 0 0 1px; height: 14px; background: var(--line); }
 .dim { color: var(--dim); margin-left: auto; }
@@ -71,7 +81,7 @@ b.alert { color: var(--err); }
    `color-scheme: dark` makes the native range thumb render dark; without it
    Chromium draws a light thumb that looks like a rendering fault on this palette. */
 .timebar {
-  position: absolute; left: 0; right: 0; bottom: 33px;
+  position: absolute; left: 0; right: 0; bottom: var(--footer-h);
   display: flex; align-items: center; gap: 12px;
   padding: 7px 12px;
   background: var(--panel);
@@ -380,3 +390,89 @@ b.alert { color: var(--err); }
   transform-origin: left center;
   transition: transform 80ms linear;
 }
+
+/* ---- the audit log -------------------------------------------------------------
+   A right rail rather than a drawer, because the thing worth showing is several rows
+   gathered under one command, and a shallow strip can only ever show one of them. */
+.audit {
+  position: absolute; right: 12px; top: 46px; bottom: 70px;
+  width: 332px;
+  display: flex; flex-direction: column;
+  padding: 9px 11px 11px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  z-index: 6;
+}
+.audit header { display: flex; align-items: baseline; gap: 8px; }
+.audit .aname { flex: 1 1 auto; color: var(--accent); font-weight: 600; letter-spacing: 0.06em; }
+.audit .anote { color: var(--dim); margin: 6px 0 8px; line-height: 1.45; }
+.audit .err { margin: 6px 0; }
+
+/* When both are open the banner steps aside. Two overlapping panels on the same edge is
+   the one arrangement that reads as a bug rather than a layout. */
+.app.auditopen .banner { right: 356px; }
+
+.agroups, .arows { list-style: none; margin: 0; padding: 0; }
+.agroups { overflow-y: auto; display: flex; flex-direction: column; gap: 9px; }
+.agroup { border-left: 1px solid var(--line); padding-left: 8px; }
+.ahead { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.atime { color: var(--text); }
+.aid { color: var(--dim); }
+.acount { color: var(--accent); font-size: 10px; letter-spacing: 0.08em; }
+.arows { margin-top: 3px; display: flex; flex-direction: column; gap: 2px; }
+.arow { display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; color: var(--dim); }
+.arow.bad .atool { color: var(--err); }
+.atool { color: var(--text); }
+.aent { color: var(--accent); }
+.ares { color: var(--err); }
+.adetail { flex: 1 1 100%; color: var(--dim); overflow-wrap: anywhere; }
+
+/* ---- the shared world: disclosure, countdown, reset ---------------------------
+   All three live in the footer beside the counts, because they are facts about the
+   state of the world rather than controls over what is drawn. */
+.worldline { color: var(--dim); }
+.worldline.due { color: var(--warn); }
+.worldline .act { color: var(--text); }
+.footbtns { display: flex; gap: 8px; margin-left: 12px; }
+/* 🔴 SIZED TO THE TEXT LINE, AND THAT IS LOAD-BEARING RATHER THAN COSMETIC. The bottom
+   strip is one line tall and the timebar is positioned at a fixed offset above it, so a
+   control that makes the footer taller pushes the strip up over the timebar and silently
+   swallows clicks on it. That is not hypothetical: ordinary-height buttons here took the
+   footer from 33px to 41px, and the eight pixels of overlap were enough to intercept the
+   timebar's GO button and fail its test with a timeout rather than anything that named a
+   layout. Keep these inside the line box. */
+.footbtns button { padding: 0 8px; font-size: 10px; line-height: 14px; letter-spacing: 0.08em; }
+.resetnotice {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  bottom: 76px;
+  padding: 6px 12px;
+  background: var(--panel); backdrop-filter: blur(6px);
+  border: 1px solid var(--warn); color: var(--warn);
+  z-index: 9;
+  display: flex; align-items: center; gap: 10px;
+}
+.resetnotice button { padding: 1px 7px; }
+
+/* ---- the reset confirmation --------------------------------------------------
+   Modal because it is the one destructive act a stranger can perform here, and it is
+   destructive for everybody rather than only for them. */
+.modal {
+  position: absolute; inset: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: center;
+  background: #050a10b3;
+}
+.modalcard {
+  width: min(420px, calc(100% - 32px));
+  padding: 14px 16px 16px;
+  background: var(--panel); backdrop-filter: blur(6px);
+  border: 1px solid var(--warn);
+}
+.modalcard h2 {
+  margin: 0 0 8px; font-size: 12px; letter-spacing: 0.1em;
+  color: var(--warn); font-weight: 600;
+}
+.modalcard p { margin: 0 0 10px; line-height: 1.5; }
+.modalcard .shared { color: var(--text); }
+.modalactions { display: flex; justify-content: flex-end; gap: 8px; }
+.modalactions .danger { border-color: var(--warn); color: var(--warn); }

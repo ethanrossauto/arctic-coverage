@@ -61,8 +61,18 @@ export const KIND_COLOR: Record<string, string> = {
   aircraft: "#d8dee9",
   ground_party: "#d8dee9",
   marker: "#c9d4e0",
-  /** The backhaul badge. Its own colour: being the way out is not a condition. */
-  gateway_badge: "#7fe3c0",
+  /**
+   * The backhaul badge. Its own colour: being the way out is not a condition.
+   *
+   * 🔑 DESATURATED RATHER THAN SHRUNK, AND THE MEASUREMENT IS WHY. At the accent mint it
+   * put 918 px on the default view against 152 px for the one contact nothing can identify,
+   * six to one in favour of a role badge over the thing the display exists to surface. The
+   * badge was made larger deliberately and stays larger: size is what makes it findable at
+   * a glance, and the problem was never that it was easy to find. Saturation is what makes
+   * it shout, so saturation is what came off. Same hue family, so it still reads as part of
+   * the network rather than as a new category.
+   */
+  gateway_badge: "#60a990",
 };
 
 /** Dark backing so an icon punches out over land as well as over water. */

@@ -40,7 +40,7 @@ try:
 except Exception:  # noqa: BLE001
     detect = None  # type: ignore[assignment]
 
-from ._lib import executor, parser, ratelimit, transcribe
+from ._lib import executor, lifecycle, parser, ratelimit, transcribe
 from ._lib import llm as llmlib
 from ._lib import mesh as meshlib
 from ._lib import tools as toollib
@@ -197,6 +197,15 @@ def _add_tracking(rows: list[dict]) -> None:
         announcing = bool(self_reporting(row)) if self_reporting else False
         row["held"] = len(found)
         row["tracked"] = announcing or bool(reported)
+        # 🔑 DETECTED UNKNOWN: we hold it, and it will not say what it is. Computed HERE
+        # rather than in the browser, even though `tracked` and `ais_reporting` are both on
+        # the wire and the client could nearly derive it. Nearly is the problem. `tracked`
+        # is `announcing or reported`, so it spans two buckets, and "announcing" is not the
+        # same question as `ais_reporting is False`: a contact with no AIS field at all
+        # falls through to a transponder and then to an emitting flag. A client rule of
+        # `tracked && ais_reporting === false` gets the common case right and quietly
+        # disagrees with the server about the rest, which is two answers to one question.
+        row["detected_unknown"] = bool(reported) and not announcing
 
 
 @app.get("/api/mesh")
@@ -762,3 +771,66 @@ def events(
         {"events": rows, "count": len(rows), "max_id": max_id},
         headers={"cache-control": "no-store"},
     )
+
+
+@app.get("/api/world")
+def world() -> JSONResponse:
+    """The idle clock, phrased for the thing on screen that has to explain it.
+
+    🔑 IT RUNS THE IDLE CHECK, and that is deliberate rather than a leak. There is no
+    scheduler here, so the reset can only ever be NOTICED by a request that was happening
+    anyway. If the countdown polled something inert it would reach zero and sit there while
+    the world stayed stale, waiting for somebody else to arrive, and a timer that visibly
+    lies at zero is worse than no timer. Polling this is what makes the number true.
+
+    ⚠️ THE POLL ITSELF IS NOT ACTIVITY. It refreshes nothing, which is the whole reason an
+    abandoned tab cannot hold the world open. See `lifecycle.mark_activity` for the other
+    half.
+    """
+    with db.connect() as conn, conn.cursor() as cur:
+        lifecycle.reset_if_idle(cur=cur)
+        conn.commit()
+    return JSONResponse(lifecycle.status(), headers={"cache-control": "no-store"})
+
+
+@app.post("/api/world/touch")
+def world_touch() -> JSONResponse:
+    """Somebody is deliberately using the display. Hold the reset off.
+
+    🔑 A SEPARATE VERB FROM THE POLL ABOVE BECAUSE THEY MEAN OPPOSITE THINGS. A GET says
+    "what is the state", and answering it must not change the state or one open tab keeps
+    the world alive forever. A POST here says "a person did something", which is exactly the
+    signal the idle window is supposed to measure and the one thing traffic alone cannot
+    tell you.
+
+    The client sends this only for deliberate acts: panning, zooming, selecting, toggling a
+    layer. Not for its own five-second refresh.
+    """
+    lifecycle.mark_activity()
+    return JSONResponse(lifecycle.status(), headers={"cache-control": "no-store"})
+
+
+@app.post("/api/reset")
+def reset_world() -> JSONResponse:
+    """Put the seeded world back, because a viewer asked for it.
+
+    🔒 OPEN TO EVERYONE, WHICH IS A DECISION AND NOT AN OVERSIGHT. Gating this to the
+    owner's address would hide it from precisely the person it exists for: a stranger who
+    has arrived to a world somebody else left in a mess. The protections are that it says
+    what it will do before it does it, and that `lifecycle.reset_now` will not run it more
+    than once a minute.
+
+    ⚠️ 429 RATHER THAN A SILENT NO. The caller is a person watching a button, so the answer
+    has to be something the interface can say out loud, which means the seconds remaining
+    rather than a bare failure.
+    """
+    result = lifecycle.reset_now()
+    if not result.get("ok"):
+        retry = int(result.get("retry_after_s", 0))
+        return JSONResponse(
+            {"ok": False, "retry_after_s": retry,
+             "detail": f"the world was reset moments ago; {retry}s before it can be reset again"},
+            status_code=429,
+            headers={"cache-control": "no-store", "retry-after": str(retry)},
+        )
+    return JSONResponse(result, headers={"cache-control": "no-store"})

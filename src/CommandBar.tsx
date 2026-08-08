@@ -18,12 +18,19 @@ import { useEffect, useRef, useState } from "react";
 
 import { fetchAssets, fetchMesh } from "./assets";
 import { useStore } from "./store";
-import type { CameraTarget } from "./store";
+import type { AssetTrack, CameraTarget } from "./store";
 
 /** What the server may ask the client to do after a plan runs. */
 interface UiEffects {
   camera?: CameraTarget;
   select?: string | null;
+  /**
+   * A position series for one asset, oldest first, lon-first.
+   *
+   * ⚠️ It arrives with a `camera` already framed to it, so nothing here adds a second
+   * camera move on top.
+   */
+  track?: AssetTrack;
 }
 
 interface CommandResponse {
@@ -53,6 +60,7 @@ export function CommandBar() {
   const setMesh = useStore((s) => s.setMesh);
   const select = useStore((s) => s.select);
   const setCamera = useStore((s) => s.setCamera);
+  const setTrack = useStore((s) => s.setTrack);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const recorder = useRef<MediaRecorder | null>(null);
@@ -94,6 +102,10 @@ export function CommandBar() {
       const fx = body.ui_effects ?? {};
       if (fx.camera) setCamera(fx.camera);
       if (fx.select !== undefined) select(fx.select);
+      // Unconditional, including when the key is absent: a trail belongs to the question
+      // that produced it, so the next command clears it rather than leaving the previous
+      // answer drawn under the new one.
+      setTrack(fx.track ?? null);
 
       // Anything may have changed the world, so the world is refetched rather than
       // patched locally. Patching would mean the client owning a second model of state

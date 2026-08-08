@@ -30,15 +30,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from api._lib.mesh import haversine_km, radio_horizon_km  # noqa: E402
+from api._lib.mesh import GROUND, LINK_RANGE_KM, haversine_km  # noqa: E402
 from api._lib.terrain import _rings, is_land  # noqa: E402
 
-# Target spacing, and the horizon it is derived from. 22 km is about 77% of the pairwise
-# horizon for two 12 m masts, which leaves margin for the terrain this model does not
-# have and for a neighbour going down.
-NODE_MAST_M = 12.0
+# Target spacing, and the link range it is derived from. 22 km is about 88% of the
+# ground-to-ground range, which leaves a couple of kilometres of margin for a chain that
+# has to survive a node going down and a coastline that is not a straight line.
+#
+# ⚠️ READ FROM THE LINK MODEL RATHER THAN TYPED HERE. A spacing constant that does not
+# move when the range does is how a seed quietly stops being connected.
 TARGET_SPACING_KM = 22.0
-MAX_SPACING_KM = radio_horizon_km(NODE_MAST_M, NODE_MAST_M)
+MAX_SPACING_KM = LINK_RANGE_KM[frozenset({GROUND})]
 
 # Each chokepoint as an axis down the middle of the waterway, plus how many nodes to put
 # on it. The axes are the real navigable routes; the nodes end up on whichever shore is
@@ -88,7 +90,8 @@ AXES: list[tuple[str, str, int, list[tuple[float, float]]]] = [
 def interpolate(axis: list[tuple[float, float]], step_km: float = 4.0) -> list[tuple[float, float]]:
     """Dense sample points along a polyline axis, roughly `step_km` apart."""
     out: list[tuple[float, float]] = []
-    for (lat1, lon1), (lat2, lon2) in zip(axis, axis[1:]):
+    # strict=False on purpose: axis[1:] is one shorter, which is what pairs consecutive points.
+    for (lat1, lon1), (lat2, lon2) in zip(axis, axis[1:], strict=False):
         seg = haversine_km(lat1, lon1, lat2, lon2)
         n = max(1, int(seg / step_km))
         for i in range(n):
@@ -144,7 +147,7 @@ def _best_ring(axis: list[tuple[float, float]], corridor_km: float = 80.0) -> li
     """
     best = None
     best_score = 2
-    for ring, min_lon, min_lat, max_lon, max_lat in _rings():
+    for ring, *_bbox in _rings():
         if len(ring) < 8:
             continue
         score = 0
@@ -258,12 +261,12 @@ def place(key: str, count: int, axis: list[tuple[float, float]]) -> list[tuple[f
 
 
 def main() -> int:
-    print(f"# spacing target {TARGET_SPACING_KM} km, hard max {MAX_SPACING_KM:.1f} km "
-          f"(radio horizon, {NODE_MAST_M:.0f} m masts)\n")
+    print(f"# spacing target {TARGET_SPACING_KM} km, hard max {MAX_SPACING_KM:.0f} km "
+          f"(ground to ground link range)\n")
     ok = True
     for key, label, count, axis in AXES:
         pts = place(key, count, axis)
-        gaps = [haversine_km(*a, *b) for a, b in zip(pts, pts[1:])]
+        gaps = [haversine_km(*a, *b) for a, b in zip(pts, pts[1:], strict=False)]
         all_land = all(is_land(*p) for p in pts)
         linked = all(g <= MAX_SPACING_KM for g in gaps)
         status = "ok" if (all_land and linked and len(pts) == count) else "PROBLEM"

@@ -1,0 +1,63 @@
+# Everything real lives in tests/run.sh, and this file only installs what that script needs
+# and calls it. Two reasons: anyone can reproduce a red build locally with one command instead
+# of reading yaml, and a check that can only run on a GitHub runner is a check nobody runs
+# before pushing.
+#
+# ⚠️ THIS DOES NOT GATE THE DEPLOY. Vercel's git integration ships this site on a push to main
+# and runs independently of Actions, so a red check here will not stop a deploy. Making it gate
+# is a Vercel setting and a separate decision. Do not describe this as protecting the site.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 🔒 READ-ONLY, AND NO SECRETS ARE USED ANYWHERE IN THIS FILE. That is what lets it run on a
+# pull request from a fork. It is also a real constraint on the suite rather than a nicety:
+# every check in tests/run.sh works against fixtures, and the browser suite, which needs a live
+# database, is opt-in there precisely so this stays true.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ⚠️ PINNED TO THE VERSION THE PROJECT IS DEVELOPED ON. `python-version: '3.x'` would
+      # silently move to whatever is current and turn a green tree red with no commit behind
+      # it, which is the least useful kind of failure.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # ⚠️ BOTH MANIFESTS, AND THE REASON IS WRITTEN IN requirements.txt. That file is what
+      # the deployed function installs; the `dev` extra in pyproject.toml is pytest, uvicorn
+      # and httpx. Installing only the first leaves the suite unable to import
+      # `fastapi.testclient`, which needs httpx, so CI would have gone red on its first run
+      # for a missing test dependency rather than for anything real.
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e ".[dev]"
+          pip install ruff mypy
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # tests/run.sh prefers .venv/bin/python and falls back to python3, which is what the
+      # runner has. Nothing here needs to know which.
+      - name: Run every check
+        run: bash tests/run.sh

@@ -17,19 +17,24 @@
  * (maplibre-gl-js#6248). A zoomed-out polar view of local GeoJSON is this app's
  * opening shot, so on v5 the bug would be the first thing anyone saw.
  *
- * ⚠️ SYMBOL LAYERS FOR ICONS, DOM MARKERS FOR TEXT, and the line between them is a
- * real constraint rather than a preference. MapLibre needs a `glyphs` endpoint only
- * when a symbol layer carries a `text-field`; the default for that endpoint is a
- * remote URL, which would quietly reintroduce the external dependency this file
- * exists to avoid. An ICON-ONLY symbol layer needs no glyphs at all, so icons go
- * through symbol layers (see ./icons.ts) and get rotation, overlap control and
- * correct occlusion behind the globe. Anything with text stays a DOM marker.
+ * ⚠️ SYMBOL LAYERS THROUGHOUT, AND NO `text-field` ANYWHERE. MapLibre needs a `glyphs`
+ * endpoint only when a symbol layer carries a `text-field`; the default for that
+ * endpoint is a remote URL, which would quietly reintroduce the external dependency
+ * this file exists to avoid. An ICON-ONLY symbol layer needs no glyphs at all, so
+ * everything drawn at a point goes through one, and gets rotation, overlap control and
+ * correct occlusion behind the globe for free.
  *
- * ⚠️ This paragraph previously read "NO SYMBOL LAYERS, DELIBERATELY". That was true
- * when the only symbol layer anyone wanted had labels on it, and it stayed in the
- * file for one commit after icons.ts made it false.
+ * ⚠️ THAT INCLUDES THE NAME LABELS, which are text drawn to a canvas and registered as
+ * images. See ./labels.ts for why that beat the two obvious alternatives. This paragraph
+ * used to end "Anything with text stays a DOM marker", which was the right call while
+ * the only text on the map was hypothetical and the wrong one once it had to collide
+ * with 67 other labels.
+ *
+ * ⚠️ It previously read "NO SYMBOL LAYERS, DELIBERATELY". That was true when the only
+ * symbol layer anyone wanted had labels on it, and it stayed in the file for one commit
+ * after icons.ts made it false.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 // MapLibre v6 removed the default export; everything is a named import now.
 import { config as maplibreConfig, Map as MapLibreMap, type GeoJSONSource } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -50,9 +55,11 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // broken build ship.
 maplibreConfig.WORKER_URL = "/maplibre/maplibre-gl-worker.mjs";
 
+import { isGateway, isUnreachable, ringState, weakAssetIds } from "../assets";
 import { useStore } from "../store";
 import { viewportBbox } from "./bounds";
 import { buildIcons, iconImageExpression, ICON_PIXEL_RATIO } from "./icons";
+import { labelImage, labelImageExpression, labelImageId, LABEL_PIXEL_RATIO } from "./labels";
 
 const COLOR = {
   ocean: "#050a10",
@@ -69,8 +76,26 @@ const COLOR = {
   radar: "#5a6b7a",
   vesselAis: "#d8dee9",
   vesselDark: "#ff5c5c",
+  // Queried position history.
+  //
+  // 🔑 A HUE NOTHING ELSE ON THIS DISPLAY USES, and that is the whole selection criterion.
+  // Amber was the first choice and was wrong: it is already the degraded status ring and
+  // the launch-site icon, so a trail would have shared a colour with two things that mean
+  // a condition. Every other colour here encodes what an asset IS or how it is DOING. A
+  // trail encodes neither; it is the answer to a question somebody just typed, which is a
+  // different category and earns its own hue. It also has to stay legible over dark ocean,
+  // dark land and bright ice, which rules out anything pale.
+  track: "#c792ea",
+  // ---- the three condition rings, and nothing else uses these -------------
+  /** Maintenance: the kit needs attention and we can still hear it. */
+  maintenance: "#ffd166",
+  /** Weak: still connected, but its best link has almost no margin left. */
+  weak: "#ff9f43",
+  /** Unreachable: no live path to a gateway, so the icon greys out with the ring. */
+  unreachable: "#6b7683",
+  /** What the operator clicked. */
+  selected: "#7fe3c0",
   degraded: "#ffd166",
-  silent: "#8a4a4a",
   land: "#111b26",
   coast: "#2b4258",
   graticule: "#16242f",
@@ -91,10 +116,21 @@ const INITIAL_VIEW = { center: [-95, 74] as [number, number], zoom: 2.1 };
 export function GlobeMap() {
   const container = useRef<HTMLDivElement>(null);
   const map = useRef<MapLibreMap | null>(null);
-  const ready = useRef(false);
+  // State rather than a ref, deliberately: the layer effects below have to RUN when the
+  // icons finish building, and a ref changing wakes nothing up. That is what the old
+  // `useStore.setState(s => ({...s}))` nudge was standing in for.
+  const [ready, setReady] = useState(false);
 
   const projection = useStore((s) => s.projection);
   const setBbox = useStore((s) => s.setBbox);
+
+  // 🔑 ONE SELECTOR PER LAYER. Each of these drives its own effect below, so a change
+  // to one never re-uploads the others. See the note above the effects.
+  const assets = useStore((s) => s.assets);
+  const mesh = useStore((s) => s.mesh);
+  const ice = useStore((s) => s.ice);
+  const showMesh = useStore((s) => s.showMesh);
+  const track = useStore((s) => s.track);
 
   // ---- create the map once -------------------------------------------------
   useEffect(() => {
@@ -139,6 +175,12 @@ export function GlobeMap() {
             type: "fill",
             source: "ice",
             paint: {
+              // 🔴 ANTIALIAS OFF, AND IT HAS TO STAY OFF. Turning it on looks like the
+              // obvious fix for a blocky layer and does the opposite: MapLibre antialiases
+              // each polygon's own edge, so every one of the thousands of adjacent cells
+              // draws a seam against its neighbours and the whole ice field gains a visible
+              // mesh. Tried, screenshotted, reverted. Smoothness comes from shading between
+              // samples, not from softening edges that should not be visible at all.
               "fill-antialias": false,
               "fill-color": [
                 "case",
@@ -204,24 +246,54 @@ export function GlobeMap() {
       // A layer per kind would mean five sources to keep in step and five style
       // blocks that drift apart; the kind is data, so it belongs in the paint
       // expression rather than in the layer list.
-      m.addSource("asset-lines", { type: "geojson", data: emptyFC() });
+      // ---- queried position history ---------------------------------------
+      //
+      // 🔒 THE ONLY LINE-PER-ASSET ON THIS MAP, AND IT IS DRAWN ONLY WHEN ASKED FOR.
+      //
+      // This replaced a layer that drew each asset's seeded route permanently. Eleven of
+      // the sixty-eight carried one, so the display opened with lines trailing behind
+      // vessels and patrols that nobody had asked about. Two things were wrong with that.
+      // It is scenery, competing for attention with the two questions the console exists
+      // to answer. And it meant the answer to "where has this been" would be drawn in the
+      // same visual language as something that was already on screen, so the one command
+      // that produces a line would have produced no visible change.
+      //
+      // Amber because it has to survive being drawn over dark ocean, dark land and bright
+      // ice, and because it is the palette's attention colour: a trail here is the answer
+      // to a question somebody just asked, which is exactly what should be pulling the
+      // eye. Heavier and far more opaque than a mesh link, which is the other thin line
+      // on this map, so the two never read as the same kind of thing.
+      m.addSource("history-track", { type: "geojson", data: emptyFC() });
       m.addLayer({
-        id: "asset-lines",
+        id: "history-track",
         type: "line",
-        source: "asset-lines",
+        source: "history-track",
+        layout: { "line-cap": "round", "line-join": "round" },
         paint: {
-          "line-color": [
-            "match",
-            ["get", "kind"],
-            "patrol", COLOR.patrol,
-            "vessel", ["case", ["get", "dark"], COLOR.vesselDark, COLOR.vesselAis],
-            COLOR.node,
-          ],
-          "line-width": ["case", ["get", "dark"], 1.6, 1.0],
-          // A track held only by a sensor is drawn dashed, because it is inferred
-          // rather than reported. The distinction is the whole point of the contact.
-          "line-dasharray": ["case", ["get", "dark"], ["literal", [2, 2]], ["literal", [1, 0]]],
-          "line-opacity": 0.55,
+          "line-color": COLOR.track,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 2, 2.0, 6, 3.0],
+          // Fully opaque, unlike every other line here. A mesh link is ambient and sits
+          // back at 0.6; this is the answer to a question somebody just asked and should
+          // sit in front of everything. It also means the colour on screen IS the colour
+          // in this file, with no blend against whatever it happens to cross, which is
+          // what makes it assertable.
+          "line-opacity": 1,
+        },
+      });
+
+      // Where the series STARTS. A bare line says where something went but not which end
+      // it came from, and "oldest first" is a fact about the array that the picture
+      // otherwise throws away.
+      m.addSource("history-origin", { type: "geojson", data: emptyFC() });
+      m.addLayer({
+        id: "history-origin",
+        type: "circle",
+        source: "history-origin",
+        paint: {
+          "circle-radius": 3.5,
+          "circle-color": COLOR.track,
+          "circle-stroke-color": COLOR.ocean,
+          "circle-stroke-width": 1,
         },
       });
 
@@ -260,24 +332,62 @@ export function GlobeMap() {
       //
       // It also degrades honestly for anyone who cannot rely on colour: every kind is
       // still distinguishable in outline with the ring removed entirely.
-      m.addSource("asset-points", { type: "geojson", data: emptyFC() });
+      // `promoteId` lifts the asset id onto the FEATURE id, which is what makes
+      // `setFeatureState` usable. Selection is then a per-feature flag the GPU reads,
+      // rather than a property baked into the data, so clicking an asset does not
+      // re-upload all 68 features to the worker.
+      m.addSource("asset-points", { type: "geojson", data: emptyFC(), promoteId: "id" });
+
+      // ---- selection ------------------------------------------------------
+      // Under everything, so it reads as a spotlight the asset is standing in rather
+      // than as another ring competing with the condition ring above it.
+      m.addLayer({
+        id: "asset-selected",
+        type: "circle",
+        source: "asset-points",
+        paint: {
+          "circle-radius": 20,
+          "circle-color": COLOR.selected,
+          "circle-opacity": [
+            "case", ["boolean", ["feature-state", "selected"], false], 0.22, 0,
+          ],
+          "circle-stroke-color": COLOR.selected,
+          "circle-stroke-width": 1,
+          "circle-stroke-opacity": [
+            "case", ["boolean", ["feature-state", "selected"], false], 0.9, 0,
+          ],
+        },
+      });
+
+      // ---- the condition ring ---------------------------------------------
+      //
+      // 🔑 THREE RINGS, THREE QUESTIONS, AND THE COLOURS ARE NOT DECORATION.
+      //
+      //   yellow  maintenance   the kit needs attention, and we can still hear it
+      //   orange  weak          still connected, but its best link is nearly gone
+      //   grey    unreachable   we are not hearing from it, so everything else is stale
+      //
+      // Nominal assets get no ring at all. Drawing one in the background colour would
+      // still cost a halo around every icon and make a busy display busier for nothing.
+      //
+      // ⚠️ RED IS NOT IN THIS LIST, DELIBERATELY. The non-broadcasting contact is the only
+      // red on the display, and that is what makes it findable in one glance across a
+      // globe covered in dots. Weak takes orange instead: distinct from the yellow beside
+      // it, and it leaves the one red meaning one thing.
       m.addLayer({
         id: "asset-status-ring",
         type: "circle",
         source: "asset-points",
-        // Nominal assets get no ring at all. Drawing one in the background colour
-        // would still cost a halo around every icon on the map and make a busy
-        // display busier for no information.
-        filter: ["!=", ["get", "status"], "nominal"],
+        filter: ["!=", ["get", "ring"], "none"],
         paint: {
           "circle-radius": 13,
           "circle-color": "rgba(0,0,0,0)",
           "circle-stroke-color": [
-            "match", ["get", "status"],
-            "silent", COLOR.silent,
-            "degraded", COLOR.degraded,
-            "warning", COLOR.vesselDark,
-            COLOR.degraded,
+            "match", ["get", "ring"],
+            "maintenance", COLOR.maintenance,
+            "weak", COLOR.weak,
+            "unreachable", COLOR.unreachable,
+            COLOR.maintenance,
           ],
           "circle-stroke-width": 2,
           "circle-stroke-opacity": 0.9,
@@ -311,12 +421,17 @@ export function GlobeMap() {
         6, ["*", 1.0, kindFactor],     // station zoom: full size, legible
       ];
       const iconPaint = {
-        // A silent asset fades rather than vanishing: last known position is still
-        // information, and losing it off the screen is how an operator forgets a
-        // node exists.
-        "icon-opacity": ["match", ["get", "status"], "silent", 0.45, 1],
+        // 🔑 AN UNREACHABLE ASSET GREYS OUT RATHER THAN VANISHING. Its last known
+        // position is still the best information anyone has, and losing it off the
+        // screen is how an operator forgets a node exists. Fading says "this is where
+        // it was when we last heard it", which is exactly true: the server stops
+        // advancing a position it cannot hear, so a faded icon is also a stationary one.
+        "icon-opacity": ["case", ["==", ["get", "ring"], "unreachable"], 0.45, 1],
       };
-      const MOVING_KINDS = ["vessel", "uas", "patrol"];
+      // Kinds that travel, and so align to the map and carry a heading. The two contact
+      // kinds are here because an aircraft drawn without a heading points north while its
+      // track runs east, which reads as a rendering fault rather than as missing data.
+      const MOVING_KINDS = ["vessel", "uas", "patrol", "aircraft", "ground_party"];
 
       m.addLayer({
         id: "asset-icons-static",
@@ -352,29 +467,104 @@ export function GlobeMap() {
         paint: iconPaint as never,
       });
 
+      // ---- the backhaul badge ---------------------------------------------
+      //
+      // Its own layer rather than a variant silhouette, so a gateway still reads as
+      // whatever kind it is and simply gains a mark. `icon-translate` is in screen pixels,
+      // so the badge keeps the same offset from its icon at every zoom.
+      m.addLayer({
+        id: "asset-gateway",
+        type: "symbol",
+        source: "asset-points",
+        filter: ["==", ["get", "gateway"], true],
+        layout: {
+          "icon-image": "gateway_badge",
+          "icon-size": ["interpolate", ["linear"], ["zoom"], 1.5, 0.6, 3.5, 0.8, 6, 1.0],
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+          "icon-rotation-alignment": "viewport",
+        },
+        paint: {
+          "icon-translate": [17, -17],
+          "icon-opacity": ["case", ["==", ["get", "ring"], "unreachable"], 0.45, 1],
+        } as never,
+      });
+
+      // ---- the name beside every icon -------------------------------------
+      //
+      // 🔑 THE ONLY LAYER ON THIS MAP THAT COLLIDES, AND THE ONLY ONE THAT SHOULD.
+      // The icon layers above set `icon-allow-overlap: true` because an asset silently
+      // suppressed by collision detection is worse than two overlapping: the operator
+      // cannot tell "not there" from "not drawn". A LABEL is the opposite case. It is a
+      // convenience on top of a symbol that is already drawn, so dropping it costs
+      // nothing but a name, and 68 overlapping names cost the whole display.
+      //
+      // Leaving overlap off is therefore what thins the labels by zoom, without a zoom
+      // ramp anywhere: at the opening pole-centred view most of them collide and drop,
+      // and they appear as you zoom into a cluster. MapLibre re-runs placement on every
+      // camera change, so this is free.
+      //
+      // ⚠️ The icon layers do not participate. `icon-ignore-placement: true` up there
+      // means an icon never blocks a label, so a label is only ever suppressed by
+      // another label. Without that, dense clusters would lose their names to their own
+      // icons.
+      m.addLayer({
+        id: "asset-labels",
+        type: "symbol",
+        source: "asset-points",
+        layout: {
+          "icon-image": labelImageExpression() as never,
+          "icon-anchor": "left",
+          "icon-allow-overlap": false,
+          "icon-ignore-placement": false,
+          "icon-padding": 3,
+          // Which name survives a collision, lowest placed first. The two questions this
+          // display exists to answer come first: what is not broadcasting, then what has
+          // gone quiet. The unowned radar line yields to everything, because it is
+          // background that happens to be numerous.
+          "symbol-sort-key": [
+            "case",
+            ["==", ["get", "dark"], true], 0,
+            ["!=", ["get", "status"], "nominal"], 1,
+            ["==", ["get", "kind"], "radar"], 3,
+            2,
+          ],
+        },
+        paint: {
+          // In pixels and independent of icon-size, which is what keeps the gap between
+          // an icon and its name constant at every zoom. `icon-offset` would have been
+          // multiplied by icon-size and drifted as the icons scale.
+          "icon-translate": [13, 0],
+          "icon-opacity": ["case", ["==", ["get", "ring"], "unreachable"], 0.72, 1],
+        } as never,
+      });
+
       // Icons must exist before the layer that names them is added, or MapLibre logs
       // "image not found" once per feature per frame and draws nothing.
       //
-      // ⚠️ `ready` is set only after this resolves. The subscription below bails while
-      // it is false, so the first store update after the icons land is what paints.
+      // ⚠️ `ready` flips only after this resolves, and the layer effects below bail
+      // while it is false. Flipping it is what paints the first frame.
+      //
+      // ⚠️ The `map.current !== m` guard matters in dev: StrictMode mounts twice, so a
+      // torn-down map's icon build can still resolve and would otherwise mark the
+      // REPLACEMENT map ready before its own icons exist.
       buildIcons()
         .then((icons) => {
+          if (map.current !== m) return;
           for (const [id, bitmap] of icons) {
             if (!m.hasImage(id)) m.addImage(id, bitmap, { pixelRatio: ICON_PIXEL_RATIO });
           }
-          ready.current = true;
           setBbox(viewportBbox(m));
-          // Nudge the store so the layers paint immediately rather than at the next
-          // clock tick, which would leave the map blank for up to a frame interval.
-          useStore.setState((s) => ({ ...s }));
+          setReady(true);
         })
         .catch((err) => {
           // A failed icon build must not leave a blank map with no explanation. The
           // rest of the display (land, graticule, links) is still useful.
+          if (map.current !== m) return;
           console.error("icon build failed", err);
           useStore.getState().setError(`icons failed to build: ${String(err)}`);
-          ready.current = true;
           setBbox(viewportBbox(m));
+          setReady(true);
         });
     });
 
@@ -382,19 +572,77 @@ export function GlobeMap() {
     // is recomputed whenever the camera settles rather than on every frame.
     m.on("moveend", () => setBbox(viewportBbox(m)));
 
+    // ---- click to select, and ask when the click is ambiguous ------------
+    //
+    // 🔑 HIT-TESTED ON THE ICON LAYERS, NOT THE RING OR THE LABEL. The icon is the thing
+    // that looks clickable, and it is the only one every asset has: a nominal asset wears
+    // no ring, and its label may have been dropped by collision at the current zoom.
+    // Hit-testing anything else would make some assets quietly unclickable.
+    const ICON_LAYERS = ["asset-icons-static", "asset-icons-moving"];
+
+    // 🔴 A BOX, NOT A POINT, AND THAT IS THE WHOLE FEATURE. Querying the single clicked
+    // pixel answers "what is exactly under the cursor", which on a globe covered in
+    // overlapping icons is a question about aim rather than about intent. An 8 pixel box
+    // asks "what did they mean", finds every asset in the pile, and lets the operator say
+    // which one. It also makes small icons at low zoom clickable at all.
+    const SLOP = 8;
+
+    m.on("click", (e) => {
+      const box: [[number, number], [number, number]] = [
+        [e.point.x - SLOP, e.point.y - SLOP],
+        [e.point.x + SLOP, e.point.y + SLOP],
+      ];
+      const hits = m.queryRenderedFeatures(box, { layers: ICON_LAYERS });
+
+      // Deduplicated because one asset appears once per layer it matched, and the pile is
+      // about distinct assets rather than about draw calls. Query order is render order,
+      // topmost first, which is the order the operator's eye is already in.
+      const ids: string[] = [];
+      for (const f of hits) {
+        const id = f.properties?.id;
+        if (typeof id === "string" && !ids.includes(id)) ids.push(id);
+      }
+
+      const { select, setPicker } = useStore.getState();
+      if (ids.length === 0) {
+        // Clicking bare map clears both. Without this the banner is a thing you can open
+        // and never close, which is worse than not having it.
+        select(null);
+        setPicker(null);
+      } else if (ids.length === 1) {
+        select(ids[0]);
+        setPicker(null);
+      } else {
+        // ⚠️ The selection is NOT changed here. Opening the list while also selecting the
+        // topmost would answer the question the list is asking.
+        setPicker({ x: e.point.x, y: e.point.y, ids });
+      }
+    });
+
+    // The list is anchored to a screen position, so it has to go the moment the world
+    // underneath it moves. Panning with a pile still open would leave the names pointing
+    // at whatever has since slid under them.
+    m.on("movestart", () => useStore.getState().setPicker(null));
+
+    // A pointer cursor is the only affordance saying these are interactive at all.
+    for (const layer of ICON_LAYERS) {
+      m.on("mouseenter", layer, () => (m.getCanvas().style.cursor = "pointer"));
+      m.on("mouseleave", layer, () => (m.getCanvas().style.cursor = ""));
+    }
+
     return () => {
       m.remove();
       map.current = null;
-      ready.current = false;
+      setReady(false);
     };
   }, [setBbox]);
 
   // ---- projection toggle ---------------------------------------------------
   useEffect(() => {
     const m = map.current;
-    if (!m || !ready.current) return;
+    if (!m || !ready) return;
     m.setProjection({ type: projection === "globe" ? "globe" : "mercator" });
-  }, [projection]);
+  }, [projection, ready]);
 
   // ---- a command asked the camera to move ----------------------------------
   /**
@@ -418,81 +666,179 @@ export function GlobeMap() {
     });
   }, [camera]);
 
-  // ---- redraw the live layers whenever the clock moves ---------------------
+  // ---- redraw each layer when ITS OWN data changes -------------------------
+  /**
+   * 🔴 ONE EFFECT PER SOURCE, AND THE SPLIT IS A PERFORMANCE FIX, NOT TIDINESS.
+   *
+   * This was a single `useStore.subscribe` with no selector, which fired on every write
+   * to the store and called `setData` on all four sources each time. `setData` is not a
+   * cheap assignment: MapLibre ships the GeoJSON to its worker, which re-parses and
+   * re-tiles it. The ice layer alone is around 6,200 polygons on a dense March date.
+   *
+   * With a clock ticking from requestAnimationFrame, that ran at display refresh rate
+   * for the whole session: a pinned worker thread, a `flyTo` that stuttered because the
+   * worker was busy, and audible fan noise on a map of a world that was not moving. The
+   * clock is gone now, but the subscription was the other half of it, and it would have
+   * done the same thing to any future per-second write.
+   *
+   * Splitting it means selecting an asset redraws nothing, and appending a line to the
+   * command transcript redraws nothing.
+   */
+
+  // Assets: the icons and the ground tracks. Converted from domain objects to GeoJSON
+  // here and nowhere else, which is what keeps the store free of map-library shapes.
   useEffect(() => {
-    const unsub = useStore.subscribe((s) => {
-      const m = map.current;
-      if (!m || !ready.current) return;
+    const m = map.current;
+    if (!m || !ready) return;
+    const dark = (a: (typeof assets)[number]) => a.aisReporting === false;
+    // Computed once per redraw rather than per asset: it walks the whole link list.
+    const weak = weakAssetIds(mesh);
+    const now = Date.now();
 
-      // Assets. Converted from domain objects to GeoJSON here and nowhere else,
-      // which is what keeps the store free of map-library shapes.
-      const dark = (a: (typeof s.assets)[number]) => a.aisReporting === false;
-      setData(
-        m,
-        "asset-points",
-        s.assets
-          .filter((a) => a.lat !== null && a.lon !== null)
-          .map((a) =>
-            point([a.lon as number, a.lat as number], {
-              id: a.id,
-              name: a.name,
-              kind: a.kind,
-              status: a.status,
-              dark: dark(a),
-              heading: headingOf(a),
-            }),
-          ),
-      );
-      setData(
-        m,
-        "asset-lines",
-        s.assets
-          .filter((a) => a.geometry !== null)
-          .flatMap((a) =>
-            splitAtAntimeridian(a.geometry!.coordinates).map((f) => ({
-              ...f,
-              properties: { id: a.id, kind: a.kind, dark: dark(a) },
-            })),
-          ),
-      );
-
-      // Sea ice for the selected date. Replaced wholesale rather than diffed: it is one
-      // GeoJSON blob from the server and the map's own tiler handles the rest.
-      if (s.ice) {
-        const src = m.getSource("ice") as GeoJSONSource | undefined;
-        src?.setData(s.ice.grid as never);
+    // 🔴 REGISTER EVERY LABEL IMAGE BEFORE THE DATA THAT NAMES IT. A symbol layer whose
+    // `icon-image` resolves to an id that was never added logs "image not found" once
+    // per feature per frame, which is thousands of console errors and a failed
+    // console-error test, and it draws nothing while looking like a data problem.
+    //
+    // Synchronous, so there is no window between the two. Labels rasterise through a
+    // canvas with no decode step, unlike the icons, which have to go through an <img>.
+    for (const a of assets) {
+      const style = { dark: dark(a), silent: ringState(a, weak, now) === "unreachable" };
+      const id = labelImageId(a.id, style);
+      if (!m.hasImage(id)) {
+        m.addImage(id, labelImage(a.name, style), { pixelRatio: LABEL_PIXEL_RATIO });
       }
+    }
 
-      // Mesh links. Endpoints are looked up from the asset list rather than sent as
-      // coordinates, so a link can never draw to a stale position: the graph names ids,
-      // and ids resolve against whatever the store currently holds.
-      if (s.mesh) {
-        const at = new globalThis.Map(
-          s.assets.filter((a) => a.lat !== null).map((a) => [a.id, a] as const),
-        );
-        setData(
-          m,
-          "mesh-links",
-          s.mesh.links.flatMap((l) => {
-            const a = at.get(l.a);
-            const b = at.get(l.b);
-            if (!a || !b) return [];
-            return [
-              line(
-                [
-                  [a.lon as number, a.lat as number],
-                  [b.lon as number, b.lat as number],
-                ],
-                { margin: l.marginKm, distance: l.distanceKm },
-              ),
-            ];
+    setData(
+      m,
+      "asset-points",
+      assets
+        .filter((a) => a.lat !== null && a.lon !== null)
+        .map((a) =>
+          point([a.lon as number, a.lat as number], {
+            id: a.id,
+            name: a.name,
+            kind: a.kind,
+            status: a.status,
+            // "none" rather than null: MapLibre filters cannot compare against a missing
+            // property, so the nominal case has to be a value like any other.
+            ring: ringState(a, weak, now) ?? "none",
+            gateway: isGateway(a),
+            dark: dark(a),
+            heading: headingOf(a),
           }),
-        );
-      }
+        ),
+    );
+  }, [assets, mesh, ready]);
 
-    });
-    return unsub;
-  }, []);
+  // The position history a command asked for, and nothing else. Null clears it, which is
+  // what makes a trail belong to the question that produced it rather than accumulating.
+  //
+  // ⚠️ `a.geometry` is still read, by `headingOf` below, to point a vessel's bow the way
+  // it is travelling. Not drawing the route does not mean throwing the route away.
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready) return;
+
+    const coords = track?.coordinates ?? [];
+    setData(m, "history-track", coords.length >= 2 ? splitAtAntimeridian(coords) : []);
+    setData(
+      m,
+      "history-origin",
+      coords.length >= 2 ? [point(coords[0], { id: track!.id })] : [],
+    );
+  }, [track, ready]);
+
+  // Sea ice for the selected date. Replaced wholesale rather than diffed: it is one
+  // GeoJSON blob and the map's own tiler handles the rest. This is the expensive one,
+  // so it now runs only when the timebar actually moves.
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready || !ice) return;
+    const src = m.getSource("ice") as GeoJSONSource | undefined;
+    src?.setData(ice.grid as never);
+  }, [ice, ready]);
+
+  // Mesh links. Endpoints are looked up from the asset list rather than sent as
+  // coordinates, so a link can never draw to a stale position: the graph names ids, and
+  // ids resolve against whatever the store currently holds. That lookup is why this
+  // depends on `assets` as well as on `mesh`.
+  //
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready || !mesh) return;
+    const at = new globalThis.Map(
+      assets.filter((a) => a.lat !== null).map((a) => [a.id, a] as const),
+    );
+    const now = Date.now();
+    setData(
+      m,
+      "mesh-links",
+      mesh.links.flatMap((l) => {
+        const a = at.get(l.a);
+        const b = at.get(l.b);
+        if (!a || !b) return [];
+        // 🔑 A LINK TO SOMETHING WE CANNOT HEAR IS NOT A LINK WE KNOW IS UP. The server
+        // computes the graph from last known positions, so a link to a silent asset is a
+        // statement about where it used to be. Drawing it claims live connectivity to
+        // something that has stopped answering, which is the opposite of what the grey
+        // treatment on that asset is saying two layers up.
+        if (isUnreachable(a, now) || isUnreachable(b, now)) return [];
+        return [
+          line(
+            [
+              [a.lon as number, a.lat as number],
+              [b.lon as number, b.lat as number],
+            ],
+            { margin: l.marginKm, distance: l.distanceKm },
+          ),
+        ];
+      }),
+    );
+  }, [mesh, assets, ready]);
+
+  // Selection, pushed to the GPU as feature state rather than into the data.
+  //
+  // 🔑 THIS IS WHY THE SOURCE HAS `promoteId`. Baking `selected` into the GeoJSON would
+  // mean re-serialising all 68 features and re-parsing them in the worker on every click,
+  // for a change that alters two circles. Feature state changes the paint result without
+  // touching the data at all.
+  //
+  // ⚠️ The previous id is cleared explicitly. Feature state is not exclusive: setting a
+  // new one does not unset the old, and the symptom is a display that accumulates
+  // highlights until every asset is selected.
+  const selectedId = useStore((s) => s.selectedId);
+  const lastSelected = useRef<string | null>(null);
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready) return;
+    if (lastSelected.current && lastSelected.current !== selectedId) {
+      m.setFeatureState({ source: "asset-points", id: lastSelected.current }, { selected: false });
+    }
+    if (selectedId) {
+      m.setFeatureState({ source: "asset-points", id: selectedId }, { selected: true });
+    }
+    lastSelected.current = selectedId;
+  }, [selectedId, ready, assets]);
+
+  // Mesh visibility. A `visibility` layout change rather than emptying the source: the
+  // geometry stays parsed and uploaded, so turning it back on costs nothing and the data
+  // effect above keeps its one job.
+  //
+  // ✅ Verified by diffing frames across an off/on cycle, cropped to the map area:
+  // hiding changed 267 pixels and showing put every one of them back, exactly 0 different
+  // from the original frame.
+  //
+  // ⚠️ MEASURE THE MAP, NOT THE SCREENSHOT. `.map` is `inset: 0`, so a screenshot of it
+  // also contains the header, command bar, timebar and footer drawn on top. Counting
+  // those made the checkbox's own pixels and an input focus ring read as map content,
+  // and produced a confident, entirely wrong conclusion that this API was broken.
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready) return;
+    m.setLayoutProperty("mesh-links", "visibility", showMesh ? "visible" : "none");
+  }, [showMesh, ready]);
 
   return <div ref={container} className="map" />;
 }

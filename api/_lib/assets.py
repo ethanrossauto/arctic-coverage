@@ -1,37 +1,48 @@
-"""The five asset kinds, and the seeded world.
+"""The nine asset kinds, and the seeded world.
 
 The world is a Canadian Arctic surveillance picture: a deployable sensor mesh at the
-chokepoints, mobile patrols and drones, under-ice acoustic sensors in the narrows,
-the maritime contacts they exist to detect, and the existing early-warning radar
-line they have to work alongside.
+chokepoints, mobile patrols and drones, an under-ice acoustic barrier across the
+eastern gate, the contacts on the water, in the air and on the ground that all of it
+exists to detect, and the existing early-warning radar line it has to work alongside.
 
-WHY SIX KINDS RATHER THAN ONE. Each has a different geometry, a different mobility
+⚠️ THE COUNT IN THIS SENTENCE HAS BEEN WRONG BEFORE. It said five while the table
+below listed six and the schema seeded seven, because a number written in prose does
+not move when a kind is added. `KIND_COUNTS` at the foot of this file is the list that
+the seed script asserts against, so it cannot drift; this table is a description and
+has to be edited by hand.
+
+WHY NINE KINDS RATHER THAN ONE. Each has a different geometry, a different mobility
 and a different set of questions worth asking about it, and that heterogeneity is the
-point: it is what makes a command layer useful rather than decorative. Six kinds
+point: it is what makes a command layer useful rather than decorative. Nine kinds
 that were all static points with a name would reduce every command to a search box.
 
-    kind        geometry          mobility        the question it answers
+    kind          geometry          mobility      the question it answers
     ---------------------------------------------------------------------------
-    node        point             static          what has gone quiet, what is
+    node          point             static        what has gone quiet, what is
                                                   about to be cut off from the mesh
-    patrol      route + position  ~4 km/h         where are my people, who has
+    patrol        route + position  ~4 km/h       where are my people, who has
                                                   not checked in
-    uas         point + path      ~100 km/h       what can I send, and how long
+    uas           point + path      ~100 km/h     what can I send, and how long
                                                   until it is on top of that
-    hydrophone  point + radius    static          what passed through the narrows
-                                                  without being seen
-    vessel      track + position  10-20 kn        who is out there, and which of
+    launch_site   point             static        where can something come from,
+                                                  and where does traffic leave
+    hydrophone    point + radius    static        what crossed the barrier without
+                                                  being seen
+    vessel        track + position  10-20 kn      who is out there, and which of
                                                   them is not broadcasting
-    radar       point + radius    static          what the existing line already
+    aircraft      point             ~300 kn       what is in the air, and which of
+                                                  it has no transponder
+    ground_party  point             on foot       who is on the ground out there,
+                                                  and is anyone holding them
+    radar         point + radius    static        what the existing line already
                                                   covers, and where it does not
 
 🔴 GEOGRAPHY IS NOT DECORATION HERE. Every position is a real place or a real
 waterway. The mesh sits on the actual Northwest Passage chokepoints, because that is
-where a sensor earns its cost; the hydrophones sit only in the narrows, because a
-sensor lowered through the ice anywhere else is money spent watching open water; and
-the drones are based at the real northern airfields. Scattering these at random would produce
-the same screenshot and would fall apart under one question from anyone who knows
-the region.
+where a sensor earns its cost; the hydrophones form one barrier across Lancaster Sound,
+the eastern gate everything arriving from the Atlantic has to pass; and the drones are
+based at the real northern airfields. Scattering these at random would produce the same
+screenshot and would fall apart under one question from anyone who knows the region.
 
 ⚠️ THE SEED IS IDEMPOTENT AND MEANT TO BE RE-RUN. `last_heard` values are offsets
 from the moment of seeding, so the interesting states (something stale, something
@@ -41,8 +52,9 @@ reset-to-known-state that a public URL needs.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 # --------------------------------------------------------------------------
@@ -128,10 +140,14 @@ def line(points: list[tuple[float, float]]) -> dict:
 # across the Arctic is a tripwire; this is area coverage of the places a transit
 # cannot avoid.
 #
-# 🔑 THE SPACING IS DERIVED, NOT CHOSEN. Two 12 m masts have a radio horizon of 28.5 km
-# (see api/_lib/mesh.py), so nodes sit about 22 km apart, roughly 77% of that, leaving
-# margin for the terrain the link model does not carry and for a neighbour going down.
-# That is why the clusters look like short chains rather than a scatter across a map.
+# 🔑 THE SPACING IS DERIVED, NOT CHOSEN. Ground to ground reach is 25 km (see
+# api/_lib/mesh.py), so nodes sit about 22 km apart, roughly 88% of it, leaving a couple of
+# kilometres of margin for a coastline that is not a straight line and for a neighbour going
+# down. That is why the clusters look like short chains rather than a scatter across a map.
+#
+# ⚠️ This paragraph read "two 12 m masts have a radio horizon of 28.5 km, so nodes sit at
+# 77% of that" until the link model became a lookup. The spacing did not change; the
+# sentence explaining it described a formula that no longer exists.
 #
 # 🔑 AND THE POSITIONS ARE ON REAL SHORELINES. Each cluster follows the coast of the
 # waterway it watches, generated by scripts/place_nodes.py, which walks the same
@@ -194,19 +210,49 @@ _NODE_CLUSTERS: list[tuple[str, str, list[tuple[float, float]]]] = [
     ),
 ]
 
-# Payloads vary by cluster so that a filter on payload returns something meaningful
-# rather than the whole set.
-_PAYLOADS = ["eo_ir", "acoustic", "rf", "seismic", "magnetic"]
+# 🔴 THREE PAYLOADS, AND EACH ONE FAILS DIFFERENTLY. That is the entire reason to mix them
+# along a shoreline instead of buying more of the best one, and api/_lib/detect.py is what
+# makes the difference real rather than decorative.
+#
+#   eo_ir     15 km, sees anything above the surface, and is the one that identifies
+#   rf        45 km, much the longest reach, and useless against a silent target
+#   magnetic   4 km, steel hull, and completely indifferent to how quiet the target is
+#
+# ⚠️ `acoustic` and `seismic` were removed. Acoustic belongs to the hydrophone array, which
+# is in the water where acoustics work. Seismic measures ground movement and was never a
+# sensible thing to point at a shipping channel; it was in this list because the list had
+# five entries and the map wanted variety.
+_PAYLOADS = ["eo_ir", "rf", "magnetic"]
 
 # Staleness is designed, not random. Most nodes are current, a few are late, and two
 # are silent, because "what has gone quiet" is only a real question if the answer is
 # neither "nothing" nor "everything".
-_NODE_STALENESS: dict[str, tuple[float, str]] = {
-    "node-nares-05": (410.0, "degraded"),   # late, and on the hardest cluster to reach
-    "node-victoria-03": (1670.0, "silent"), # silent for over a day
-    "node-pow-06": (95.0, "degraded"),      # late, low battery below
-    "node-barrow-07": (2880.0, "silent"),   # silent for two days
+# 🔑 BATTERY IS ITS OWN NUMBER, not a function of lateness. It used to be derived from the
+# status value, which meant the seed could not say a node was late with a healthy battery,
+# and could not say a node was nearly flat while still reporting on time. Those are two
+# facts that usually travel together and sometimes do not, and the interesting rows are
+# exactly the ones where they come apart.
+_NODE_STALENESS: dict[str, tuple[float, int]] = {
+    "node-nares-05": (410.0, 44),    # late, but the battery is fine: something else is wrong
+    "node-victoria-03": (1670.0, 0), # nothing for over a day, and flat
+    "node-pow-06": (95.0, 18),       # late, and the battery is the obvious reason
+    # 🔴 THIS ONE IS THE CLUSTER'S UPLINK, AND THAT IS THE WHOLE POINT OF PUTTING IT HERE.
+    # Barrow Strait has been off the air for two days, and not because its sensors failed:
+    # every other node in that chain is reporting normally to its neighbours. What broke is
+    # the one route out. A display that only coloured the dead node would show one problem;
+    # the truthful picture is seven assets nobody has heard from, and one reason.
+    "node-barrow-05": (2880.0, 0),
 }
+
+# 🔑 ONE NODE PER CLUSTER CARRIES THE SATELLITE UPLINK, and the rest relay inward to it.
+# See api/_lib/mesh.py for why a cluster needs its own way out rather than depending on a
+# long hop to an airfield.
+#
+# Each of these is the most central node in its chain, which is where you put the terminal
+# if you want no member to be more hops from the exit than it has to be.
+_BACKHAUL_NODES: frozenset[str] = frozenset(
+    {"node-barrow-05", "node-pow-03", "node-victoria-02", "node-nares-03"}
+)
 
 
 def _nodes() -> list[Asset]:
@@ -214,10 +260,18 @@ def _nodes() -> list[Asset]:
     for cluster_key, cluster_name, points in _NODE_CLUSTERS:
         for i, (lat, lon) in enumerate(points, start=1):
             node_id = f"node-{cluster_key}-{i:02d}"
-            stale_minutes, status = _NODE_STALENESS.get(node_id, (float(7 + (i * 3) % 40), "nominal"))
-            # Battery tracks status: a silent node is assumed flat until proven
-            # otherwise, which is the assumption an operator would make.
-            battery = 0 if status == "silent" else (18 if status == "degraded" else 55 + (i * 7) % 40)
+            stale_minutes, battery = _NODE_STALENESS.get(
+                node_id, (float(7 + (i * 3) % 40), 55 + (i * 7) % 40)
+            )
+            props = {
+                "cluster": cluster_key,
+                "cluster_name": cluster_name,
+                "payload": _PAYLOADS[(i - 1) % len(_PAYLOADS)],
+                "power_source": "solar_wind" if i % 3 else "primary_battery",
+                "battery_pct": battery,
+            }
+            if node_id in _BACKHAUL_NODES:
+                props["backhaul"] = "satellite"
             out.append(
                 Asset(
                     id=node_id,
@@ -226,18 +280,8 @@ def _nodes() -> list[Asset]:
                     lat=lat,
                     lon=lon,
                     alt_m=float(5 + (i * 11) % 60),
-                    status=status,
                     last_heard_minutes_ago=stale_minutes,
-                    props={
-                        "cluster": cluster_key,
-                        "cluster_name": cluster_name,
-                        "payload": _PAYLOADS[(i - 1) % len(_PAYLOADS)],
-                        "power_source": "solar_wind" if i % 3 else "primary_battery",
-                        "battery_pct": battery,
-                        # Mesh degree: the ones at a cluster edge have fewer
-                        # neighbours, which is what makes them worth watching.
-                        "mesh_peers": 1 if i in (1, len(points)) else 2 + (i % 2),
-                    },
+                    props=props,
                 )
             )
     return out
@@ -246,10 +290,14 @@ def _nodes() -> list[Asset]:
 # --------------------------------------------------------------------------
 # 2. Ranger patrols: 3
 # --------------------------------------------------------------------------
-# The long-range route is the real one: a 1 Canadian Ranger Patrol Group patrol
-# covered roughly 5,200 km from Inuvik to Churchill over 52 days. Two shorter
-# community patrols give the map assets that move on a human timescale, which is
-# what makes the time controls mean anything next to a satellite at 7 km/s.
+# Three patrols, and they are the only assets on the map that a person is standing on.
+# They move on a human timescale, tens of kilometres a day rather than the hundreds a
+# vessel covers, which is what makes "where has this been" a different question for a
+# patrol than for a ship.
+#
+# 1 Canadian Ranger Patrol Group genuinely runs long-range patrols of thousands of
+# kilometres over weeks. The route here is a working leg of one, not the whole thing,
+# because a patrol is only on this display while the display can hear it.
 
 def _patrols() -> list[Asset]:
     # ⚠️ THIS ROUTE IS MAINLAND-ONLY, AND THAT IS A CORRECTION.
@@ -265,37 +313,47 @@ def _patrols() -> list[Asset]:
     # commands for. The world has to obey its own physics before it can refuse anyone
     # else's plan.
     #
-    # So: the mainland coast route, Beaufort Sea to Hudson Bay. Same 5,000 km order of
-    # magnitude, same operational shape, no water crossing.
+    # 🔴 AND EVERY PATROL STAYS INSIDE RELAY RANGE OF A WAY OUT, which is the second
+    # correction and the one that moved these routes.
+    #
+    # A patrol is the asset most likely to walk out of contact, because it is the only one
+    # that travels. Each route here keeps every waypoint within 100 km of a backhaul: the
+    # cluster uplink or a launch site. 100 km is two 50 km air-to-ground hops, so one drone
+    # at the midpoint restores the link from anywhere on any of these routes. Checked
+    # against the seed rather than eyeballed, and the worst point on any route is 97.7 km.
+    #
+    # ⚠️ Every waypoint is also on LAND, for the August reason above. The first version of
+    # these two routes ran straight down the middle of Victoria Strait and Prince of Wales
+    # Strait, which is open water in August, and `is_land` said so on all nine points.
+    #
+    # A loop is the patrol's current tasking, not the limit of where it can go. The
+    # community it works out of is often further than the loop it is working.
     long_range = [
-        SETTLEMENTS[n]
-        for n in (
-            "Inuvik", "Tuktoyaktuk", "Paulatuk", "Kugluktuk", "Bathurst Inlet",
-            "Baker Lake", "Arviat", "Churchill",
-        )
+        (72.41, -118.13), (72.41, -117.63), (73.31, -116.38),
+        (73.46, -116.63), (73.61, -116.88),
     ]
     resolute_loop = [
         SETTLEMENTS["Resolute Bay"], (75.20, -95.50), (75.55, -94.00),
         (75.05, -92.80), SETTLEMENTS["Resolute Bay"],
     ]
     cambridge_loop = [
-        SETTLEMENTS["Cambridge Bay"], (69.60, -106.50), (70.10, -105.00),
-        (69.50, -103.50), SETTLEMENTS["Cambridge Bay"],
+        (69.80, -102.00), (69.95, -101.50), (70.10, -101.00),
+        (69.95, -101.00), (69.80, -102.00),
     ]
     return [
         Asset(
             id="patrol-1crpg-lr",
             kind="patrol",
             name="1 CRPG Long Range",
-            lat=SETTLEMENTS["Cambridge Bay"][0],
-            lon=SETTLEMENTS["Cambridge Bay"][1],
+            lat=long_range[1][0],
+            lon=long_range[1][1],
             geometry=line(long_range),
             last_heard_minutes_ago=52.0,
             props={
                 "members": 14,
                 "progress_pct": 48,
-                "next_waypoint": "Gjoa Haven",
-                "transport": "snowmobile",
+                "next_waypoint": "Prince of Wales Strait north",
+                "transport": "atv",
                 "speed_kmh": 22,
             },
         ),
@@ -313,12 +371,11 @@ def _patrols() -> list[Asset]:
             id="patrol-cambridge",
             kind="patrol",
             name="Cambridge Bay Patrol",
-            lat=69.60,
-            lon=-106.50,
+            lat=cambridge_loop[1][0],
+            lon=cambridge_loop[1][1],
             geometry=line(cambridge_loop),
-            status="degraded",
             last_heard_minutes_ago=316.0,  # overdue: the check-in question, embodied
-            props={"members": 5, "progress_pct": 61, "next_waypoint": "Byron Bay", "transport": "snowmobile", "speed_kmh": 20},
+            props={"members": 5, "progress_pct": 61, "next_waypoint": "Collinson Peninsula", "transport": "atv", "speed_kmh": 20},
         ),
     ]
 
@@ -350,7 +407,7 @@ def _uas() -> list[Asset]:
                 lat=lat,
                 lon=lon,
                 alt_m=0.0 if state != "on_station" else 3200.0,
-                status="nominal" if state != "maintenance" else "degraded",
+                status="maintenance" if state == "maintenance" else "nominal",
                 last_heard_minutes_ago=2.0 if state == "on_station" else 26.0,
                 props={
                     "base": base,
@@ -371,39 +428,64 @@ def _uas() -> list[Asset]:
 # water is narrow and a transit has no alternative. Putting these in open water would
 # be the kind of design error someone who knows the region would spot immediately.
 
-# ⚠️ FOUR OF THESE SIT WITHIN RADIO REACH OF A NODE CLUSTER, AND SIX DELIBERATELY DO
-# NOT, which is a finding rather than an oversight.
+# 🔴 THEY ARE ONE ARRAY, NOT TEN LONE SENSORS, and that is the correction that matters.
 #
-# A hydrophone's acoustic half is under the ice and reaches nothing by radio. What is on
-# the mesh is its surface buoy, at about 1.5 m, and a buoy that low talking to a 12 m
-# mast has a horizon of 19.3 km. Most of these narrows have no node within that.
+# These used to sit one per chokepoint across the whole region, which read well on a map
+# and was wrong twice over. Seven of the ten were 244 to 546 km from anything, so they
+# were on no mesh and could not deliver what they heard. And a single hydrophone does not
+# tell you much: it gives you a detection, not a direction, not a speed, and not a track.
 #
-# 🔑 So "which hydrophones cannot reach the mesh" has a real, non-trivial answer, and it
-# is the question that makes the drone valuable: an overflight is how you collect from a
-# sensor nobody can raise. Placing all ten in reach would have erased that; placing none
-# in reach would look broken.
+# An acoustic barrier is a LINE of them across the water a transit cannot avoid. Spacing
+# is set so neighbours overlap acoustically and so their surface buoys can talk to each
+# other, which turns ten detections into one picture of something moving through.
 #
-# The four in reach were positioned by measuring outward from their cluster's nearest
-# node until the point was in water and inside the link budget, not by eye.
+# 🔑 AND THE LINE CARRIES ITS OWN WAY OUT. One unit in the middle has a satellite terminal;
+# the rest relay to it along the line. That is why the array survives when the surface
+# sensors nearby do not, and it is the same architecture the node clusters use.
+#
+# Lancaster Sound is the eastern gate of the Northwest Passage. Everything arriving from
+# the Atlantic side comes through here, so it is where an array earns its cost first. The
+# honest limit, and the README says it: this is ONE barrier. A real deployment replicates
+# it per chokepoint, and building one well is how you find out what the second one costs.
+_ARRAY_LAT = 74.30
+_ARRAY_LON_0 = -87.50
+_ARRAY_SPACING_DEG = 0.66  # about 19.9 km at this latitude, inside the 25 km ground range
+_ARRAY_BACKHAUL_INDEX = 5  # the middle unit carries the terminal, so no member is far from it
+
 _NARROWS: list[tuple[str, str, float, float, int]] = [
-    ("barrow", "Barrow Strait", 74.7346, -91.1069, 180),
-    ("bellot", "Bellot Strait", 71.99, -94.50, 60),
-    ("pow", "Prince of Wales Strait", 73.2995, -115.2286, 210),
-    ("victoria", "Victoria Strait", 69.9989, -101.0062, 120),
-    ("fury", "Fury and Hecla Strait", 69.92, -84.50, 90),
-    ("dolphin", "Dolphin and Union Strait", 69.00, -114.50, 75),
-    ("peel", "Peel Sound", 73.00, -96.50, 240),
-    ("franklin", "Franklin Strait", 71.50, -96.00, 190),
-    ("nares", "Nares Strait", 78.4009, -72.6778, 260),
-    ("amundsen", "Amundsen Gulf", 70.50, -123.00, 300),
+    (
+        f"lancaster-{i:02d}",
+        f"Lancaster Sound {i:02d}",
+        _ARRAY_LAT,
+        round(_ARRAY_LON_0 + _ARRAY_SPACING_DEG * (i - 1), 4),
+        180 + (i * 23) % 140,
+    )
+    for i in range(1, 11)
 ]
 
 
 def _hydrophones() -> list[Asset]:
     out = []
     for i, (key, name, lat, lon, depth) in enumerate(_NARROWS, start=1):
-        # Two have heard something recently. Those two are the reason the rest exist.
-        detected = key in ("barrow", "victoria")
+        # The two units that are currently holding a contact. They are the reason the
+        # other eight are in the water.
+        detected = i in _DETECTING_UNITS
+        props = {
+            "array": "Lancaster Sound barrier",
+            "position_in_line": i,
+            "depth_m": depth,
+            # 🔑 THE SENSOR RADIUS, WHICH IS NOT THE RADIO RANGE. About 18 km of useful
+            # underwater detection against a quiet vessel here. Entirely separate from how
+            # this unit reaches the mesh, which it does over RF through its surface buoy
+            # like any other ground asset. Neighbours are 19.9 km apart, so the acoustic
+            # footprints very nearly touch and a transit crosses the line rather than
+            # slipping between two of them.
+            "detection_radius_km": 18,
+            "last_detection_minutes_ago": 22 if detected else None,
+            "battery_pct": 40 + (i * 13) % 55,
+        }
+        if i == _ARRAY_BACKHAUL_INDEX:
+            props["backhaul"] = "satellite"
         out.append(
             Asset(
                 id=f"hyd-{key}",
@@ -412,16 +494,11 @@ def _hydrophones() -> list[Asset]:
                 lat=lat,
                 lon=lon,
                 alt_m=float(-depth),
-                status="nominal" if i != 6 else "degraded",
+                # One unit is unserviceable. `maintenance` rather than a vaguer word,
+                # because the only thing an operator can do about it is send someone.
+                status="maintenance" if i == 6 else "nominal",
                 last_heard_minutes_ago=float(4 + (i * 9) % 50),
-                props={
-                    "narrows": name,
-                    "depth_m": depth,
-                    "ice_thickness_cm": 120 + (i * 17) % 90,
-                    "detection_radius_km": 18,
-                    "last_detection_minutes_ago": 22 if detected else None,
-                    "battery_pct": 40 + (i * 13) % 55,
-                },
+                props=props,
             )
         )
     return out
@@ -463,6 +540,114 @@ _SOUTHERN_ROUTE = [
 ]
 
 
+# 🔴 THE DARK CONTACTS ARE PLACED BY THEIR DETECTOR, NOT BY A ROUTE INDEX.
+#
+# This is the correction that mattered most in the whole seed. UNKNOWN 01 was credited to
+# a hydrophone 355.7 km away and UNKNOWN 02 to one 193.8 km away, against a detection
+# radius of 18 km. Neither contact could have been heard by the sensor the data said heard
+# it, in the one feature this console is built around. Anyone who checked the numbers would
+# have found it, and checking the numbers is what the audience for this does for a living.
+#
+# So each is positioned relative to the array unit holding it, which makes the provenance
+# true BY CONSTRUCTION rather than by a coincidence a later edit can quietly break. Move
+# the array and the contacts move with it.
+_DARK_CONTACTS: list[tuple[str, str, int, float, float]] = [
+    # id, name, array unit holding it (1-based), km south of the line, speed in knots
+    ("vsl-unk-01", "UNKNOWN 01", 3, 12.0, 16.5),
+    ("vsl-unk-02", "UNKNOWN 02", 8, 11.0, 15.0),
+]
+_DETECTING_UNITS: frozenset[int] = frozenset(u for _, _, u, _, _ in _DARK_CONTACTS)
+
+_KM_PER_DEG_LAT = 111.19
+
+
+def _dark_contacts() -> list[Asset]:
+    """The two vessels running without AIS, each sitting inside its detector's radius.
+
+    The observed track is short on purpose: a contact with no transponder is known only
+    from the moment a sensor first heard it, so there is no history before that. A broadcast
+    vessel gets its whole route because it has been announcing itself the entire way.
+    """
+    out = []
+    for vid, name, unit, south_km, speed in _DARK_CONTACTS:
+        _, _, u_lat, u_lon, _ = _NARROWS[unit - 1]
+        lat = u_lat - south_km / _KM_PER_DEG_LAT
+        km_per_deg_lon = _KM_PER_DEG_LAT * math.cos(math.radians(lat))
+        # Approaching from the Atlantic side, so the observed leg runs east to west.
+        track = [
+            (round(lat - 0.04, 4), round(u_lon + 40.0 / km_per_deg_lon, 4)),
+            (round(lat - 0.02, 4), round(u_lon + 20.0 / km_per_deg_lon, 4)),
+            (round(lat, 4), u_lon),
+        ]
+        out.append(
+            Asset(
+                id=vid,
+                kind="vessel",
+                name=name,
+                lat=round(lat, 4),
+                lon=u_lon,
+                status="nominal",
+                geometry=line(track),
+                ais_reporting=False,
+                last_heard_minutes_ago=22.0,
+                props={
+                    "classification": "unknown",
+                    "flag": None,
+                    "speed_kn": speed,
+                    "heading_deg": 270,
+                    "held_by": f"hyd-{_NARROWS[unit - 1][0]}",
+                    "track_source": "acoustic",
+                    # Running dark through a chokepoint is the behaviour that earns this
+                    # label. It is a property of an ordinary vessel rather than a kind of
+                    # its own, so nothing in terrain, motion, detection or the mesh has to
+                    # learn a new word to handle it.
+                    "hostile": True,
+                },
+            )
+        )
+
+    # 🔴 THE THIRD ONE IS THE INTERESTING ONE, AND IT IS IN THE DARK CLUSTER.
+    #
+    # It sits 10 km south of `node-barrow-04`, well inside that node's 15 km camera. So a
+    # working sensor is holding it right now, and Barrow Strait's uplink has been down for
+    # two days, which means nothing that sensor sees is reaching this display.
+    #
+    # That is the state worth putting in the seed, because it is the one a console can most
+    # easily lie about. An empty patch of ocean and a patch of ocean nobody can hear from
+    # look identical unless the display insists on telling them apart, and `detect.py`
+    # reports it as `detected_not_reported` rather than folding it into either.
+    b_lat, b_lon = _NODE_CLUSTERS[0][2][3]
+    out.append(
+        Asset(
+            id="vsl-unk-03",
+            kind="vessel",
+            name="UNKNOWN 03",
+            lat=round(b_lat - 10.0 / _KM_PER_DEG_LAT, 4),
+            lon=b_lon,
+            status="nominal",
+            geometry=line(
+                [
+                    (round(b_lat - 0.16, 4), round(b_lon + 0.9, 4)),
+                    (round(b_lat - 0.12, 4), round(b_lon + 0.45, 4)),
+                    (round(b_lat - 10.0 / _KM_PER_DEG_LAT, 4), b_lon),
+                ]
+            ),
+            ais_reporting=False,
+            last_heard_minutes_ago=14.0,
+            props={
+                "classification": "unknown",
+                "flag": None,
+                "speed_kn": 11.0,
+                "heading_deg": 250,
+                "emitting": False,
+                "track_source": "electro-optical",
+                "hostile": True,
+            },
+        )
+    )
+    return out
+
+
 def _vessels() -> list[Asset]:
     specs = [
         # id, name, classification, flag, ais, route, position index, speed
@@ -472,11 +657,8 @@ def _vessels() -> list[Asset]:
         ("vsl-kiviuq", "Kiviuq", "research", "Canada", True, _NORTHERN_ROUTE, 6, 9.5),
         ("vsl-sea-hawk", "Sea Hawk", "fishing", "Greenland", True, _SOUTHERN_ROUTE, 7, 8.0),
         ("vsl-tundra-maru", "Tundra Maru", "cargo", "Liberia", True, _NORTHERN_ROUTE, 8, 13.0),
-        # The two that matter.
-        ("vsl-unk-01", "UNKNOWN 01", "unknown", None, False, _NORTHERN_ROUTE, 4, 16.5),
-        ("vsl-unk-02", "UNKNOWN 02", "unknown", None, False, _SOUTHERN_ROUTE, 4, 15.0),
     ]
-    out = []
+    out = _dark_contacts()
     for vid, name, classification, flag, ais, route, idx, speed in specs:
         lat, lon = route[idx]
         # A non-broadcasting contact is held by a sensor, not by its own report, so
@@ -489,7 +671,11 @@ def _vessels() -> list[Asset]:
                 name=name,
                 lat=lat,
                 lon=lon,
-                status="nominal" if ais else "warning",
+                # 🔑 NOT BROADCASTING IS NOT A CONDITION OF THE VESSEL. It is already its
+                # own field, its own filter and its own colour on the map. Encoding it a
+                # second time as a status made one fact answer to two names, and the two
+                # could disagree.
+                status="nominal",
                 geometry=line(track),
                 ais_reporting=ais,
                 last_heard_minutes_ago=3.0 if ais else 22.0,
@@ -609,24 +795,29 @@ def _radars() -> list[Asset]:
 # splits into a launch and recovery element and a mission control element; this models
 # the first. No vendor's product name appears here or anywhere else in this repo.
 #
-# `mesh_gateway` is the field that matters architecturally: a site with satellite
-# backhaul is where mesh traffic leaves the theatre, which is what lets the four ground
-# clusters be locally isolated from each other and still useful.
+# 🔑 EVERY LAUNCH SITE HAS BACKHAUL, so every one of them is a way out of the theatre.
+# There is no per-site flag any more: a field that is true for every row of its kind
+# carries no information, and this one used to leak into `status`, where a site with no
+# backhaul was written up as a condition of the site rather than a fact about the network.
+# See api/_lib/mesh.py, which decides what a gateway is.
+#
+# What still makes Alert the interesting row is that nothing is based there and its fuel
+# is limited, both of which are in `props` where they belong.
 
-_LAUNCH_SITES: list[tuple[str, str, str, int, bool, int]] = [
-    # id suffix, display name, settlement, runway m, satellite backhaul, drones based
-    ("inuvik", "FLS Inuvik", "Inuvik", 1830, True, 1),
-    ("yellowknife", "FLS Yellowknife", "Yellowknife", 2286, True, 1),
-    ("rankin", "FLS Rankin Inlet", "Rankin Inlet", 1798, True, 1),
-    ("iqaluit", "FLS Iqaluit", "Iqaluit", 2743, True, 1),
-    ("resolute", "FLS Resolute Bay", "Resolute Bay", 1981, True, 1),
-    ("alert", "FLS Alert", "Alert", 1646, False, 0),
+_LAUNCH_SITES: list[tuple[str, str, str, int, int]] = [
+    # id suffix, display name, settlement, runway m, drones based
+    ("inuvik", "FLS Inuvik", "Inuvik", 1830, 1),
+    ("yellowknife", "FLS Yellowknife", "Yellowknife", 2286, 1),
+    ("rankin", "FLS Rankin Inlet", "Rankin Inlet", 1798, 1),
+    ("iqaluit", "FLS Iqaluit", "Iqaluit", 2743, 1),
+    ("resolute", "FLS Resolute Bay", "Resolute Bay", 1981, 1),
+    ("alert", "FLS Alert", "Alert", 1646, 0),
 ]
 
 
 def _launch_sites() -> list[Asset]:
     out = []
-    for key, name, settlement, runway, gateway, based in _LAUNCH_SITES:
+    for key, name, settlement, runway, based in _LAUNCH_SITES:
         lat, lon = SETTLEMENTS[settlement]
         out.append(
             Asset(
@@ -636,19 +827,139 @@ def _launch_sites() -> list[Asset]:
                 lat=lat,
                 lon=lon,
                 alt_m=0.0,
-                # Alert has no satellite backhaul in this scenario, so it is the one site
-                # that depends on the mesh reaching it. That makes it the interesting one
-                # to ask connectivity questions about rather than a sixth identical row.
-                status="nominal" if gateway else "degraded",
+                status="nominal",
                 last_heard_minutes_ago=float(3 + len(key) % 11),
                 props={
                     "settlement": settlement,
                     "runway_m": runway,
-                    "mesh_gateway": gateway,
+                    # Every launch site is a way out of the theatre. Carried as a property
+                    # rather than inferred from the kind, so one field answers "is this a
+                    # gateway" for a launch site, a sensor node and a hydrophone alike.
+                    "backhaul": "satellite",
                     "uas_capacity": 2,
                     "uas_based": based,
-                    "fuel_state": "full" if gateway else "limited",
+                    "fuel_state": "full" if based else "limited",
                     "position_accuracy": "settlement centroid",
+                },
+            )
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# 8. Air and ground contacts
+# --------------------------------------------------------------------------
+# 🔴 THE THREE DOMAINS EXIST SO THE SENSOR MIX HAS SOMETHING TO PROVE. A shoreline carrying
+# three kinds of sensor is only worth explaining if the three disagree, and they only get to
+# disagree if there is something in the air, something on the ground and something on the
+# water. See api/_lib/detect.py, which decides who is holding what.
+#
+# `props.emitting` is the field that matters here, and it is the air and land twin of
+# `ais_reporting`. Something transmitting is visible to RF from 45 km. Something that has
+# switched everything off is invisible to the longest-ranged sensor on the map and can only
+# be caught by looking at it or by passing within a few kilometres of it.
+#
+# ⚠️ AIRCRAFT ARE NOT ON THE MESH and neither are ground contacts, for the same reason
+# vessels are not: they are what the network is FOR, not participants in it.
+
+# ⚠️ TRANSIT OR ORBIT, AND THE UNKNOWN ONE ORBITS FOR A REASON. A jet at 340 knots crosses
+# a 15 km camera in about ninety seconds, so an air contact modelled as a fast transit is
+# detected and gone before anyone looks at the screen. That is true of real jets and it makes
+# for a display that cannot demonstrate its own air picture.
+#
+# A slow aircraft holding station over a chokepoint is both the more realistic adversary and
+# the one worth drawing: loitering is what you do when you are watching something, and a
+# transit is what you do when you are going somewhere. So the unidentified contact orbits at
+# 70 knots and stays inside the sensor that holds it.
+_AIRCRAFT: list[tuple[str, str, str, bool, float, float, int, int, str]] = [
+    # id, name, classification, emitting, lat, lon, alt m, speed kn, path
+    ("air-arctic-214", "Arctic Air 214", "cargo", True, 74.20, -93.40, 9100, 310, "transit"),
+    ("air-medevac-07", "Medevac 07", "medical", True, 66.10, -66.80, 7600, 280, "transit"),
+    ("air-survey-03", "Survey 03", "research", True, 72.80, -117.90, 4200, 190, "transit"),
+    # The one that is not talking, holding station over Victoria Strait. Silent, so the
+    # 45 km RF sensor cannot see it at all; the 15 km camera can, and does.
+    ("air-unk-01", "UNKNOWN AIR 01", "unknown", False, 69.9200, -100.9668, 3200, 70, "orbit"),
+]
+
+_GROUND_PARTIES: list[tuple[str, str, str, bool, float, float, int]] = [
+    # id, name, classification, emitting, lat, lon, party size
+    ("gnd-survey-alpha", "Survey Team Alpha", "survey", True, 78.5500, -75.5000, 6),
+    # Held by a Nares node's camera despite running silent.
+    ("gnd-unk-01", "UNKNOWN PARTY 01", "unknown", False, 78.6500, -75.2000, 4),
+    # 🔑 AND THIS ONE IS HELD BY NOTHING AT ALL, which is the honest third answer. It sits
+    # 278 km from the nearest sensor of any kind. Not a gap in the data: a gap in the
+    # coverage, and the display should say so rather than imply the ground is empty.
+    ("gnd-unk-02", "UNKNOWN PARTY 02", "unknown", False, 71.2000, -110.5000, 3),
+]
+
+
+def _aircraft() -> list[Asset]:
+    out = []
+    for aid, name, classification, emitting, lat, lon, alt, speed, path in _AIRCRAFT:
+        if path == "orbit":
+            # A closed racetrack about 8 km across, so it stays well inside a 15 km camera
+            # and reads as holding station rather than going anywhere.
+            dlat = 4.0 / _KM_PER_DEG_LAT
+            dlon = dlat / math.cos(math.radians(lat))
+            track = [
+                (round(lat + dlat, 4), round(lon - dlon, 4)),
+                (round(lat + dlat, 4), round(lon + dlon, 4)),
+                (round(lat - dlat, 4), round(lon + dlon, 4)),
+                (round(lat - dlat, 4), round(lon - dlon, 4)),
+                (round(lat + dlat, 4), round(lon - dlon, 4)),
+            ]
+        else:
+            # A long straight leg through the seeded position. Long enough that an airliner
+            # does not run off the end and wrap back to the start inside one demo, which
+            # looks like a teleport and is the artefact of modelling a route as a loop.
+            track = [
+                (round(lat - 5.0, 4), round(lon - 18.0, 4)),
+                (lat, lon),
+                (round(lat + 5.0, 4), round(lon + 18.0, 4)),
+            ]
+        out.append(
+            Asset(
+                id=aid,
+                kind="aircraft",
+                name=name,
+                lat=lat,
+                lon=lon,
+                alt_m=float(alt),
+                geometry=line(track),
+                status="nominal",
+                last_heard_minutes_ago=4.0 if emitting else 31.0,
+                props={
+                    "classification": classification,
+                    "emitting": emitting,
+                    "transponder": emitting,
+                    "hostile": classification == "unknown",
+                    "speed_kn": speed,
+                    "altitude_m": alt,
+                },
+            )
+        )
+    return out
+
+
+def _ground_parties() -> list[Asset]:
+    out = []
+    for gid, name, classification, emitting, lat, lon, size in _GROUND_PARTIES:
+        out.append(
+            Asset(
+                id=gid,
+                kind="ground_party",
+                name=name,
+                lat=lat,
+                lon=lon,
+                alt_m=0.0,
+                status="nominal",
+                last_heard_minutes_ago=11.0 if emitting else 96.0,
+                props={
+                    "classification": classification,
+                    "emitting": emitting,
+                    "hostile": classification == "unknown",
+                    "party_size": size,
+                    "transport": "on foot",
                 },
             )
         )
@@ -665,11 +976,12 @@ def seed_assets() -> list[Asset]:
         *_hydrophones(),
         *_vessels(),
         *_radars(),
+        *_aircraft(),
+        *_ground_parties(),
     ]
 
-
 def seed_rows(now: datetime | None = None) -> list[dict[str, Any]]:
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     return [a.row(now) for a in seed_assets()]
 
 
@@ -679,6 +991,8 @@ KIND_COUNTS = {
     "uas": 5,
     "launch_site": 6,
     "hydrophone": 10,
-    "vessel": 8,
+    "vessel": 9,
     "radar": 12,
+    "aircraft": 4,
+    "ground_party": 3,
 }

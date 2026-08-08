@@ -47,9 +47,20 @@ ATTRIB='\bthe brief\b|\bassessment\b|\btake[ -]?home\b|problem [0-9]|declared sc
 ATTRIB="$ATTRIB"'|\bas required\b|\bper the spec\b|evaluation criteri|\bgrader\b'
 ATTRIB="$ATTRIB"'|\bthe reviewer\b|\bthe client (asks|wants|requires)\b'
 
-# Only tracked files, because only tracked files publish. Untracked scratch is not this
-# check's business, and .gitignore'd files are covered by Set A instead.
-mapfile -d '' -t FILES < <(git ls-files -z 2>/dev/null)
+# 🔴 TRACKED **AND** UNTRACKED-BUT-NOT-IGNORED. This used to be tracked files only,
+# reasoning that only tracked files publish. That is true and it was still the wrong
+# scope, because it made the check blind at exactly the moment it is most needed.
+#
+# A brand new source file is untracked for the whole time it is being written, which is
+# when its prose is fresh and most likely to have carried something across from research
+# notes. The check would print "clear: checked 54 tracked file(s)" while a new file sat
+# beside it unread, and "clear" is what you remember. It happened: a new module was
+# written, this passed, and the file had never been looked at.
+#
+# `--others --exclude-standard` adds precisely the files that are on their way to being
+# committed. Anything genuinely scratch belongs in /tmp or in .gitignore, and ignored
+# files stay out of scope here because they cannot publish.
+mapfile -d '' -t FILES < <(git ls-files -z --cached --others --exclude-standard 2>/dev/null)
 COUNT=${#FILES[@]}
 
 if [ "$COUNT" -eq 0 ]; then
@@ -77,7 +88,7 @@ report "a company, product or exercise name appears in a tracked file" "$NAMES"
 report "a requirement is credited to someone else rather than stated as a decision" "$ATTRIB"
 
 if [ "$RC" -eq 0 ]; then
-  echo "attribution clear: checked $COUNT tracked file(s) for names and for handed-down phrasing"
+  echo "attribution clear: checked $COUNT file(s), tracked and untracked-not-ignored, for names and for handed-down phrasing"
 else
   echo ""
   echo "Fix by stating the fact as a decision with no author, e.g."

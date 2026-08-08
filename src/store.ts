@@ -10,9 +10,15 @@
  * lets the same store drive the map, the panels and the command layer without any
  * of them having to know how the others draw.
  *
- * Time lives here too. `simClock` is the playback position, which is separate
- * from wall-clock time because fast-forward exists. Everything that renders reads
- * `simClock`; nothing reads `Date.now()` except the ticker that advances it.
+ * 🔒 THERE IS NO PLAYBACK CLOCK, and that is a decision rather than a gap. The
+ * display shows the present: what an asset last reported, what the mesh looks like
+ * now, where a contact is. History is a QUERY ("four days of positions for
+ * daymark-3"), which returns a series to draw, not a timeline to scrub. A second
+ * time control would have to pretend the whole picture can be wound back, and only
+ * one layer of it can.
+ *
+ * The one time control on screen is the ice timebar, and it moves through five years
+ * of satellite measurements rather than through the scenario.
  */
 import { create } from "zustand";
 
@@ -20,6 +26,42 @@ import type { Asset, IceLayer, MeshStatus } from "./assets";
 import type { ViewportBbox } from "./map/bounds";
 
 export type Projection = "globe" | "mercator";
+
+/**
+ * A position series for one asset, as the server returned it.
+ *
+ * 🔒 THE ONLY WAY A LINE APPEARS ON THIS MAP. Assets used to draw their seeded route
+ * permanently, which meant 11 of the 68 had a line behind them at rest, before anyone had
+ * asked anything. That is scenery, and it made the answer to "where has this been" look
+ * identical to furniture that was already there. Now a line means somebody asked a
+ * question, and it goes away when they ask the next one.
+ *
+ * Lon-first, GeoJSON order, oldest first, exactly as it arrives.
+ */
+export interface AssetTrack {
+  id: string;
+  coordinates: [number, number][];
+}
+
+/**
+ * Several assets sitting under one click, and where the click was.
+ *
+ * 🔑 THIS EXISTS BECAUSE THE MAP REFUSES TO HIDE ANYTHING. The icon layers set
+ * `icon-allow-overlap: true` on purpose: on a tactical display an asset silently
+ * suppressed by collision detection is worse than two overlapping, because the operator
+ * cannot tell "not there" from "not drawn". The cost of that decision is that a dense
+ * cluster is a pile, and a click on a pile has to pick one.
+ *
+ * Picking the topmost silently is the wrong answer, because the topmost is decided by
+ * draw order rather than by anything the operator can see or predict. So the pile asks.
+ */
+export interface AssetPick {
+  /** Screen coordinates of the click, so the list opens where the finger landed. */
+  x: number;
+  y: number;
+  /** Every asset under the click, nearest the top of the draw order first. */
+  ids: string[];
+}
 
 /** One line in the on-screen transcript. */
 export interface CommandEntry {
@@ -57,10 +99,9 @@ interface State {
   /**
    * The date the ice layer is drawn for, as YYYY-MM-DD.
    *
-   * 🔑 Separate from `simClock`, and the two answer different questions. The slider moves
-   * across FIVE YEARS of monthly satellite measurements; the clock moves across MINUTES of
-   * a single scenario, animating vessels and drone transits. Folding them into one control
-   * would mean nudging a vessel along its track also jumped the ice by a month.
+   * 🔑 It moves the ICE and nothing else. Dragging it five years back does not wind the
+   * assets back with it, and the readout says which layer it is talking about, because a
+   * control that looks like a scenario timeline and is not one is worse than no control.
    *
    * It only ever holds one of the vendored measurement dates. Nothing interpolates between
    * them, because a value between two measurements is a value nobody observed.
@@ -71,12 +112,17 @@ interface State {
   loading: boolean;
   error: string | null;
 
-  /** Playback clock, ms since epoch. Not wall time: fast-forward moves it. */
-  simClock: number;
-  /** Whether the clock is advancing. Fast-forward jumps rather than speeding it up. */
-  running: boolean;
-
   projection: Projection;
+  /**
+   * Whether the radio link graph is drawn.
+   *
+   * 🔑 A VIEW SETTING, NOT A DOMAIN FACT. Hiding the lines does not stop the mesh being
+   * computed, does not change what the footer counts, and does not change what a command
+   * about connectivity answers. The mesh is one layer among several now rather than the
+   * subject of the display, and on a dense cluster its lines are what you turn off to
+   * read anything else.
+   */
+  showMesh: boolean;
   /** Last computed viewport box. What a command means by "the current window". */
   bbox: ViewportBbox | null;
   selectedId: string | null;
@@ -92,6 +138,10 @@ interface State {
   commandLog: CommandEntry[];
   /** Where a command asked the camera to go. Null until one does. */
   camera: CameraTarget | null;
+  /** The position history a command asked for. Null when nobody has asked. */
+  track: AssetTrack | null;
+  /** An unresolved click on overlapping assets. Null unless the operator is choosing. */
+  picker: AssetPick | null;
 
   setAssets: (a: Asset[]) => void;
   setMesh: (m: MeshStatus) => void;
@@ -100,14 +150,14 @@ interface State {
   setIceScrubbing: (v: boolean) => void;
   setLoading: (v: boolean) => void;
   setError: (e: string | null) => void;
-  setClock: (ms: number) => void;
-  advance: (ms: number) => void;
-  setRunning: (v: boolean) => void;
   setProjection: (p: Projection) => void;
+  setShowMesh: (v: boolean) => void;
   setBbox: (b: ViewportBbox) => void;
   select: (id: string | null) => void;
   appendCommand: (e: CommandEntry) => void;
   setCamera: (c: CameraTarget | null) => void;
+  setTrack: (t: AssetTrack | null) => void;
+  setPicker: (p: AssetPick | null) => void;
 }
 
 /** How many transcript lines to keep. Enough to follow a demo, not a scrollback. */
@@ -121,18 +171,19 @@ export const useStore = create<State>((set) => ({
   iceScrubbing: false,
   loading: true,
   error: null,
-  simClock: Date.now(),
-  running: true,
   // Projection can be pinned from the URL (?proj=mercator). Useful for linking
   // someone to a specific view, and it is how the renderer swap gets exercised
   // without a click during automated screenshots.
   projection: (new URLSearchParams(location.search).get("proj") === "mercator"
     ? "mercator"
     : "globe") as Projection,
+  showMesh: true,
   bbox: null,
   selectedId: null,
   commandLog: [],
   camera: null,
+  track: null,
+  picker: null,
 
   setAssets: (a) => set({ assets: a, loading: false, error: null }),
   setMesh: (m) => set({ mesh: m }),
@@ -141,12 +192,14 @@ export const useStore = create<State>((set) => ({
   setIceScrubbing: (v) => set({ iceScrubbing: v }),
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e, loading: false }),
-  setClock: (ms) => set({ simClock: ms }),
-  advance: (ms) => set((s) => ({ simClock: s.simClock + ms })),
-  setRunning: (v) => set({ running: v }),
   setProjection: (p) => set({ projection: p }),
+  setShowMesh: (v) => set({ showMesh: v }),
   setBbox: (b) => set({ bbox: b }),
   select: (id) => set({ selectedId: id }),
   appendCommand: (e) => set((s) => ({ commandLog: [...s.commandLog, e].slice(-LOG_LIMIT) })),
   setCamera: (c) => set({ camera: c }),
+  setTrack: (t) => set({ track: t }),
+  // Choosing one clears the list in the same update, so a stale pile can never sit over
+  // the banner it just opened.
+  setPicker: (p) => set({ picker: p }),
 }));

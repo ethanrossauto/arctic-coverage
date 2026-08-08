@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from . import db
 
@@ -92,6 +92,11 @@ def _bump(bucket: str, limit: int) -> tuple[bool, int]:
         )
         row = cur.fetchone()
         conn.commit()
+    if row is None:
+        # An upsert with `returning count` always yields a row, so this cannot happen. It
+        # raises rather than defaulting to 0 because a silent 0 would read as "no spend yet"
+        # and hand out free model calls forever.
+        raise RuntimeError("spend counter upsert returned no row")
     used = int(row["count"])
     return used <= limit, used
 
@@ -112,12 +117,32 @@ def check(client_ip: str | None) -> Verdict:
     if ip in _owner_ips():
         return Verdict(allowed=True, scope="owner", reason="owner address, exempt from both counts")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     day = now.strftime("%Y-%m-%d")
 
     try:
-        # Global first. If everyone together is over the daily cap there is no reason to
-        # spend a write on the per-IP counter.
+        # 🔴 PER-IP FIRST, AND THE ORDER IS THE WHOLE POINT. This used to bump the global
+        # counter first, to save a write when everyone together was already over the cap.
+        # That micro-optimisation was a denial of service: a single address past its own
+        # limit still drained the shared allowance on every refused call, so one caller
+        # could spend the demo's whole day for everybody without ever getting an answer.
+        #
+        # Checking the caller's own budget first means an abusive address burns only its
+        # own counter. The shared counter moves only for callers who were entitled to make
+        # the call.
+        ok_ip, used_ip = _bump(f"ip:{ip}:{day}", PER_IP_DAILY)
+        if not ok_ip:
+            return Verdict(
+                allowed=False,
+                scope="ip",
+                used=used_ip,
+                limit=PER_IP_DAILY,
+                reason=(
+                    f"you have used {PER_IP_DAILY} model calls today, which is the per-address "
+                    "cap. The deterministic commands are unmetered and still work"
+                ),
+            )
+
         ok_global, used_global = _bump(f"global:{day}", GLOBAL_DAILY)
         if not ok_global:
             return Verdict(
@@ -129,19 +154,6 @@ def check(client_ip: str | None) -> Verdict:
                     f"this demo has made {GLOBAL_DAILY} model calls today, which is its daily cap. "
                     "Every deterministic command still works: try \"mesh status\", "
                     "\"what is not broadcasting\", or \"show me the drones\""
-                ),
-            )
-
-        ok_ip, used_ip = _bump(f"ip:{ip}:{day}", PER_IP_DAILY)
-        if not ok_ip:
-            return Verdict(
-                allowed=False,
-                scope="ip",
-                used=used_ip,
-                limit=PER_IP_DAILY,
-                reason=(
-                    f"you have used {PER_IP_DAILY} model calls today, which is the per-address "
-                    "cap. The deterministic commands are unmetered and still work"
                 ),
             )
 
@@ -175,12 +187,15 @@ def origin_allowed(origin: str | None) -> bool:
 
 def status() -> dict:
     """Current counter values, for the health endpoint and for the README's honesty."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     try:
         with db.connect() as conn, conn.cursor() as cur:
+            # One bucket, asked for once. This read the same key twice through an `in`
+            # clause, which returned the same single row and made the query look like it
+            # was fetching a pair when there was only ever one to fetch.
             cur.execute(
-                "select bucket, count from spend_counters where bucket in (%s, %s)",
-                (f"global:{now:%Y-%m-%d}", f"global:{now:%Y-%m-%d}"),
+                "select count from spend_counters where bucket = %s",
+                (f"global:{now:%Y-%m-%d}",),
             )
             rows = cur.fetchall()
         used = rows[0]["count"] if rows else 0

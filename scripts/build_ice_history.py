@@ -81,15 +81,35 @@ ECC = 0.081816153
 #
 # Full longitude coverage is required near the pole regardless: every meridian converges
 # there, so a partial box can only ever draw a wedge.
-# ⚠️ THESE ARE CELL ORIGINS, NOT EDGES, and each cell spans one further step north and
-# east. So the northern bound is 89.5 rather than 90.0: the top row then covers 89.5 to
-# exactly 90.0 and stops at the pole. Setting it to 90.0 produces a final row spanning
-# 90.0 to 90.5, which is not a latitude, and polygons past the pole render as garbage in
-# the middle of the default camera view.
-# The eastern bound closes the circle the same way: 178.5 spans to exactly 180.0.
-OUT_LAT_STEP, OUT_LON_STEP = 0.5, 1.5
-OUT_SOUTH, OUT_NORTH = 55.0, 89.5
-OUT_WEST, OUT_EAST = -180.0, 178.5
+# 🔑 THE STEP IS SET BY THE SOURCE, AND THE SOURCE IS A 25 KM GRID. That is the ceiling on
+# how fine this can honestly go: below 25 km there is no measurement to draw, only
+# interpolation, and inventing detail is the thing this whole layer exists to avoid.
+#
+# 🔴 A LAT/LON GRID DOES NOT HAVE ONE RESOLUTION, which is what made the earlier settings
+# wrong in a way that was invisible. A degree of longitude shrinks towards the pole, so one
+# step is a different distance at every latitude:
+#
+#     at 0.25 x 0.75      55 N: 48 km      70 N: 29 km      80 N: 15 km
+#     at 0.20 x 0.375     55 N: 24 km      70 N: 14 km      80 N:  7 km
+#
+# The old settings were coarser than the source everywhere below 75 N, and the Northwest
+# Passage sits at 68 to 78 N. So the region this console is actually about was being drawn
+# from averaged-down data while the pole was oversampled.
+#
+# ⚠️ THE PRICE IS PAID AT THE POLE AND IT IS UNAVOIDABLE HERE. Sampling finely enough for
+# 55 N means 7 km cells at 80 N, where the source has nothing finer than 25 km to give, so
+# most of the file is polar cells repeating their neighbours. A latitude-dependent longitude
+# step would fix it and would make every row a different width, which the wire format and the
+# renderer both assume is not the case. Worth doing if this were a product; not worth doing
+# for the gain, which is file size rather than truth.
+#
+# ⚠️ AND THE BOUNDS MOVE WITH THE STEP. They are cell ORIGINS, so the last cell has to land
+# exactly on the pole and exactly on the antimeridian: 89.8 + 0.2 = 90.0, and
+# 179.625 + 0.375 = 180.0. Changing a step without moving its bound opens a gap at the pole
+# and a seam down the antimeridian.
+OUT_LAT_STEP, OUT_LON_STEP = 0.2, 0.375
+OUT_SOUTH, OUT_NORTH = 55.0, 89.8
+OUT_WEST, OUT_EAST = -180.0, 179.625
 
 
 def grid_to_latlon(col: int, row: int) -> tuple[float, float]:
@@ -156,7 +176,11 @@ def read_geotiff(path: Path) -> list[int]:
     if (w, h) != (GRID_W, GRID_H):
         raise RuntimeError(f"{path.name}: expected {GRID_W}x{GRID_H}, got {w}x{h}")
 
-    raw = b"".join(data[o : o + c] for o, c in zip(tags[273], tags[279]))
+    # 🔒 strict=True EARNS ITS PLACE HERE. 273 is the strip offset table and 279 the strip
+    # byte counts, and a TIFF where those two disagree in length is malformed. Zipping
+    # leniently would silently decode only the shorter of the two and hand back an ice grid
+    # missing its last rows, which would look like a rendering bug months later.
+    raw = b"".join(data[o : o + c] for o, c in zip(tags[273], tags[279], strict=True))
     per = bits // 8
     n_px = len(raw) // per
     fmt = endian + ("H" if bits == 16 else "B") * n_px

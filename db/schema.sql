@@ -62,7 +62,7 @@ create table if not exists entities (
     created_by   text        not null default 'seed',
 
     constraint entities_kind_check check (
-        kind in ('node', 'patrol', 'uas', 'launch_site', 'hydrophone', 'vessel', 'radar', 'marker')
+        kind in ('node', 'patrol', 'uas', 'launch_site', 'hydrophone', 'vessel', 'radar', 'marker', 'aircraft', 'ground_party')
     ),
     constraint entities_created_by_check check (
         created_by in ('seed', 'user', 'llm')
@@ -123,8 +123,17 @@ create table if not exists events (
     constraint events_source_check check (
         source in ('ui_button', 'typed', 'voice', 'system')
     ),
+    -- 🔑 'clarify' IS ITS OWN OUTCOME, NOT A FLAVOUR OF 'rejected'. The three original
+    -- values answer "did it work", and a clarification answers none of them: the system
+    -- understood the request, declined to guess, and asked a question it already knows
+    -- every valid answer to. Folded into 'rejected' it would be indistinguishable from a
+    -- real refusal, and the two questions worth asking of this log are exactly the ones
+    -- that difference decides: how often does the system have to ask, and how often does
+    -- it have to say no. A row whose `parent_command_id` points at a 'clarify' row is a
+    -- vague request that got resolved, which is a success story living in the same
+    -- column as a failure.
     constraint events_result_check check (
-        result in ('ok', 'rejected', 'error')
+        result in ('ok', 'rejected', 'clarify', 'error')
     ),
     constraint events_tier_check check (
         tier is null or tier in ('parser', 'llm')
@@ -154,7 +163,7 @@ create index if not exists events_tier_idx    on events (tier);
 -- constraint was created by the statement above with the correct definition already.
 alter table entities drop constraint if exists entities_kind_check;
 alter table entities add constraint entities_kind_check check (
-    kind in ('node', 'patrol', 'uas', 'launch_site', 'hydrophone', 'vessel', 'radar', 'marker')
+    kind in ('node', 'patrol', 'uas', 'launch_site', 'hydrophone', 'vessel', 'radar', 'marker', 'aircraft', 'ground_party')
 );
 
 -- --------------------------------------------------------------------------
@@ -171,4 +180,23 @@ create table if not exists spend_counters (
     bucket     text primary key,
     count      integer     not null default 0,
     updated_at timestamptz not null default now()
+);
+
+
+-- The idle clock, for the demo's own housekeeping. See api/_lib/lifecycle.py.
+--
+-- 🔑 ONE ROW, ENFORCED BY A CHECK CONSTRAINT rather than by everyone remembering to pass
+-- the same id. This is global state about the world, not a per-something counter, and a
+-- second row would mean two clocks disagreeing about whether the world is idle. The
+-- constraint makes that unrepresentable instead of merely discouraged.
+--
+-- ⚠️ Two timestamps, not one, and they answer different questions. `last_activity` is when
+-- a command last ran and decides whether a reset is DUE. `last_reset` is when the world was
+-- last laid back down and decides whether one is ALLOWED yet, which is the floor that stops
+-- a bug in the first field turning every page load into a full reseed.
+create table if not exists world_state (
+    id            smallint primary key default 1,
+    last_activity timestamptz not null default now(),
+    last_reset    timestamptz not null default now(),
+    constraint world_state_single_row check (id = 1)
 );

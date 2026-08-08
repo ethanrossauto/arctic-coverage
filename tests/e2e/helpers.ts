@@ -69,16 +69,6 @@ export async function waitForIceLoaded(page: Page): Promise<void> {
   await page.locator(".timebar .icedate").waitFor({ state: "visible", timeout: 30_000 });
 }
 
-/** The playback clock as the UI renders it, parsed back into a Date. */
-export async function readClock(page: Page): Promise<Date> {
-  const text = await page.locator(".clock").innerText();
-  // Rendered as "2026-08-07  12:34:56Z" with two spaces where the T belongs.
-  const iso = text.trim().replace(/\s+/, "T").replace(/Z$/, "Z");
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) throw new Error(`could not parse clock: ${JSON.stringify(text)}`);
-  return d;
-}
-
 /**
  * How much of the map area is painted with the LAND fill colour?
  *

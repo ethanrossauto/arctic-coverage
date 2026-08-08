@@ -23,18 +23,26 @@ grep finds it.
 """
 from __future__ import annotations
 
+import uuid
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ._lib import db
-from ._lib import executor
+
+# 🔒 OPTIONAL BY CONSTRUCTION. The detection layer decorates an answer rather than
+# producing one, so its absence must cost a field and never a route. Imported through a
+# try so this file loads even mid-edit on a shared tree.
+try:
+    from ._lib import detect
+except Exception:  # noqa: BLE001
+    detect = None  # type: ignore[assignment]
+
+from ._lib import executor, parser, ratelimit, transcribe
 from ._lib import llm as llmlib
-from ._lib import ratelimit
-from ._lib import parser
-from ._lib import tools as toollib
 from ._lib import mesh as meshlib
-from ._lib import transcribe
+from ._lib import tools as toollib
 
 app = FastAPI(
     title="Arctic Coverage",
@@ -78,15 +86,97 @@ def entities(
     thing it exists for. Writes and tool invocations are logged without exception.
     """
     try:
-        rows = db.fetch_entities(kind)
+        # 🔴 EVERY ROW IS FETCHED EVEN WHEN ONE KIND IS ASKED FOR, AND THE FILTER IS
+        # APPLIED BELOW. Connectivity is a property of the whole graph: whether a node can
+        # reach a gateway depends on assets of other kinds standing between it and one.
+        # Asking the database for `kind = 'node'` and computing flags from what came back
+        # would compute them against a world with most of its relays deleted, and the
+        # answer would be confidently wrong rather than missing. Sixty-eight rows is
+        # cheaper than the second query the alternative needs.
+        rows = db.fetch_entities()
     except RuntimeError as exc:
         # A missing connection string is a configuration failure, not an empty
         # world, and it must not render as one.
         raise HTTPException(503, str(exc)) from exc
+
+    _add_connectivity(rows)
+    _add_tracking(rows)
+    if kind:
+        rows = [r for r in rows if r["kind"] == kind]
+
+    # ℹ️ `overdue` and `flag` are already on every row: `db.fetch_entities` decorates at
+    # the read, so this endpoint, the mesh and every tool see one answer computed against
+    # one instant. This route used to add them itself, which was one caller doing it
+    # correctly while the browser did it again from its own copy of the intervals.
     return JSONResponse(
         {"entities": rows, "count": len(rows)},
         headers={"cache-control": "no-store"},
     )
+
+
+def _add_connectivity(rows: list[dict]) -> None:
+    """Put both connectivity flags on each row, where they are facts about that asset.
+
+    🔑 THE ABSENCE IS THE CONTRACT, NOT AN OVERSIGHT. A vessel and a radar site carry no
+    radio, so neither flag is true or false about them, and this leaves the keys off those
+    rows rather than writing `false`. `false` would read as "we checked and it cannot
+    reach us", which is a different and wrong claim: the honest answer is that the question
+    does not apply.
+
+    🔒 GUARDED, because it reaches into a module another part of the build owns and the
+    whole application is imported through this file. A missing helper degrades the map's
+    colouring; it must never take down the endpoints that have nothing to do with it.
+    """
+    flags = getattr(meshlib, "asset_flags", None)
+    if flags is None:
+        return
+    try:
+        by_id = flags(rows)
+    except Exception:  # noqa: BLE001 - connectivity is a decoration on an answer that exists
+        return
+    for row in rows:
+        found = by_id.get(row["id"])
+        if found:
+            row.update(found)
+
+
+def _add_tracking(rows: list[dict]) -> None:
+    """Say, per contact, whether we actually have it on the picture.
+
+    🔑 THE POINT IS THE GAP BETWEEN "IT IS THERE" AND "WE KNOW IT IS THERE". A contact can
+    be present in the world and absent from the display in two different ways: nothing is
+    holding it, or something is holding it and the route carrying that report home is down.
+    Both come back as `tracked: false`, because from an operator's chair they are the same
+    situation, and `held` says which of the two it is.
+
+    That distinction is what makes an adversary worth adding to this world. Placing a
+    hostile contact somewhere nothing can see it is not a decoration; it is the question
+    the whole sensor network exists to answer, and the map can now be asked it directly.
+
+    ⚠️ CONTACTS ONLY, and absent on everything else, for the same reason the connectivity
+    flags are absent on a vessel: a mesh node is not something we track, so neither `true`
+    nor `false` is a fact about it.
+
+    🔒 GUARDED, like the connectivity pair. A missing detection layer costs the checkbox,
+    never the endpoint.
+    """
+    grouped_by_contact = getattr(detect, "held_by", None) if detect else None
+    if grouped_by_contact is None:
+        return
+    try:
+        held = grouped_by_contact(rows)
+        self_reporting = getattr(detect, "_self_reporting", None)
+    except Exception:  # noqa: BLE001 - a decoration on an answer that already exists
+        return
+
+    for row in rows:
+        found = held.get(row["id"])
+        if found is None:
+            continue
+        reported = [d for d in found if d.get("reported")]
+        announcing = bool(self_reporting(row)) if self_reporting else False
+        row["held"] = len(found)
+        row["tracked"] = announcing or bool(reported)
 
 
 @app.get("/api/mesh")
@@ -106,22 +196,39 @@ def mesh() -> JSONResponse:
         raise HTTPException(503, str(exc)) from exc
 
     payload = meshlib.mesh_status(rows)
-    payload["model"] = {
-        # Stated on the wire, not just in a docstring, because every number above depends
-        # on it and a reader of the API should not have to open the source to find the
-        # assumptions.
-        "horizon_formula": "4.12 * (sqrt(h1_m) + sqrt(h2_m))",
-        "note": (
-            "4/3-earth radio horizon, capped by each radio's rated range. Terrain "
-            "masking, Fresnel clearance and fade margin are not modelled, so these "
-            "links are an optimistic upper bound."
-        ),
-        "profiles": {
-            kind: {"height_m": p.height_m, "max_range_km": p.max_range_km, "role": p.role}
-            for kind, p in meshlib.RADIO.items()
-        },
-    }
+    payload["model"] = _mesh_model()
     return JSONResponse(payload, headers={"cache-control": "no-store"})
+
+
+def _mesh_model() -> dict:
+    """How the links above were decided, asked of the thing that decided them.
+
+    🔴 THIS BLOCK USED TO BE A HARDCODED DESCRIPTION OF THE LINK MODEL, SERVED TO ANYONE
+    WHO CALLED THE ENDPOINT, and it was written in a different file from the code it
+    described. That is the exact shape that goes false quietly: change how links are
+    computed and the API keeps publishing the old formula, with the confidence of
+    something that came off the wire rather than out of a comment.
+
+    So it is asked for instead. The module that computes the links describes them, and
+    the two cannot disagree because there is only one of them.
+
+    🔒 FAILS SOFT, IN BOTH DIRECTIONS. A build whose mesh module publishes no description
+    says so, rather than this file inventing one on its behalf. Saying nothing about the
+    assumptions is a smaller problem than saying something untrue about them.
+    """
+    describe = getattr(meshlib, "model", None)
+    if callable(describe):
+        try:
+            return describe()
+        except Exception:  # noqa: BLE001 - a broken description must not break /api/mesh
+            pass
+
+    return {
+        "note": (
+            "this build does not publish its link model. The links above are computed "
+            "from live positions and are a planning aid, not a link budget."
+        )
+    }
 
 
 class CommandRequest(BaseModel):
@@ -276,6 +383,11 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
             tier=tier,
             utterance=req.utterance,
             parent_command_id=req.parent_command_id,
+            # The deixis carrier finally reaches the executor. It was collected by the
+            # client and forwarded to the model from the start, but nothing downstream
+            # could act on it, so "this asset" and "the current window" were words the
+            # system understood and could not answer.
+            context=req.context,
         )
     except executor.PlanRejected as exc:
         return JSONResponse(
@@ -288,7 +400,8 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
 
     outcome["ok"] = all(r["ok"] for r in outcome["results"])
     outcome["tier"] = tier
-    outcome["plan"] = plan
+    # `plan` is set by the executor and is the RESOLVED one; do not overwrite it with the
+    # pre-resolution copy this function still holds.
     return JSONResponse(outcome, headers={"cache-control": "no-store"})
 
 
@@ -339,13 +452,29 @@ async def transcribe_audio(request: Request) -> JSONResponse:
             status_code=200, headers={"cache-control": "no-store"},
         )
 
+    # 🔑 THE TRANSCRIPTION GETS A COMMAND ID AND HANDS IT BACK, which is what makes a
+    # spoken command one thread in the log instead of two unrelated rows. Without it the
+    # audit trail holds "some audio became these words" and, separately, "this command
+    # ran", with nothing joining them: you could not ask what a person actually SAID to
+    # cause a given action, which is the first question anyone asks of a voice interface
+    # when it does something surprising.
+    #
+    # The client returns it as `parent_command_id` on the command that follows, so the
+    # chain reads transcription, then plan, then steps, under one parent. It is the same
+    # mechanism a clarification uses, and deliberately so: both are cases where one
+    # interaction spans more than one request.
+    command_id = str(uuid.uuid4())
     db.log_event(
         tool="transcribe", source="voice", tier="llm", result="ok",
+        command_id=command_id,
         params={k: v for k, v in out.items() if k != "text"},
         detail=out["text"],
         latency_ms=out["latency_ms"],
     )
-    return JSONResponse({"ok": True, "text": out["text"]}, headers={"cache-control": "no-store"})
+    return JSONResponse(
+        {"ok": True, "text": out["text"], "command_id": command_id},
+        headers={"cache-control": "no-store"},
+    )
 
 
 @app.get("/api/tools")

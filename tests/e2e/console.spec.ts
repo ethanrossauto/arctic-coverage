@@ -70,3 +70,53 @@ test("the basemap and the world both load, and nothing is fetched off-origin", a
   await page.waitForTimeout(1000);
   expect(offOrigin, "requests to third-party hosts").toEqual([]);
 });
+
+/**
+ * ACCESSIBILITY.
+ *
+ * 🔑 THIS IS NOT BOX-TICKING FOR THIS PARTICULAR APP, for two reasons worth stating.
+ *
+ * The console signals state through COLOUR: grey for an asset nothing can hear, amber for
+ * maintenance, a distinct treatment for a contact running dark. Colour as the sole channel
+ * for information is the most common serious WCAG failure there is, and this display leans
+ * on it harder than most.
+ *
+ * And the buyer for a system like this is a government or defence organisation, where
+ * accessibility is a procurement requirement rather than a preference: AODA in Ontario,
+ * WCAG in federal contracting. "It passes axe" is a commercially relevant sentence.
+ *
+ * ⚠️ WHAT AN AUTOMATED PASS DOES AND DOES NOT MEAN. axe catches roughly a third to a half
+ * of real WCAG issues: contrast, missing labels, bad roles, unlabelled controls. It cannot
+ * tell whether the map is usable by keyboard alone or whether a screen reader can follow a
+ * command's result. A green run here is a floor, not a certificate, and the README says so
+ * in those words rather than claiming compliance.
+ */
+test("the console has no serious or critical accessibility violations", async ({ page }) => {
+  const { default: AxeBuilder } = await import("@axe-core/playwright");
+
+  await page.goto("/");
+  await waitForAppLoaded(page);
+
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    // ⚠️ EXCLUDED, AND NAMED RATHER THAN SILENTLY SCOPED OUT. MapLibre renders into a
+    // canvas it owns and injects its own controls, so findings inside it are reports about
+    // a dependency that this project cannot fix in this repo. Everything the project
+    // actually wrote (the command bar, the panels, the timebar, the banner) is in scope.
+    .exclude(".maplibregl-map")
+    .analyze();
+
+  // Serious and critical only. Axe's "minor" tier is largely advisory, and failing a build
+  // on advice is how a check gets switched off.
+  const blocking = results.violations.filter(
+    (v) => v.impact === "serious" || v.impact === "critical",
+  );
+
+  // The failure message has to say WHAT and WHERE, or whoever sees it red at 2am learns
+  // nothing from it.
+  const detail = blocking
+    .map((v) => `${v.id} (${v.impact}): ${v.help}\n    ${v.nodes.map((n) => n.target).join("\n    ")}`)
+    .join("\n\n");
+
+  expect(blocking, `accessibility violations:\n\n${detail}`).toHaveLength(0);
+});

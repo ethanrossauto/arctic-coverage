@@ -38,7 +38,6 @@ import json
 import math
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from .mesh import haversine_km
 
@@ -129,10 +128,6 @@ def is_land(lat: float, lon: float) -> bool:
     return False
 
 
-def is_water(lat: float, lon: float) -> bool:
-    return not is_land(lat, lon)
-
-
 def distance_to_coast_km(lat: float, lon: float, search_deg: float = 3.0) -> float:
     """Roughly how far this point is from the nearest coastline vertex.
 
@@ -162,57 +157,45 @@ def distance_to_coast_km(lat: float, lon: float, search_deg: float = 3.0) -> flo
     return best
 
 
-def nearest_land(lat: float, lon: float, max_km: float = 120.0) -> tuple[float, float] | None:
-    """The closest coastline vertex to this point, or None if none is within `max_km`.
-
-    🔑 THIS IS WHAT PLACES THE SENSOR NODES. A chokepoint axis is drawn down the middle
-    of a strait, because that is where the water a sensor watches actually is, but a
-    node has to physically sit on a shore. Snapping each planned position to the nearest
-    coast puts it where one could really be installed, and does it from the same data
-    the map draws so the result cannot look wrong on screen.
-
-    ⚠️ Returns a VERTEX of the simplified coastline, so it is a shoreline within the
-    resolution of the basemap, not a surveyed site. Good enough to be defensible, and
-    described that way in the seed rather than as a real position.
-    """
-    best: tuple[float, float] | None = None
-    best_d = max_km
-    search_deg = max_km / 111.0 + 1.0
-    for ring, min_lon, min_lat, max_lon, max_lat in _rings():
-        if (
-            lon < min_lon - search_deg
-            or lon > max_lon + search_deg
-            or lat < min_lat - search_deg
-            or lat > max_lat + search_deg
-        ):
-            continue
-        for rlon, rlat in ring:
-            if abs(rlat - lat) > search_deg:
-                continue
-            d = haversine_km(lat, lon, rlat, rlon)
-            if d < best_d:
-                best_d = d
-                best = (rlat, rlon)
-    return best
-
-
 # --------------------------------------------------------------------------
 # The constraint table: which medium each kind can exist in
 # --------------------------------------------------------------------------
 #
-# ⚠️ THE SEASON IS PART OF THIS AND IS NOT HIDDEN. The scenario is set in AUGUST, when
-# the Northwest Passage is navigable, which is why eight vessels are transiting it. In
-# August a snowmobile patrol cannot cross open water. In March it drives over the same
-# water on sea ice, and the identical validator with `sea_ice` set would permit the
-# route it refuses here.
+# ⚠️ THE SEASON IS PART OF THIS AND IS NOT HIDDEN. The scenario is set in AUGUST, when the
+# Northwest Passage is navigable, which is why vessels are transiting it and why a ground
+# patrol cannot cross open water. In winter the same patrol drives over that water on sea
+# ice and the same check should permit what it refuses here.
 #
-# That is stated in the README as a parameter of the scenario rather than left as an
-# assumption someone has to reverse-engineer from a refusal.
+# ⚠️ There WAS a `sea_ice` parameter for that, and it was removed rather than kept: no
+# caller had ever passed it, nothing set it, and a dormant branch that has never run once is
+# not flexibility, it is an untested code path advertising a feature that does not exist.
+# Winter belongs in this comment until something actually needs it.
 
-LAND_KINDS = {"node", "patrol", "launch_site", "radar"}
+LAND_KINDS = {"node", "patrol", "launch_site", "radar", "ground_party"}
 WATER_KINDS = {"hydrophone", "vessel"}
-# A drone flies, a marker is an annotation, and neither has an opinion about the surface.
-ANY_KINDS = {"uas", "marker"}
+# A drone flies, an aircraft flies, a marker is an annotation, and none of the three has an
+# opinion about the surface underneath it.
+ANY_KINDS = {"uas", "marker", "aircraft"}
+
+# 🔴 ABSENCE MUST NOT PRODUCE A CONFIDENT ANSWER. This was a real bug, found by Lane review
+# on 2026-08-07 and worth keeping the story of.
+#
+# The check used to end in `wants_land = kind in LAND_KINDS`, so a kind that appeared in
+# NONE of the three sets fell through to False and was quietly treated as belonging in the
+# sea. When `aircraft` and `ground_party` were added to the schema and to the seed, nobody
+# added them here, and the result was that **a ground party was refused for standing on the
+# ground** while an aircraft could only be placed at sea.
+#
+# It stayed invisible for as long as it did because nothing could place those kinds, so the
+# misclassification never ran. The moment placement opened to every kind, a dormant fault
+# became one a demo could hit.
+#
+# 🔑 The fix that matters is not the two missing entries, it is that the fall-through had a
+# default at all. A classifier with a default cannot tell "this belongs in water" from "I
+# have never heard of this", and it reports both with the same confidence. Now an unknown
+# kind raises, so the next kind added to the schema fails loudly here on its first placement
+# rather than getting an answer nobody computed.
+CLASSIFIED_KINDS = LAND_KINDS | WATER_KINDS | ANY_KINDS
 
 # 🔴 THE MOST IMPORTANT NUMBER IN THIS FILE, AND IT WAS MEASURED, NOT CHOSEN.
 #
@@ -259,7 +242,7 @@ ANY_KINDS = {"uas", "marker"}
 COASTAL_TOLERANCE_KM = 6.0
 
 
-def check_placement(kind: str, lat: float, lon: float, sea_ice: bool = False) -> str | None:
+def check_placement(kind: str, lat: float, lon: float) -> str | None:
     """None if this placement is physically possible, or a plain-English reason if not.
 
     The message is written to be read by an operator rather than parsed by a machine,
@@ -276,6 +259,15 @@ def check_placement(kind: str, lat: float, lon: float, sea_ice: bool = False) ->
     if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
         return f"{lat:.4f}, {lon:.4f} is not a valid position"
 
+    # 🔴 REFUSE TO GUESS ABOUT A KIND NOBODY CLASSIFIED. See CLASSIFIED_KINDS above: the
+    # alternative is a confident wrong answer, and the one this produced was refusing a
+    # ground party for being on the ground.
+    if kind not in CLASSIFIED_KINDS:
+        raise ValueError(
+            f'"{kind}" has no medium classified in terrain.py. Add it to LAND_KINDS, '
+            "WATER_KINDS or ANY_KINDS before it can be placed."
+        )
+
     if kind in ANY_KINDS:
         return None
 
@@ -291,11 +283,9 @@ def check_placement(kind: str, lat: float, lon: float, sea_ice: bool = False) ->
 
     label = kind.replace("_", " ")
     if wants_land:
-        if sea_ice:
-            return None
         return (
             f"that position is roughly {offset:.0f} km out in open water, and a {label} "
-            "has to be on land. The scenario is set in August, so there is no sea ice to cross"
+            "has to be on land"
         )
     return (
         f"that position is roughly {offset:.0f} km inland, and a {label} has to be in water"

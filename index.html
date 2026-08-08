@@ -4,10 +4,121 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Arctic Coverage</title>
-    <meta name="description" content="Satellite coverage planning for deployable Arctic sensor nodes." />
+    <meta
+      name="description"
+      content="An Arctic situational-awareness console: a natural-language interface to a deployable sensor picture, with measured sea ice as context."
+    />
+
+    <!--
+      THE LOADING CURTAIN IS INLINE HERE, AND NOT A REACT COMPONENT, ON PURPOSE.
+
+      Everything in this block is painted on the very first frame, before the module bundle
+      has been fetched, parsed or executed. A curtain that React has to mount first cannot
+      cover the gap it exists to cover: the blank page IS the wait for that bundle. Moving
+      this into a component would leave exactly the flash it removes.
+
+      The cost is that these styles are duplicated rather than sharing the app's stylesheet,
+      which is the trade being made deliberately: a few hundred bytes of inline CSS against
+      a visible blank frame on every cold load.
+    -->
+    <style>
+      #boot {
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0b0e14;
+        color: #e6edf3;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        transition: opacity 400ms ease;
+      }
+      #boot.boot--done {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .boot__inner {
+        text-align: center;
+        width: 300px;
+        max-width: calc(100vw - 48px);
+      }
+      .boot__mark {
+        font-size: 22px;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+      }
+      .boot__sub {
+        margin-top: 10px;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        color: #8b98a9;
+      }
+      .boot__bar {
+        margin-top: 18px;
+        height: 2px;
+        background: #1c2430;
+        overflow: hidden;
+      }
+      .boot__fill {
+        display: block;
+        height: 100%;
+        width: 40%;
+        background: #4a9eff;
+        animation: boot-sweep 1.1s ease-in-out infinite;
+      }
+      @keyframes boot-sweep {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(350%); }
+      }
+      /* Someone who has asked for less motion gets a static bar rather than none: the point
+         is to show that something is happening, and a still bar still says that. */
+      @media (prefers-reduced-motion: reduce) {
+        .boot__fill { animation: none; width: 100%; opacity: 0.5; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+
+    <!-- Nothing lifts the curtain without JavaScript, and a console that never boots is
+         worse than an honest blank page. -->
+    <noscript><style>#boot { display: none; }</style></noscript>
+
+    <div id="boot" role="status" aria-label="Loading the console">
+      <div class="boot__inner">
+        <div class="boot__mark">ARCTIC COVERAGE</div>
+        <div class="boot__sub">Loading...</div>
+        <div class="boot__bar"><span class="boot__fill"></span></div>
+      </div>
+    </div>
+
+    <script>
+      // The app calls window.consoleReady() when the map has actually drawn something. Until
+      // it does, the watchdog below is what lifts the curtain, so this is safe to ship before
+      // anything calls it.
+      (function () {
+        var lifted = false;
+        function lift() {
+          if (lifted) return;
+          lifted = true;
+          var el = document.getElementById("boot");
+          if (!el) return;
+          el.classList.add("boot--done");
+          // Remove it rather than leaving a transparent full-screen layer over the map,
+          // which would swallow every click on the globe underneath it.
+          setTimeout(function () { el.remove(); }, 450);
+        }
+        window.consoleReady = lift;
+
+        // 🔒 THE WATCHDOG IS THE IMPORTANT HALF. A curtain that waits for a signal will hang
+        // forever the day that signal is not sent, and a permanently "Loading..." page is a
+        // far worse failure than a map that appears a moment early. So the wait is bounded
+        // and the bound is short.
+        setTimeout(lift, 6000);
+      })();
+    </script>
+
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -34,7 +34,6 @@ body {
 .strip.bottom { top: auto; bottom: 0; border-bottom: 0; border-top: 1px solid var(--line); }
 .brand { color: var(--accent); letter-spacing: 0.14em; font-weight: 600; }
 .sep { flex: 0 0 1px; height: 14px; background: var(--line); }
-.clock { color: var(--warn); letter-spacing: 0.06em; }
 .dim { color: var(--dim); margin-left: auto; }
 .err { color: var(--err); }
 b { color: #fff; font-weight: 600; }
@@ -46,6 +45,18 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 button:disabled { opacity: 0.4; cursor: default; }
+
+/* Layer toggles in the top strip. `color-scheme: dark` for the same reason the timebar
+   needs it: Chromium otherwise draws a light native checkbox that reads as a rendering
+   fault against this palette. */
+.toggle {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--dim); letter-spacing: 0.06em;
+  cursor: pointer; user-select: none;
+  color-scheme: dark;
+}
+.toggle:hover { color: var(--text); }
+.toggle input { accent-color: var(--accent); cursor: pointer; margin: 0; }
 
 /* Two states worth colouring in the status strip, and only two. Everything else
    stays neutral so that these read instantly. */
@@ -69,36 +80,30 @@ b.alert { color: var(--err); }
   color-scheme: dark;
   z-index: 5;
 }
-.timebar .scrub { position: relative; flex: 1 1 auto; }
-.timebar input[type="range"] {
-  width: 100%;
-  accent-color: var(--accent);
+/* The month list. Sized to its content rather than stretched: it is a control you pick
+   from once, not one you drag along the bar, and a full-width select would go on implying
+   the continuous scrub the range input used to. */
+.timebar .icepick {
+  font: inherit;
+  background: #0b141c; color: var(--text);
+  border: 1px solid var(--line);
+  padding: 4px 8px;
   cursor: pointer;
-  margin: 0;
+  letter-spacing: 0.06em;
 }
-/* Year labels under the track. Absolutely positioned by fraction, and translated
-   back by half their own width so the text centres on the tick rather than
-   starting at it. The first and last are nudged inward by the clamp so neither
-   runs off the end of the bar. */
-.timebar .ticks {
-  position: relative; height: 11px; margin-top: 2px;
-}
-.timebar .ticks span {
-  position: absolute; top: 0;
-  transform: translateX(-50%);
-  font-size: 9px; letter-spacing: 0.08em;
-  color: var(--dim);
-  white-space: nowrap;
-}
+.timebar .icepick:hover { border-color: var(--accent); }
+.timebar .icepick:focus { outline: none; border-color: var(--accent); }
+.timebar .icecount { margin-left: 0; }
 .timebar .icedate {
-  color: var(--accent);
-  letter-spacing: 0.1em;
-  font-weight: 600;
-  min-width: 8.5em;      /* fixed so the bar does not twitch as the month changes */
-  text-align: right;
+  letter-spacing: 0.08em;
+  margin-left: 0;
+  min-width: 13em;       /* fixed so the bar does not twitch as the index changes */
 }
-.timebar .caveat { margin-left: 0; flex: 0 0 auto; }
-.timebar .play, .timebar .stepbtn { padding: 3px 9px; }
+.timebar .caveat { margin-left: auto; flex: 0 0 auto; }
+.timebar .play, .timebar .stepbtn, .timebar .icego { padding: 3px 9px; }
+/* Enabled means there is a choice waiting to be drawn, so it takes the accent to say so.
+   Disabled it is just quiet, which is the resting state most of the time. */
+.timebar .icego:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .timebar .play { min-width: 3em; }
 
 /* ---- the command surface -----------------------------------------------------
@@ -170,3 +175,139 @@ b.alert { color: var(--err); }
 @media (prefers-reduced-motion: reduce) {
   .cmdbar .mic.live { animation: none; }
 }
+
+/* ---- the asset banner ---------------------------------------------------------
+   Top right, opposite the command bar. The two are the only panels that appear and
+   disappear, and putting them in the same corner would mean one covering the other at
+   exactly the moment both matter: you type a command, it selects something, you read the
+   result. */
+.banner {
+  position: absolute; right: 12px; top: 46px;
+  width: 268px;
+  padding: 9px 11px 11px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  z-index: 6;
+}
+.banner header { display: flex; align-items: baseline; gap: 8px; }
+.banner .bname {
+  flex: 1 1 auto;
+  color: var(--accent); font-weight: 600; letter-spacing: 0.06em;
+  overflow-wrap: anywhere;
+}
+.banner .bclose {
+  flex: 0 0 auto; padding: 0 4px; line-height: 1.2;
+  background: none; border: 0; color: var(--dim);
+}
+.banner .bclose:hover { color: var(--text); border: 0; }
+.banner .bkind {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  color: var(--dim); margin: 3px 0 8px;
+}
+
+/* The same three colours the rings use. A banner that named a condition in a different
+   colour from the ring beside it would be two vocabularies for one fact. */
+.banner .bflag {
+  font-size: 9px; letter-spacing: 0.1em;
+  padding: 1px 5px; border: 1px solid currentColor; border-radius: 2px;
+}
+.banner .bflag.maintenance { color: #ffd166; }
+.banner .bflag.weak { color: #ff9f43; }
+.banner .bflag.unreachable { color: #6b7683; }
+/* A role, not a condition, so it takes the accent rather than one of the ring colours. */
+.banner .bflag.gateway { color: var(--accent); }
+
+/* A row grid rather than one grid over every dt and dd, so a long value wraps under its
+   own label instead of shoving every row below it out of alignment. */
+.banner dl { margin: 0; max-height: 58vh; overflow-y: auto; }
+.banner .brow {
+  display: grid; grid-template-columns: auto 1fr; gap: 12px;
+  padding: 1px 0;
+}
+.banner dt { color: var(--dim); }
+.banner dd { margin: 0; text-align: right; color: var(--text); overflow-wrap: anywhere; }
+.banner dd.warn { color: var(--warn); }
+.banner dd.alert { color: var(--err); }
+
+/* ---- the overlapping-assets fan -----------------------------------------------
+   Icons lifted off the pile, each tethered back to where it really is. The tether is the
+   part that matters: without it this would be a map quietly drawing assets at positions
+   nobody measured, which every other layer here refuses to do. */
+.fanlines {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;        /* it is an annotation, never a target */
+  z-index: 7;
+}
+.fanlines line {
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;       /* dashed, so it never reads as a mesh link */
+  opacity: 0.75;
+}
+.fanlines circle { fill: var(--accent); opacity: 0.9; }
+
+.fan { position: absolute; inset: 0; pointer-events: none; z-index: 8; }
+.fanitem {
+  position: absolute;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  width: 96px; padding: 5px 4px 6px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+.fanitem:hover { border-color: var(--accent); }
+.fanitem:hover .fanname { color: var(--accent); }
+.fanitem .fanicon { display: block; line-height: 0; }
+.fanitem .fanname {
+  color: var(--text); font-size: 11px; text-align: center; line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.fanitem .fankind {
+  display: flex; flex-direction: column; align-items: center;
+  color: var(--dim); font-size: 9px; letter-spacing: 0.06em; text-align: center;
+}
+/* An unreachable asset is faded in the fan exactly as it is on the map, so the fan reads
+   as the same picture pulled apart rather than as a different one. */
+.fanitem.unreachable .fanicon { opacity: 0.45; }
+.fanitem .fanflag.maintenance { color: #ffd166; }
+.fanitem .fanflag.weak { color: #ff9f43; }
+.fanitem .fanflag.unreachable { color: #6b7683; }
+
+/* ---- the old list, retired -----------------------------------------------------
+   Anchored to where the click landed rather than to a corner, because the question it
+   asks is about that spot: dropping the list in a fixed panel would make the operator
+   look away from the pile to answer a question about the pile. */
+.picker {
+  position: absolute;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--accent);
+  z-index: 8;                 /* above the banner: it is answering a question first */
+  display: flex; flex-direction: column;
+  max-height: 60vh; overflow-y: auto;
+}
+.picker .phead {
+  padding: 5px 9px;
+  color: var(--dim); font-size: 10px; letter-spacing: 0.1em;
+  border-bottom: 1px solid var(--line);
+}
+.picker .prow {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 5px 9px; text-align: left;
+  background: none; border: 0; border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.picker .prow:last-child { border-bottom: 0; }
+.picker .prow:hover { background: #14202b; border-color: var(--line); }
+.picker .prow:hover .pname { color: var(--accent); }
+.picker .pname { color: var(--text); overflow-wrap: anywhere; }
+.picker .pkind { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 10px; }
+.picker .pflag { letter-spacing: 0.08em; }
+.picker .pflag.maintenance { color: #ffd166; }
+.picker .pflag.weak { color: #ff9f43; }
+.picker .pflag.unreachable { color: #6b7683; }

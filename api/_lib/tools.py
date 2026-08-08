@@ -23,10 +23,13 @@ tool answer a button, a typed command and a test.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from . import db, mesh as meshlib, terrain
+from . import db, freshness, terrain
+from . import mesh as meshlib
 
 # --------------------------------------------------------------------------
 # Result and error types
@@ -59,6 +62,31 @@ class ToolError(Exception):
     Distinct from an unexpected exception on purpose: this is the system working
     correctly and declining, and it is logged as `rejected` rather than `error`.
     """
+
+
+class Ambiguous(ToolError):
+    """The request was understood; it just named more than one thing.
+
+    🔑 A SUBCLASS RATHER THAN A FLAG, because every existing handler already does the
+    right thing with it. Anything that catches `ToolError` keeps treating this as a
+    refusal and logs it as one; only the executor, which catches `Ambiguous` first,
+    knows to turn it into a question. Adding a branch to a base class would have meant
+    auditing every catch site instead.
+
+    ⚠️ IT CARRIES THE CANDIDATES, WHICH IS THE ENTIRE POINT. The old code built the same
+    list, formatted it into a sentence, and threw the structure away, so the one thing a
+    caller needed in order to offer a choice was the one thing that did not survive.
+    `message` is still a complete English sentence, so a client that ignores all of this
+    is no worse off than before.
+    """
+
+    def __init__(self, query: str, candidates: list[dict[str, Any]], total: int) -> None:
+        names = ", ".join(f'{c["name"]} ({c["id"]})' for c in candidates)
+        more = "" if total <= len(candidates) else f" and {total - len(candidates)} more"
+        super().__init__(f'"{query}" matches {total} assets: {names}{more}. Which one?')
+        self.query = query
+        self.candidates = candidates
+        self.total = total
 
 
 # --------------------------------------------------------------------------
@@ -114,23 +142,52 @@ def _resolve(text: str, entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [e for e in entities if needle in e["name"].lower() or needle in e["id"].lower()]
 
 
-def _require_one(text: str, entities: list[dict[str, Any]]) -> dict[str, Any]:
-    matches = _resolve(text, entities)
-    if not matches:
-        near = ", ".join(e["name"] for e in entities[:4])
-        raise ToolError(f'nothing here matches "{text}". Some of what exists: {near}')
-    if len(matches) > 1:
-        names = ", ".join(f'{e["name"]} ({e["id"]})' for e in matches[:6])
-        raise ToolError(f'"{text}" matches {len(matches)} assets: {names}. Which one?')
-    return matches[0]
+# How many candidates a clarification offers before it stops listing them. Six fits on
+# screen and reads aloud; past that the honest answer is "narrow it down", not a longer
+# list nobody scans.
+MAX_CANDIDATES = 6
+
+# 🔑 EVERY KIND THE WORLD CAN HOLD IS PLACEABLE. This used to be four, which made the map
+# read-only for most of what is on it: an operator could add a sensor but not the ship they
+# were watching or the patrol they were sending. Someone opening this up to put assets
+# where the real ones are is the thing the application most wants to encourage, and a short
+# list quietly decided that half of that was not allowed.
+#
+# ⚠️ WHAT STOPS A NONSENSE PLACEMENT IS THE TERRAIN CHECK, NOT THIS LIST. A vessel on a
+# glacier and a radar site in open water are both still refused, with a reason naming the
+# medium and the distance. That is a physical answer rather than a policy one, which is why
+# widening the policy costs nothing.
+#
+# ⚠️ THE DATABASE HOLDS THE SAME LIST IN A CHECK CONSTRAINT, and a test pins the two
+# together. Two copies of one list is the shape that drifts, and the failure would be ugly:
+# a kind allowed here and refused there dies inside the insert as an unhandled error rather
+# than as a clean refusal, so the audit log would call it a broken tool instead of a bad
+# request.
+PLACEABLE_KINDS: frozenset[str] = frozenset(
+    {
+        "node",
+        "patrol",
+        "uas",
+        "launch_site",
+        "hydrophone",
+        "vessel",
+        "radar",
+        "marker",
+        "aircraft",
+        "ground_party",
+    }
+)
 
 
-def _bbox_contains(bbox: dict[str, Any], lat: float, lon: float) -> bool:
+def bbox_contains(bbox: dict[str, Any], lat: float, lon: float) -> bool:
     """Point-in-box with wraparound, the server twin of `src/map/bounds.ts`.
 
-    ⚠️ THE TWO MUST AGREE OR A FILTER HIGHLIGHTS A DIFFERENT SET THAN IT REPORTS. Kept as
-    one short function in each language rather than a shared module for eight lines of
-    arithmetic, with this note on both sides.
+    🔴 THIS WAS DELETED AS DEAD CODE AND HAD TO COME BACK, which is worth recording. It
+    was genuinely unreachable: nothing took a bbox, so removing it was correct about the
+    code and wrong about the product, because "assets in the current zoom window" is the
+    first capability the application is supposed to have. Unused is not the same as
+    unwanted, and the honest fix was to finish the feature rather than to delete its
+    remains.
 
     The cases that matter, and that a naive version gets wrong: a pole-centred globe view
     legitimately spans EVERY longitude, and an oblique view can produce west > east.
@@ -143,6 +200,70 @@ def _bbox_contains(bbox: dict[str, Any], lat: float, lon: float) -> bool:
     if bbox.get("wraps"):
         return lon >= bbox["west"] or lon <= bbox["east"]
     return bbox["west"] <= lon <= bbox["east"]
+
+
+def _require_one(text: str, entities: list[dict[str, Any]]) -> dict[str, Any]:
+    """One asset, or a question. Never a guess.
+
+    Raising `Ambiguous` rather than picking the first match is the difference between a
+    system that asks and one that acts on an assumption the operator never made. The
+    executor turns it into a choice; nothing here knows or cares how it is drawn.
+    """
+    matches = _resolve(text, entities)
+    if not matches:
+        near = ", ".join(e["name"] for e in entities[:4])
+        raise ToolError(f'nothing here matches "{text}". Some of what exists: {near}')
+    if len(matches) > 1:
+        raise Ambiguous(
+            query=text,
+            candidates=[
+                {"id": e["id"], "name": e["name"], "kind": e["kind"], "status": e["status"]}
+                for e in matches[:MAX_CANDIDATES]
+            ],
+            total=len(matches),
+        )
+    return matches[0]
+
+
+# --------------------------------------------------------------------------
+# Overdue
+# --------------------------------------------------------------------------
+
+# 🔑 THE RULE LIVES IN `freshness`, NOT HERE, and these names are re-exported so callers
+# do not have to care which module answers. It moved out because four layers need the
+# same answer and this one imports the domain, so nothing below it could ask this file
+# without a cycle. Re-exported rather than aliased at each call site: `tools.is_overdue`
+# is what the tests and the API already say, and a move that renames every caller is a
+# move that gets half done.
+OVERDUE_MINUTES = freshness.OVERDUE_MINUTES
+minutes_since_heard = freshness.minutes_since_heard
+is_overdue = freshness.is_overdue
+flag_for = freshness.flag_for
+
+# ⚠️ A SECOND `def is_overdue` USED TO SIT BELOW THIS AND SHADOW IT. It was a byte-for-byte
+# copy of the one in `freshness`, so the behaviour never differed and nothing failed. What
+# it meant was that this re-export was dead: `tools.is_overdue` resolved to the local copy,
+# and the de-duplication these four lines exist to perform had not actually happened.
+#
+# 🔑 Worth remembering as a shape rather than an incident. Moving a function and re-exporting
+# it is only finished when the original is DELETED; leaving it means two definitions that
+# agree today, silently diverge on the first edit, and cannot be told apart by reading.
+# Found by ruff (F811) and mypy (no-redef) independently, which is why both are in CI.
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    """An instant back into a real datetime for a write.
+
+    `fetch_entities` serialises timestamps to ISO strings so they can be sent to a
+    browser, and a tool that reads a row and writes it back would otherwise hand a text
+    value to a `timestamptz` column, which Postgres refuses rather than coerces.
+    """
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, datetime) else None
 
 
 def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
@@ -183,11 +304,11 @@ def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
     # not expose a clean degrees-per-pixel, so this is a ladder tuned against
     # screenshots, clamped at both ends. A single point has no scale of its own and gets
     # a fixed close zoom rather than infinite.
-    for limit, zoom in ((0.0, 7.5), (15, 6.5), (60, 5.2), (200, 4.2), (600, 3.2), (1500, 2.4)):
+    zoom = 1.8  # the widest rung, used when nothing on the ladder is wide enough
+    for limit, rung in ((0.0, 7.5), (15, 6.5), (60, 5.2), (200, 4.2), (600, 3.2), (1500, 2.4)):
         if spread_km <= limit:
+            zoom = rung
             break
-    else:
-        zoom = 1.8
 
     return {
         "center": [round(lon_c, 4), round(lat_c, 4)],
@@ -206,9 +327,11 @@ def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
     "List assets, optionally filtered by kind, status, overdue or AIS state.",
     {
         "kind": "one asset kind, e.g. node, patrol, uas, hydrophone, vessel, radar, launch_site",
-        "status": "nominal, degraded, warning or silent",
+        "status": "nominal or maintenance. For assets that have gone quiet use overdue, not status",
         "not_broadcasting": "true to return only contacts holding no AIS broadcast",
         "isolated": "true to return only assets on no mesh at all",
+        "overdue": "true to return only assets that have not reported inside their kind's interval",
+        "bbox": "restrict to what is on screen right now, for 'in the current zoom window'",
     },
 )
 def list_entities(
@@ -216,25 +339,73 @@ def list_entities(
     status: str | None = None,
     not_broadcasting: bool | None = None,
     isolated: bool | None = None,
+    overdue: bool | None = None,
+    bbox: dict[str, Any] | None = None,
 ) -> ToolResult:
-    rows = _entities()
+    """Assets, filtered.
+
+    🔴 `overdue` IS A REAL FILTER NOW, AND IT WAS ADVERTISED BEFORE IT EXISTED. The
+    summary line above has offered it since this registry was written, the command bar
+    ships "which assets are overdue" as a suggested example, and the parser answered that
+    sentence with a condition filter, which is a different question with a different
+    answer.
+    Overdue is about silence, status is about condition, and two assets were in one set
+    and not the other. So the app's own suggestion returned a set that disagreed with the
+    count in the footer beside it.
+    """
+    all_rows = _entities()
+    rows = all_rows
     if kind:
         rows = [r for r in rows if r["kind"] == kind]
     if status:
         rows = [r for r in rows if r["status"] == status]
     if not_broadcasting:
         rows = [r for r in rows if r.get("ais_reporting") is False]
+    if overdue:
+        now = datetime.now(UTC)
+        rows = [r for r in rows if is_overdue(r, now)]
     if isolated:
-        alone = set(meshlib.mesh_status(_entities())["isolated"])
+        # ⚠️ THE WORLD IS ALREADY IN HAND. This re-read it, so asking for isolated assets
+        # cost two full round trips to the database for one question. Every connection to
+        # the pooled endpoint is hundreds of milliseconds of pure network, so a second
+        # read is not a tidiness issue: it is the single most expensive thing a filter
+        # here can do.
+        alone = set(meshlib.mesh_status(all_rows)["isolated"])
         rows = [r for r in rows if r["id"] in alone]
+    if bbox:
+        # ⚠️ AN ASSET WITH NO POSITION CANNOT BE ON SCREEN. Route-only entities are
+        # excluded rather than silently kept, because "what is in view" that includes
+        # something with no place is not an answer anyone can check.
+        rows = [
+            r
+            for r in rows
+            if r.get("lat") is not None
+            and r.get("lon") is not None
+            and bbox_contains(bbox, r["lat"], r["lon"])
+        ]
 
     return ToolResult(
         ok=True,
         message=f"{len(rows)} matching",
-        data={"ids": [r["id"] for r in rows], "names": [r["name"] for r in rows]},
-        # A query highlights its answer and does NOT move the camera. Answering "what is
-        # overdue" by flying somewhere is disorienting when the answer is four things in
-        # three places.
+        # 🔑 POSITIONS TRAVEL WITH THE ANSWER so that framing it needs no second read of
+        # the world. The executor used to re-fetch every entity purely to look up where
+        # the results were, which doubled the database cost of the commonest command in
+        # the application to move a camera.
+        data={
+            "ids": [r["id"] for r in rows],
+            "names": [r["name"] for r in rows],
+            "points": [
+                [r["lat"], r["lon"]]
+                for r in rows
+                if r.get("lat") is not None and r.get("lon") is not None
+            ],
+        },
+        # Highlighting is this tool's own effect. The camera is NOT decided here: the
+        # executor frames whatever the plan returned, once, after every plan. An earlier
+        # version of this comment claimed a list query left the camera alone, which stayed
+        # in the file after `executor._frame_results` made it false. Handing an operator a
+        # list of four assets and no idea where they are is the behaviour that changed,
+        # and the comment describing it should have gone with it.
         ui_effects={"highlight": [r["id"] for r in rows]},
     )
 
@@ -257,9 +428,47 @@ def mesh_status() -> ToolResult:
     )
 
 
+def _history_module() -> Any:
+    """The position-history module, or None if this build does not record one.
+
+    ⚠️ IMPORTED INSIDE THE FUNCTION, NOT AT MODULE SCOPE, AND THAT IS THE WHOLE REASON
+    THIS HELPER EXISTS. `api/index.py` imports this file, so an ImportError up top would
+    take down every route in the application, including the ones with nothing to do with
+    history. An optional capability that is not present must degrade to "not available"
+    and cost nothing else.
+    """
+    try:
+        from . import history  # noqa: PLC0415 - deliberately deferred; see the docstring
+
+        return history
+    except Exception:  # noqa: BLE001 - absent, broken or half-written all mean the same here
+        return None
+
+
+def _connection_stats(entity_id: str) -> dict[str, Any]:
+    """How much of the time this asset has actually had a route out.
+
+    A live neighbour count says what is true this second. These say what has been true,
+    which is the difference between "it is connected" and "it is reliable", and the
+    second one is the question worth asking about a node sitting on an island.
+
+    🔒 NEVER RAISES. This decorates an answer that has already been computed; a missing
+    or failing history layer must not turn a working description into an error.
+    """
+    hist = _history_module()
+    fn = getattr(hist, "connection_stats", None) if hist else None
+    if fn is None:
+        return {"available": False, "reason": "connection history is not recorded in this build"}
+    try:
+        stats = fn(entity_id) or {}
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"[:160]}
+    return {"available": True, **stats}
+
+
 @tool(
     "describe_entity",
-    "Everything known about one asset, including its mesh neighbours.",
+    "Everything known about one asset, including its mesh neighbours and how reliably it has been connected.",
     {"target": "asset name or id"},
 )
 def describe_entity(target: str) -> ToolResult:
@@ -271,15 +480,124 @@ def describe_entity(target: str) -> ToolResult:
         for link in st["links"]
         if asset["id"] in (link["a"], link["b"])
     ]
+    # 🔑 A CONTACT SHOULD BE ABLE TO SAY WHY WE THINK IT IS THERE. Without this, a dark
+    # vessel on the map is an assertion with no provenance; with it, the answer is "a
+    # camera on Barrow Strait 04 is holding it at 11 km", which is checkable.
+    detect = _detect_module()
+    held_fn = getattr(detect, "held_by", None) if detect else None
+    holders: list[dict[str, Any]] = []
+    if held_fn:
+        try:
+            holders = held_fn(rows).get(asset["id"], []) or []
+        except Exception:  # noqa: BLE001 - provenance decorates an answer that exists
+            holders = []
+
+    stats = _connection_stats(asset["id"])
+    held = stats.get("avg_gateway_minutes")
+    tail = f", gateway held {held:.0f} min on average" if isinstance(held, (int, float)) else ""
+
     return ToolResult(
         ok=True,
-        message=f'{asset["name"]}: {asset["kind"]}, {asset["status"]}, {len(peers)} mesh neighbours',
-        data={"asset": asset, "peers": peers},
+        message=(
+            f'{asset["name"]}: {asset["kind"]}, {asset["status"]}, '
+            f"{len(peers)} mesh neighbours{tail}"
+        ),
+        data={
+            "asset": asset,
+            "peers": peers,
+            # Named separately from `peers` because the panel wants a number and the map
+            # wants the ids, and making the panel call `.length` on a list it does not
+            # otherwise use is how a display ends up owning a piece of the domain.
+            "connections": len(peers),
+            "connectivity": stats,
+            # Absent-versus-empty matters here too: [] means nothing holds this contact,
+            # which is a finding. A non-contact simply never gets the key.
+            **({"held_by": holders} if holders or asset["kind"] in ("vessel", "aircraft", "ground_party") else {}),
+        },
         ui_effects={"select": asset["id"], "camera": frame_for([(asset["lat"], asset["lon"])])}
         if asset["lat"] is not None
         else {"select": asset["id"]},
         entity_id=asset["id"],
     )
+
+
+# A track has to be drawable. Four days at one sample a minute is 5,760 points for one
+# asset, which is a slow line nobody can read; the series is downsampled to this before it
+# is returned, and the response says how many samples it stands for.
+MAX_TRACK_POINTS = 400
+
+
+@tool(
+    "entity_history",
+    "Where one asset has been over a window of time.",
+    {
+        "target": "asset name or id",
+        "days": "how far back to look, in days. Fractions are fine: 0.5 is the last twelve hours",
+    },
+)
+def entity_history(target: str, days: float = 1.0) -> ToolResult:
+    """One asset's recent positions, as a series.
+
+    ⚠️ WINDOW FIRST, THEN DOWNSAMPLE, AND NOT THE OTHER WAY AROUND. Returning the raw
+    series would put the cost of a four-day question on the wire and then on the renderer,
+    for a line whose shape is identical at four hundred points. The count of what it was
+    drawn from is returned alongside, so the thinning is visible rather than silent.
+    """
+    rows = _entities()
+    asset = _require_one(target, rows)
+
+    hist = _history_module()
+    fn = getattr(hist, "positions", None) if hist else None
+    if fn is None:
+        raise ToolError(
+            f'no position history is recorded for {asset["name"]} in this build. What is '
+            "available: its current position, status, and who it can reach on the mesh"
+        )
+
+    window_days = max(0.0, min(float(days), 30.0))
+    minutes = max(1, int(window_days * 1440))
+    series = fn(asset["id"], minutes=minutes, max_points=MAX_TRACK_POINTS) or []
+
+    points = [
+        (float(p["lat"]), float(p["lon"]))
+        for p in series
+        if p.get("lat") is not None and p.get("lon") is not None
+    ]
+    if not points:
+        return ToolResult(
+            ok=True,
+            message=f'nothing recorded for {asset["name"]} in the last {_window_words(minutes)}',
+            data={"asset_id": asset["id"], "points": [], "window_minutes": minutes},
+            ui_effects={"select": asset["id"]},
+            entity_id=asset["id"],
+        )
+
+    return ToolResult(
+        ok=True,
+        message=(
+            f'{asset["name"]}: {len(points)} positions over the last {_window_words(minutes)}'
+        ),
+        data={"asset_id": asset["id"], "points": series, "window_minutes": minutes},
+        ui_effects={
+            "select": asset["id"],
+            # lon-first, matching GeoJSON and everything else on the wire, so the client
+            # never has to remember which way round this particular payload is.
+            "track": {
+                "id": asset["id"],
+                "coordinates": [[lon, lat] for lat, lon in points],
+            },
+            "camera": frame_for(points),
+        },
+        entity_id=asset["id"],
+    )
+
+
+def _window_words(minutes: int) -> str:
+    if minutes < 90:
+        return f"{minutes} minutes"
+    if minutes < 2880:
+        return f"{minutes / 60:.0f} hours"
+    return f"{minutes / 1440:.0f} days"
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +641,46 @@ def frame_entities(targets: list[str] | None = None, kind: str | None = None) ->
     )
 
 
+# The environmental layers this build actually has. Sea ice is measured satellite data,
+# vendored per date; there is no weather feed, and saying so is better than implying one.
+OVERLAYS: dict[str, str] = {
+    "ice": "measured sea ice concentration",
+}
+
+
+@tool(
+    "show_overlay",
+    "Turn on an environmental overlay, such as measured sea ice, over the current view.",
+    {"layer": "ice"},
+)
+def show_overlay(layer: str = "ice") -> ToolResult:
+    """Answer "show me the overlays" without inventing a feed this build does not have.
+
+    🔒 NOTHING HERE READS THE ICE DATA, and that is deliberate rather than incidental. The
+    ice layer is measured satellite concentration rendered by the client; the server has
+    no business re-deriving it, and a second copy of that answer would be a second thing
+    to keep true. This tool does one honest thing: it asks the display to show a layer it
+    already has.
+
+    ⚠️ IT DOES NOT PRETEND TO BE WEATHER. A request for weather gets sea ice plus a plain
+    statement of what that is, because the alternative is a command that appears to
+    succeed while showing something else entirely.
+    """
+    key = (layer or "ice").strip().lower()
+    if key not in OVERLAYS:
+        raise ToolError(
+            f'there is no "{key}" overlay in this build. What exists: '
+            + ", ".join(f"{n} ({d})" for n, d in OVERLAYS.items())
+            + ". Nothing here fetches live weather at runtime, deliberately"
+        )
+    return ToolResult(
+        ok=True,
+        message=f"showing {OVERLAYS[key]}",
+        data={"layer": key},
+        ui_effects={"overlay": {"layer": key, "visible": True}},
+    )
+
+
 @tool("reset_view", "Return the camera to the default view of the whole Arctic.", {})
 def reset_view() -> ToolResult:
     return ToolResult(
@@ -345,13 +703,18 @@ def reset_view() -> ToolResult:
         "lat": "latitude in degrees",
         "lon": "longitude in degrees",
         "name": "optional display name",
+        "hostile": "true to place it as an adversary rather than one of ours",
     },
     writes=True,
 )
-def place_asset(kind: str, lat: float, lon: float, name: str | None = None) -> ToolResult:
-    placeable = {"node", "hydrophone", "marker", "launch_site"}
-    if kind not in placeable:
-        raise ToolError(f'cannot place a {kind}; placeable kinds are {", ".join(sorted(placeable))}')
+def place_asset(
+    kind: str, lat: float, lon: float, name: str | None = None, hostile: bool | None = None
+) -> ToolResult:
+    if kind not in PLACEABLE_KINDS:
+        raise ToolError(
+            f'"{kind}" is not an asset kind. Placeable kinds are '
+            f'{", ".join(sorted(PLACEABLE_KINDS))}'
+        )
 
     # 🥇 THE CHECK THAT MAKES THIS MORE THAN A FORM. A well-formed, correctly typed
     # request naming a real kind at valid coordinates can still be physically impossible,
@@ -375,8 +738,27 @@ def place_asset(kind: str, lat: float, lon: float, name: str | None = None) -> T
             "lon": lon,
             "alt_m": 0.0,
             "status": "nominal",
+            # ⚠️ NO ROUTE, AND THAT IS WHAT KEEPS IT WHERE IT WAS PUT. Every placeable
+            # kind is a fixed installation: a node on a guyed mast, a hydrophone moored to
+            # the bottom, a launch site. They have nowhere to move along and no reason to,
+            # so an operator dropping one where the real thing stands finds it there
+            # afterwards without anything having to defend it.
             "geometry": None,
-            "props": {"placed_by": "operator"},
+            # 🔴 DELIBERATELY NOT FROZEN, and this is the whole point of placing a vessel
+            # or a patrol rather than only a mast. A placed asset of a moving kind should
+            # start moving; freezing it would leave a ship sitting on the water forever,
+            # which is a stranger sight than any drift. Stationary kinds need no flag to
+            # stay put: a node has no route and nothing will carry it anywhere.
+            #
+            # ⚠️ `task_uas` STILL WRITES `motion_frozen`, and the difference is intent. A
+            # placed asset was put somewhere to exist; a tasked drone was sent somewhere
+            # specific, and wandering off station is not what was asked for.
+            # 🔑 AN ADVERSARY IS A FLAG, NOT A KIND. A hostile vessel is still a vessel:
+            # it floats, it drifts, it is held or missed by the same sensors on the same
+            # ranges. Making it its own kind would have meant teaching terrain, motion,
+            # detection and the mesh about a thing that behaves identically to one they
+            # already know, and every one of those would have needed the same entry.
+            "props": {"placed_by": "operator", **({"hostile": True} if hostile else {})},
             "last_heard": None,
             "ais_reporting": None,
             "created_by": "user",
@@ -419,7 +801,7 @@ def task_uas(target: str, lat: float, lon: float, altitude_m: float = 3200.0) ->
     asset = _require_one(target, rows)
     if asset["kind"] != "uas":
         raise ToolError(f'{asset["name"]} is a {asset["kind"]}, not a drone')
-    if asset["status"] == "degraded":
+    if asset["status"] == "maintenance":
         raise ToolError(f'{asset["name"]} is in maintenance and cannot be tasked')
 
     props = asset.get("props") or {}
@@ -446,12 +828,28 @@ def task_uas(target: str, lat: float, lon: float, altitude_m: float = 3200.0) ->
             "status": "nominal",
             "props": {
                 **props,
+                # 🔑 `state` AND `station` SAY MORE THAN A STOP FLAG EVER COULD: they name
+                # the point the drone was sent to, so whatever simulates motion can hold it
+                # there, orbit it, or fly it home. `motion_frozen` is written alongside them
+                # only because the motion layer reads it today, and it is redundant with
+                # these two. Removing it while it has a reader would turn a working guard
+                # into a dead one, so it goes when the reader has moved.
+                "motion_frozen": True,
                 "state": "on_station",
                 "station": [lat, lon],
                 "eta_min": round(eta_min, 1),
                 "endurance_min_remaining": round(endurance - eta_min, 1),
             },
-            "last_heard": None,
+            # 🔴 CARRIED THROUGH, NOT CLEARED. This wrote None, so tasking a drone erased
+            # its heartbeat and quietly removed it from overdue accounting for good: the
+            # one action an operator takes on a drone was the action that stopped the
+            # system noticing when that drone went quiet.
+            #
+            # Nor is it refreshed to now. `last_heard` records when the ASSET last
+            # reported its own state, and an operator sending it somewhere is not the
+            # asset saying anything. Writing now here would mean a drone could be tasked
+            # into looking healthy, which is the failure this column exists to catch.
+            "last_heard": _as_datetime(asset.get("last_heard")),
             "created_by": asset["created_by"],
         }
     )
@@ -464,6 +862,241 @@ def task_uas(target: str, lat: float, lon: float, altitude_m: float = 3200.0) ->
         data={"eta_min": round(eta_min, 1), "distance_km": round(distance, 1)},
         ui_effects={"select": asset["id"], "refetch": True, "camera": frame_for([(lat, lon)])},
         entity_id=asset["id"],
+    )
+
+
+def _detect_module() -> Any:
+    """The detection layer, or None if this build does not carry one.
+
+    Deferred for the same reason the history import is: this file is imported by the
+    application entry point, so an absent optional capability must cost a command rather
+    than every route.
+    """
+    try:
+        from . import detect  # noqa: PLC0415 - deliberately deferred
+
+        return detect
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@tool(
+    "coverage",
+    "What the sensor network can and cannot currently see, including contacts nothing is holding.",
+    {},
+)
+def coverage() -> ToolResult:
+    """Answer "what are we not seeing", which is the question this network exists for.
+
+    🥇 THE INTERESTING BUCKET IS `detected_not_reported`: something IS holding the contact
+    and the report cannot get home, because the route back to a gateway is down. The ocean
+    is not empty, we simply cannot hear the thing that can see it. An operator told
+    "nothing out there" in that situation has been misinformed by their own display, and
+    the fix is a command away rather than a mystery.
+
+    ⚠️ IT REPORTS A GAP RATHER THAN A REASSURANCE. "Four contacts tracked" is comfortable
+    and useless on its own; the number that matters is the one nobody is holding.
+    """
+    detect = _detect_module()
+    summary = getattr(detect, "coverage_summary", None) if detect else None
+    if summary is None:
+        raise ToolError(
+            "this build does not compute sensor coverage. What is available: asset status, "
+            "mesh connectivity, and which contacts are not broadcasting"
+        )
+
+    out = summary(_entities())
+    counts = out.get("counts", {})
+
+    # 🔑 THE ID LISTS ARE ALREADY IN THE ANSWER, so this names the contacts rather than
+    # recomputing them. A count nobody can act on is a worse answer than a short list
+    # somebody can go and look at, and the two cannot disagree if only one of them exists.
+    missing = list(out.get("detected_not_reported", [])) + list(out.get("untracked", []))
+
+    parts = [f'{counts.get("self_reporting", 0)} reporting their own position']
+    if counts.get("tracked"):
+        parts.append(f'{counts["tracked"]} held by a sensor')
+    if counts.get("detected_not_reported"):
+        parts.append(
+            f'{counts["detected_not_reported"]} seen by a sensor that cannot report it'
+        )
+    if counts.get("untracked"):
+        parts.append(f'{counts["untracked"]} held by nothing at all')
+    if not missing:
+        parts.append("nothing is unaccounted for")
+
+    return ToolResult(
+        ok=True,
+        message="; ".join(parts),
+        data={**out, "not_on_the_picture": missing},
+        ui_effects={"highlight": missing},
+    )
+
+
+@tool(
+    "remove_asset",
+    "Remove an asset from the world. Works on anything, seeded or placed by an operator.",
+    {"target": "asset name or id"},
+    writes=True,
+)
+def remove_asset(target: str) -> ToolResult:
+    """Take one asset off the map.
+
+    🔑 THE COUNTERPART TO PLACING, AND THE MAP IS ONLY EDITABLE IF BOTH EXIST. An operator
+    who can add but not remove has a world that only ever grows, so a mistake is permanent
+    and the display drifts further from what they meant with every correction.
+
+    ⚠️ IT DOES NOT REFUSE TO REMOVE SEEDED ASSETS. The seed is a starting position rather
+    than a protected fixture, and a console that lets you delete your own additions while
+    guarding the scenery would be enforcing an authorship rule nobody asked for. The idle
+    reset restores the world, so nothing here is unrecoverable.
+    """
+    rows = _entities()
+    asset = _require_one(target, rows)
+
+    removed = db.delete_entity(asset["id"])
+    if not removed:
+        raise ToolError(f'{asset["name"]} was already gone by the time the removal ran')
+
+    return ToolResult(
+        ok=True,
+        message=f'removed {asset["name"]} ({asset["id"]})',
+        data={"id": asset["id"], "kind": asset["kind"]},
+        # The selection has to be cleared: leaving a detail panel open on a row that no
+        # longer exists is how a UI ends up showing a ghost.
+        ui_effects={"refetch": True, "select": None, "highlight": []},
+        entity_id=asset["id"],
+    )
+
+
+# What an operator can break, and every one of these drives a state the display already
+# renders. That is deliberate: a fault nobody can see on the map teaches nothing, and a
+# fault that needs new rendering is a fault that will not be ready in time.
+FAULTS: dict[str, str] = {
+    "silent": "stops reporting, so it ages into overdue and greys out",
+    "maintenance": "goes unserviceable, so it cannot be tasked",
+}
+
+# How far back a silenced asset's last report is pushed. Beyond every kind's interval, so
+# the fault takes hold immediately rather than at some later moment the operator has to
+# wait out. A demo that needs a four-hour wait to show a failure is not a demo.
+SILENCE_BACKDATE_MINUTES = 6 * 60
+
+
+@tool(
+    "inject_fault",
+    "Break something on purpose: make an asset go silent, or take it out of service.",
+    {
+        "target": "asset name or id",
+        "fault": "silent, or maintenance",
+    },
+    writes=True,
+)
+def inject_fault(target: str, fault: str = "silent") -> ToolResult:
+    """Introduce a failure so the operator can watch the picture respond.
+
+    🔑 FAULTS ARE EXPRESSED IN THE FIELDS THE DISPLAY ALREADY WATCHES, not in a parallel
+    fault model. Going quiet is `last_heard` moving into the past; going unserviceable is
+    `status`. Both already colour the map, both already drive a question the command layer
+    answers, and neither needs a line of new rendering. A separate `faults` table would
+    have been a second source of truth about the same two facts.
+
+    ⚠️ THE INTERESTING PART IS WHAT FOLLOWS, WHICH IS WHY THIS IS WORTH HAVING. Silencing
+    one node is not one grey icon: if that node carries the cluster's backhaul, everything
+    behind it loses its route to the display, and a contact a working camera can still see
+    stops arriving because nothing can carry it home. That is a failure propagating through
+    a real dependency rather than a flag being toggled.
+    """
+    key = (fault or "silent").strip().lower()
+    if key not in FAULTS:
+        raise ToolError(
+            f'"{fault}" is not a fault I can inject. Available: '
+            + "; ".join(f"{n} ({d})" for n, d in FAULTS.items())
+        )
+
+    rows = _entities()
+    asset = _require_one(target, rows)
+    props = dict(asset.get("props") or {})
+    updated = {**asset, "props": props}
+
+    if key == "silent":
+        updated["last_heard"] = datetime.now(UTC) - timedelta(
+            minutes=SILENCE_BACKDATE_MINUTES
+        )
+    else:
+        updated["status"] = "maintenance"
+
+    props["fault"] = key
+    _write_back(updated)
+
+    return ToolResult(
+        ok=True,
+        message=f'{asset["name"]} is now {key}: it {FAULTS[key]}',
+        data={"id": asset["id"], "fault": key},
+        ui_effects={"refetch": True, "select": asset["id"]},
+        entity_id=asset["id"],
+    )
+
+
+@tool(
+    "clear_fault",
+    "Repair an asset: bring it back into service and mark it as reporting again.",
+    {"target": "asset name or id"},
+    writes=True,
+)
+def clear_fault(target: str) -> ToolResult:
+    """Undo a fault, so the operator can watch the picture heal.
+
+    Restoring is as much of the demonstration as breaking. A fault that cannot be cleared
+    turns every experiment into a reseed, and nobody explores a world they can only damage.
+    """
+    rows = _entities()
+    asset = _require_one(target, rows)
+    props = dict(asset.get("props") or {})
+    props.pop("fault", None)
+
+    _write_back(
+        {
+            **asset,
+            "props": props,
+            "status": "nominal",
+            "last_heard": datetime.now(UTC),
+        }
+    )
+
+    return ToolResult(
+        ok=True,
+        message=f'{asset["name"]} is back in service and reporting',
+        data={"id": asset["id"]},
+        ui_effects={"refetch": True, "select": asset["id"]},
+        entity_id=asset["id"],
+    )
+
+
+def _write_back(row: dict[str, Any]) -> None:
+    """Persist a row that came out of a read, without persisting anything derived.
+
+    🔴 THE READ PATH DECORATES ROWS AND `insert_entity` REPLACES THEM WHOLE. Freshness adds
+    `overdue` and `flag`, connectivity adds its own pair, and the motion layer moves
+    positions, none of which are columns. Handing the whole row back would try to write
+    keys the insert does not know, and would persist simulated values as though an operator
+    had set them. So exactly the stored columns are sent, and nothing else.
+    """
+    db.insert_entity(
+        {
+            "id": row["id"],
+            "kind": row["kind"],
+            "name": row["name"],
+            "lat": row["lat"],
+            "lon": row["lon"],
+            "alt_m": row.get("alt_m"),
+            "status": row["status"],
+            "geometry": row.get("geometry"),
+            "props": row.get("props") or {},
+            "last_heard": _as_datetime(row.get("last_heard")),
+            "ais_reporting": row.get("ais_reporting"),
+            "created_by": row.get("created_by", "user"),
+        }
     )
 
 

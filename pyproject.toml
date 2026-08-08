@@ -23,9 +23,51 @@ dependencies = [
 # skyfield was the independent implementation the hand-written orbital transforms were
 # checked against. Both it and sgp4 went when the satellite layer did; nothing imports
 # either now, and a dependency nobody imports is one more thing to install and audit.
-dev = ["pytest", "uvicorn[standard]", "httpx"]
+dev = ["pytest", "uvicorn[standard]", "httpx", "ruff", "mypy"]
 
 # Vercel's current Python runtime wants ONE ASGI entrypoint rather than a handler
 # per file under api/. See the note in api/index.py.
 [tool.vercel]
 entrypoint = "api.index:app"
+
+# ⚠️ ADDED BY LANE C 2026-08-07 and announced in the mailbox. `pyproject.toml` belongs to no
+# lane, so this note is here rather than only in a message.
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# 🔑 A DELIBERATELY SHORT LIST, NOT "ALL". Every rule here catches something that is a real
+# defect rather than a matter of taste:
+#   E,W  pycodestyle          F   pyflakes: undefined names, unused imports
+#   I    import order         B   bugbear: mutable defaults, loop-variable capture
+#   UP   outdated syntax      C4  needless comprehensions
+# Turning on the full set produces hundreds of findings about docstring punctuation and
+# teaches everyone to run with --no-verify, which costs more than it buys.
+select = ["E", "W", "F", "I", "B", "UP", "C4"]
+
+# The codebase argues its reasoning in prose and some of those lines run long. Wrapping a
+# sentence to satisfy a linter makes it harder to read, which is the opposite of the point.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts read their own directory before importing the package, so imports cannot be at the
+# top of the file. That is deliberate and the `noqa: E402` markers already say so.
+"scripts/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["api", "scripts"]
+# 🔑 NOT `strict`. The point is to check the annotations that are already written, not to
+# require annotations everywhere: this codebase is heavily typed and NOTHING has ever
+# verified any of it, so the first win is simply making the existing types load-bearing.
+# Tightening comes after that is green, not instead of it.
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+# Third-party packages that ship no type information. Their absence is not a finding about
+# this code, and without this every import of them is reported as an error.
+module = ["psycopg.*", "anthropic.*", "google.*", "dotenv.*"]
+ignore_missing_imports = true

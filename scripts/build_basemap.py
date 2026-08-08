@@ -88,7 +88,7 @@ def ring_area_km2(ring: list[list[float]]) -> float:
     lat0 = sum(p[1] for p in ring) / len(ring)
     k = math.cos(math.radians(lat0))
     total = 0.0
-    for (x1, y1), (x2, y2) in zip(ring, ring[1:] + ring[:1]):
+    for (x1, y1), (x2, y2) in zip(ring, ring[1:] + ring[:1], strict=True):
         total += (x1 * k) * y2 - (x2 * k) * y1
     return abs(total) / 2.0 * (111.32**2)
 
@@ -126,7 +126,7 @@ def simplify(ring: list[list[float]], tol: float) -> list[list[float]]:
             keep[worst_i] = True
             stack.append((lo, worst_i))
             stack.append((worst_i, hi))
-    out = [p for p, k in zip(ring, keep) if k]
+    out = [p for p, k in zip(ring, keep, strict=True) if k]
     return out if len(out) >= 4 else ring
 
 

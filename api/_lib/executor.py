@@ -14,17 +14,30 @@ three after step two was rejected leaves a state nobody asked for and nobody can
 from the log. Partial execution of a plan is worse than no execution, because the
 operator now has to work out what happened rather than reading one refusal.
 
-The cost is real and is stated in the README's tradeoffs: one bad parameter loses the
-whole utterance, and the user retypes.
+The cost is real: one bad parameter loses the whole utterance, and the user retypes.
+
+⚠️ EXECUTION IS FAIL-FAST, NOT TRANSACTIONAL, AND THE DIFFERENCE IS WORTH SAYING OUT
+LOUD. Once a plan validates, its steps run in order and the first refusal stops the rest.
+Steps that already ran have already committed (`db.insert_entity` commits per call), so
+there is no rollback and this layer does not pretend to offer one. Atomicity is a
+property of the CHECK, not of the WRITE.
+
+Making it transactional would mean one connection held open across every step of a plan,
+with every tool taking a cursor it does not otherwise need, to buy something the shape of
+the plans does not really call for: the writing tools are `place_asset` and `task_uas`,
+and no plan the parser or the model produces contains two of them. That is a reason to
+leave it, not a reason to claim it was never a gap.
 """
 from __future__ import annotations
 
+import copy
+import inspect
 import time
 import uuid
 from typing import Any
 
 from . import db
-from .tools import REGISTRY, ToolError, ToolResult
+from .tools import REGISTRY, Ambiguous, ToolError, ToolResult
 
 # A plan longer than this is not a plan, it is a loop, and the model does not get one.
 MAX_STEPS = 8
@@ -76,6 +89,16 @@ def validate(plan: list[dict[str, Any]]) -> list[str]:
         if unknown:
             reasons.append(f'step {i} ({name}): unknown parameters {", ".join(sorted(unknown))}')
 
+        # ⚠️ MISSING IS AS INVALID AS WRONG, and this used to check only the second one.
+        # `place_asset` with no `lat` passed validation cleanly and then died inside the
+        # call as a TypeError, which the executor logged as `error`, the category
+        # reserved for "this code has a bug", not for "you did not say where". A
+        # malformed request has to be refused by the validator, or the audit log stops
+        # being able to tell a bad request from a broken tool.
+        missing = sorted(set(_required(spec.fn)) - set(params))
+        if missing:
+            reasons.append(f'step {i} ({name}): missing required parameters {", ".join(missing)}')
+
         # Numeric sanity, clamped here rather than trusted. A hallucinated latitude is
         # the single most likely bad value in a geographic tool call.
         for key in ("lat", "latitude"):
@@ -97,6 +120,92 @@ def _in_range(value: Any, lo: float, hi: float) -> bool:
         return False
 
 
+def _required(fn: Any) -> list[str]:
+    """The parameters a tool cannot run without, read off the function itself.
+
+    🔑 DERIVED, NOT DECLARED. The registry's `params` dict is a description of each
+    parameter for the model's prompt, and adding a "required" flag to it would create a
+    second statement of something the signature already says perfectly. A default means
+    optional; no default means required. The two can then never disagree, because there
+    is only one of them.
+    """
+    return [
+        name
+        for name, p in inspect.signature(fn).parameters.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    ]
+
+
+# What the parser writes when the operator said "this" or "the current zoom window"
+# instead of naming something. The plan stays a plain data structure that means nothing
+# until it meets the context, which is what lets the parser stay free of live state.
+VIEWPORT = "__viewport__"
+SELECTION = "__selected__"
+
+# The words people actually use for the thing they are looking at. Deixis is not a corner
+# case in a map application: "this", "it", "that one" are how anyone refers to the asset
+# they just clicked, and a system that cannot resolve them forces the operator to type a
+# name they can already see on screen.
+DEICTIC = {
+    "this",
+    "this one",
+    "this asset",
+    "this entity",
+    "it",
+    "that",
+    "that one",
+    "the selected asset",
+    "the selection",
+    "selected",
+}
+
+
+def resolve_context(
+    plan: list[dict[str, Any]], context: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Turn "this" and "the current window" into an id and a box, or say why it cannot.
+
+    🔑 THIS IS WHERE A COMMAND MEETS THE SCREEN. The parser and the model both work from
+    words alone and have no idea what is selected or visible, which is what keeps them
+    testable without a browser. The plans they emit carry a placeholder, and this is the
+    one place that placeholder becomes live state.
+
+    ⚠️ AN UNRESOLVABLE PLACEHOLDER IS A REFUSAL WITH A REASON, NEVER A SILENT DROP. Asking
+    for "this asset" with nothing selected is a real mistake an operator makes, and the
+    useful answer names it: select something first. Dropping the parameter instead would
+    quietly widen the request to every asset in the world, which is the most expensive
+    possible way to be wrong about what someone asked for.
+    """
+    context = context or {}
+    resolved: list[dict[str, Any]] = []
+
+    for step in plan:
+        params = dict(step.get("params", {}))
+        for key, value in list(params.items()):
+            if value == VIEWPORT:
+                bbox = context.get("bbox")
+                if not bbox:
+                    raise PlanRejected(
+                        ["I cannot tell what is on screen right now, so 'the current "
+                         "window' has nothing to mean. Try naming a kind instead"]
+                    )
+                params[key] = bbox
+            elif value == SELECTION or (
+                isinstance(value, str) and value.strip().lower() in DEICTIC
+            ):
+                selected = context.get("selected_id")
+                if not selected:
+                    raise PlanRejected(
+                        ["nothing is selected, so I do not know which asset 'this' means. "
+                         "Select one on the map, or name it"]
+                    )
+                params[key] = selected
+        resolved.append({**step, "params": params})
+
+    return resolved
+
+
 def execute(
     plan: list[dict[str, Any]],
     *,
@@ -104,6 +213,7 @@ def execute(
     tier: str | None,
     utterance: str | None = None,
     parent_command_id: str | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate, then run every step under one command id.
 
@@ -112,6 +222,19 @@ def execute(
     for. It lands as `result='rejected'` with the reasons in `detail`.
     """
     command_id = str(uuid.uuid4())
+
+    # Deixis is resolved BEFORE validation, so what gets validated, logged and run is what
+    # the words actually meant. Validating the placeholder would check a string nobody
+    # intended to pass, and the audit row would record it.
+    try:
+        plan = resolve_context(plan, context)
+    except PlanRejected as exc:
+        db.log_event(
+            tool="plan", source=source, tier=tier, result="rejected",
+            command_id=command_id, parent_command_id=parent_command_id,
+            params={"plan": plan, "utterance": utterance}, detail="; ".join(exc.reasons),
+        )
+        raise
 
     reasons = validate(plan)
     if reasons:
@@ -127,10 +250,37 @@ def execute(
         )
         raise PlanRejected(reasons)
 
+    # 🔴 THE DECISION IS A ROW, NOT JUST ITS CONSEQUENCES, and this was the hole in the
+    # chain. A plan that FAILED validation logged the utterance; a plan that passed logged
+    # only its steps, and a step row carries the tool's parameters rather than the
+    # sentence. So the audit log could tell you that `list_entities(kind='uas')` ran and
+    # could not tell you that someone said "where are my drones" to cause it. The one
+    # question an interface like this has to be able to answer afterwards is what a person
+    # asked for and what the system decided that meant, and half of it was unrecoverable
+    # on exactly the commands that worked.
+    #
+    # It lands BEFORE the steps so the row order is the reasoning order: the model's
+    # selection if there was one, then the plan, then what the plan did. Reading a
+    # command_id top to bottom now reads as a chain.
+    #
+    # ⚠️ The cost is one more connection per command, because `db.log_event` opens its
+    # own. That is a pre-existing property of the logging layer rather than something this
+    # row introduces, and a batched writer is the fix if it ever matters.
+    db.log_event(
+        tool="plan",
+        source=source,
+        tier=tier,
+        result="ok",
+        command_id=command_id,
+        parent_command_id=parent_command_id,
+        params={"plan": plan, "utterance": utterance},
+        detail=f'accepted {len(plan)} step(s): {", ".join(s["tool"] for s in plan)}',
+    )
+
     results: list[dict[str, Any]] = []
     merged_effects: dict[str, Any] = {}
 
-    for step in plan:
+    for index, step in enumerate(plan):
         name = step["tool"]
         params = step.get("params", {})
         spec = REGISTRY[name]
@@ -153,6 +303,36 @@ def execute(
             )
             results.append({"tool": name, "ok": True, "message": result.message, "data": result.data})
             merged_effects.update(result.ui_effects)
+
+        except Ambiguous as exc:
+            # 🔑 THE ONE REFUSAL THAT IS A QUESTION. Everything else the executor
+            # declines is final: the operator has to type something different. This one
+            # is not, because the system already knows every answer that would work, and
+            # a refusal that withholds the list it just computed is a worse interface
+            # than one that had never resolved the name at all.
+            #
+            # Caught above ToolError because it IS one. The ordering is what lets every
+            # other catch site keep treating it as an ordinary refusal.
+            elapsed = int((time.perf_counter() - started) * 1000)
+            db.log_event(
+                tool=name,
+                source=source,
+                tier=tier,
+                # 🔑 ITS OWN OUTCOME. "I understood you and need one more word" is not a
+                # refusal, and recording it as one would make the two most useful
+                # questions about this log unanswerable: how often does the system have
+                # to ask, and how often does it have to say no. The candidates go in
+                # `params`, so the row records what was offered as well as that it asked.
+                result="clarify",
+                command_id=command_id,
+                parent_command_id=parent_command_id,
+                params={**params, "clarify_candidates": [c["id"] for c in exc.candidates]},
+                detail=str(exc),
+                latency_ms=elapsed,
+            )
+            results.append({"tool": name, "ok": False, "message": str(exc)})
+            merged_effects["clarify"] = _clarify(exc, command_id, plan, index)
+            break
 
         except ToolError as exc:
             # The system working correctly and declining. Logged as a refusal, not an
@@ -215,7 +395,91 @@ def execute(
         # model. A model-written summary is a claim about the world; this is a report of
         # it, and the two diverge exactly when it matters most.
         "summary": _summarise(results),
+        # 🔑 THE RESOLVED PLAN, NOT THE ONE THAT ARRIVED. "this asset" became an id and
+        # "the current window" became a box before anything ran, so reporting the
+        # placeholder would show the caller a plan that never executed while the audit log
+        # holds the one that did. Two accounts of the same command is the thing this
+        # layer exists to prevent.
+        "plan": plan,
     }
+
+
+def _clarify(
+    exc: Ambiguous, command_id: str, plan: list[dict[str, Any]], index: int
+) -> dict[str, Any]:
+    """Turn "which one?" into something a client can actually offer.
+
+    🔑 EVERY OPTION CARRIES A READY-TO-RUN PLAN, which is what keeps this from needing a
+    second endpoint, a second validator or a server-side memory of half-finished
+    commands. The client posts the option's `plan` straight back to /api/command with
+    `parent_command_id` set to the `command_id` here, and it arrives as an ordinary
+    button-shaped request: same validator, same executor, same audit rows. A clarify
+    session held on the server would be state to expire, and on a serverless platform it
+    would be state that does not survive the next invocation.
+
+    ⚠️ THE PLAN STARTS AT THE AMBIGUOUS STEP, NOT AT THE BEGINNING. Anything before it
+    already ran and already committed, so replaying the whole plan would place a second
+    asset or fly a drone twice. The prior steps are logged under the parent command; the
+    answer only owes the part that did not happen.
+    """
+    return {
+        "command_id": command_id,
+        "query": exc.query,
+        "question": f'Which "{exc.query}" did you mean?',
+        "total": exc.total,
+        "options": [
+            {
+                "id": c["id"],
+                "label": c["name"],
+                "detail": f'{c["kind"]}, {c["status"]}',
+                "plan": _resubmit(plan, index, exc.query, c["id"]),
+            }
+            for c in exc.candidates
+        ],
+    }
+
+
+def _resubmit(
+    plan: list[dict[str, Any]], index: int, query: str, chosen_id: str
+) -> list[dict[str, Any]] | None:
+    """The same request with the vague word replaced by one id.
+
+    Substitution is by value rather than by parameter name: the ambiguous phrase is
+    whatever the operator typed, and it arrives in `target` for most tools and inside
+    `targets` for `frame_entities`. Matching on the value finds it in both without this
+    function needing a table of which parameter each tool resolves.
+
+    🔒 RETURNS None RATHER THAN A PLAN THAT WOULD ASK THE SAME QUESTION AGAIN. If nothing
+    could be substituted, offering the option anyway would give the operator a button
+    that loops. The client should render those as plain text.
+    """
+    steps = copy.deepcopy(plan[index:])
+    params = steps[0].setdefault("params", {})
+    needle = query.strip().lower()
+    swapped = False
+
+    for key, value in list(params.items()):
+        if isinstance(value, str) and value.strip().lower() == needle:
+            params[key] = chosen_id
+            swapped = True
+        elif isinstance(value, list):
+            replaced = [
+                chosen_id if isinstance(v, str) and v.strip().lower() == needle else v
+                for v in value
+            ]
+            if replaced != value:
+                params[key] = replaced
+                swapped = True
+
+    if not swapped:
+        # The phrase was rewritten somewhere between the plan and the resolver. Falling
+        # back to the tool's own target parameter is still an unambiguous request.
+        spec = REGISTRY.get(steps[0].get("tool", ""))
+        if spec is None or "target" not in spec.params:
+            return None
+        params["target"] = chosen_id
+
+    return steps
 
 
 def _summarise(results: list[dict[str, Any]]) -> str:
@@ -243,11 +507,24 @@ def _frame_results(results: list[dict[str, Any]]) -> dict[str, Any] | None:
     a framing failure must not turn a completed command into an error. Worst case it
     returns None and the camera stays where the operator left it.
     """
+    # 🔴 POSITIONS COME FROM THE RESULTS, NOT FROM A SECOND READ OF THE WORLD. This used
+    # to re-fetch every entity purely to look up where the answer was, which meant the
+    # commonest command in the application paid for two full trips to the database: one to
+    # find the assets and one to find out where they are. Measured, a connection to the
+    # pooled endpoint is hundreds of milliseconds of pure network, and a simple listing
+    # command was opening four of them.
+    #
+    # Tools that return a set of entities now carry their positions, so framing is
+    # arithmetic on data already in hand.
+    points: list[tuple[float, float]] = []
     ids: list[str] = []
     for r in results:
         if not r.get("ok"):
             continue
         data = r.get("data") or {}
+        for point in data.get("points") or []:
+            if isinstance(point, (list, tuple)) and len(point) == 2:
+                points.append((float(point[0]), float(point[1])))
         found = data.get("ids")
         if isinstance(found, list):
             ids.extend(str(i) for i in found)
@@ -256,19 +533,24 @@ def _frame_results(results: list[dict[str, Any]]) -> dict[str, Any] | None:
         elif isinstance(data.get("asset"), dict) and data["asset"].get("id"):
             ids.append(str(data["asset"]["id"]))
 
-    if not ids:
+    if not points and not ids:
         return None
 
     try:
-        from . import db as _db
         from .tools import frame_for
 
-        by_id = {row["id"]: row for row in _db.fetch_entities()}
-        points = [
-            (by_id[i]["lat"], by_id[i]["lon"])
-            for i in dict.fromkeys(ids)  # dedupe, order preserved
-            if i in by_id and by_id[i].get("lat") is not None
-        ]
+        # ⚠️ THE FALLBACK STILL EXISTS, and it still costs a read. A tool that reports ids
+        # without positions (a single placed asset, a described entity) is framed the old
+        # way rather than not at all. The point is that the common path no longer pays it.
+        if not points:
+            from . import db as _db
+
+            by_id = {row["id"]: row for row in _db.fetch_entities()}
+            points = [
+                (by_id[i]["lat"], by_id[i]["lon"])
+                for i in dict.fromkeys(ids)
+                if i in by_id and by_id[i].get("lat") is not None
+            ]
         if not points:
             return None
         camera = frame_for(points)

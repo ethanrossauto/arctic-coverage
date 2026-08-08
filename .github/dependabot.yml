@@ -1,0 +1,41 @@
+# ⚠️ MONTHLY, NOT WEEKLY, AND THAT IS THE WHOLE DESIGN DECISION HERE.
+#
+# Dependabot's default cadence on a small project produces a steady trickle of pull requests
+# nobody reviews, and an unreviewed PR queue is worse than no scanning: it looks like the
+# repository is maintained while actually training whoever owns it to ignore the one alert
+# that matters.
+#
+# Monthly grouped updates give a single PR to read. Security advisories are NOT subject to
+# this schedule; GitHub raises those as soon as they are published, which is the behaviour
+# actually worth having.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      # One PR for everything routine. The point is a thing a person will actually open.
+      all:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # A major version of MapLibre or React is a piece of work, not a merge, so it gets
+    # raised on its own rather than buried in a group of fifteen.
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      all:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 3
+
+  # The workflow's own actions pin to major versions and drift silently otherwise, which is
+  # how a build starts failing on a runner change with no commit behind it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -54,7 +54,15 @@ export const KIND_COLOR: Record<string, string> = {
   // A contact holding no AIS broadcast is the only red on the display. It gets its
   // own image rather than a tint, because it also gets its own silhouette.
   vessel_dark: "#ff5c5c",
+  // Air and land contacts. The same neutral the broadcasting vessel uses, because they
+  // are the same category: something we are holding, whose identity is not the point of
+  // the colour. If either should get the red not-broadcasting treatment a vessel gets,
+  // that is a decision about the data, not about this table.
+  aircraft: "#d8dee9",
+  ground_party: "#d8dee9",
   marker: "#c9d4e0",
+  /** The backhaul badge. Its own colour: being the way out is not a condition. */
+  gateway_badge: "#7fe3c0",
 };
 
 /** Dark backing so an icon punches out over land as well as over water. */
@@ -79,11 +87,37 @@ const SHAPES: Record<string, (c: string) => string> = {
    * convention is most recognisable for.
    */
   patrol: (c) => `
-    <rect x="5.5" y="10" width="21" height="12" rx="2.5"
-          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
-    <path d="M6.5 11 L25.5 21 M6.5 21 L25.5 11" stroke="${c}" stroke-width="1.6"/>`,
+    <path d="M6 4 H26 V17.5 C26 23.5 21.5 27.8 16 29.6 C10.5 27.8 6 23.5 6 17.5 Z"
+          fill="${BACKING}" stroke="${c}" stroke-width="1.8" stroke-linejoin="round"/>
+    <g transform="translate(7.9,7.4) scale(0.162)">
+      <path d="M50.0 -2.0 L60.2 21.2 L82.0 15.2 L74.7 36.0 L94.6 50.3 L71.6 58.5 L69.0 76.9 L53.5 72.0 L53.5 97.0 L46.5 97.0 L46.5 72.0 L31.0 76.9 L28.4 58.5 L5.4 50.3 L25.3 36.0 L18.0 15.2 L39.8 21.2 Z"
+            fill="${c}"/>
+    </g>`,
 
-  /** UAS: swept planform, nose UP so `icon-rotate` maps straight onto heading. */
+  /**
+   * Ranger patrol: the shape of the Canadian Rangers patch, cut down to what survives at
+   * 32 pixels.
+   *
+   * ⚠️ THE DEVICE, NOT THE ARTWORK. The patch is a green shield carrying crossed rifle and
+   * axe behind three red maple leaves, with lettering around it. Lettering is unreadable at
+   * 32 pixels and the crossed pair competes with the leaf for the same few pixels, so this
+   * keeps the two things that carry it: the shield, and one leaf filling it.
+   *
+   * 🔑 WHAT FINALLY MADE IT READ AS A LEAF: THE BOTTOM IS EMPTY EXCEPT FOR THE STEM.
+   * Seven attempts failed before that, and every failure was the same mistake in a new
+   * costume. Lobes at even angles all the way round is the definition of a STAR, and it
+   * rendered as one; broad upward triangles gave a FIR TREE; shallow notches gave a COG;
+   * deep ones gave a SNOWFLAKE. What none of them had was the real leaf's silhouette: lobes
+   * occupy only the upper part, and the lower third carries nothing but a thin stem. Break
+   * the radial symmetry and the shape stops being a star, whatever the notch depth.
+   *
+   * Generated from a polar profile rather than typed by hand, so lobe and notch radii could
+   * be moved independently instead of nudging twenty coordinates each time.
+   *
+   * ⚠️ IT IS NOT A REPRODUCTION AND MUST NOT BECOME ONE. No badge artwork is copied and
+   * none is vendored; this is a hand-drawn silhouette in the same monochrome grammar as
+   * every other icon here, and it takes the kind colour like the rest.
+   */
   uas: (c) => `
     <path d="M16 3.5 L19 13 L28.5 18.5 L28.5 21.5 L18.5 18.8 L17.6 24.5
              L20.5 27.5 L16 26.4 L11.5 27.5 L14.4 24.5 L13.5 18.8
@@ -145,6 +179,52 @@ const SHAPES: Record<string, (c: string) => string> = {
     <path d="M24.5 8.5 A 12 12 0 0 0 20 5" fill="none" stroke="${c}"
           stroke-width="1.3" stroke-linecap="round" opacity="0.65"/>`,
 
+  /**
+   * The backhaul badge: a dish with two uplink arcs.
+   *
+   * 🔑 A BADGE, NOT A KIND. A gateway is not a different sort of thing, it is an ordinary
+   * node or launch site that happens to carry the satellite terminal the rest of its
+   * cluster relays through. So it keeps its own silhouette and gains a mark, rather than
+   * getting a shape of its own: the operator should still read "node" at a glance, then
+   * "and this one is the way out".
+   *
+   * ⚠️ IT IS A BODY WITH SOLAR PANELS, NOT A DISH. The first version was a ground dish with
+   * uplink arcs, which reads as "radio" rather than as "satellite" and looked like every
+   * other antenna on the map. Panels either side of a bus is the shape everyone already
+   * knows, and it stays legible when the badge is only twenty pixels across.
+   *
+   * Drawn by its own layer and offset clear of the icon, so it never competes with the
+   * condition ring or covers the silhouette underneath.
+   */
+  gateway_badge: (c) => `
+    <rect x="12.4" y="10.6" width="7.2" height="10.8" rx="1.2"
+          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
+    <rect x="0.9" y="12.4" width="10" height="7.2" rx="0.8"
+          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
+    <rect x="22.1" y="12.4" width="10" height="7.2" rx="0.8"
+          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
+    <path d="M5.9 12.4 V19.6 M27.1 12.4 V19.6" stroke="${c}" stroke-width="1.3"/>
+    <path d="M16 10.6 V6.2" stroke="${c}" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="16" cy="4.6" r="1.9" fill="${c}"/>
+    <path d="M16 21.4 V24.4" stroke="${c}" stroke-width="2" stroke-linecap="round"/>
+    <path d="M11.6 29.4 A5.6 5.6 0 0 1 20.4 29.4" fill="none" stroke="${c}"
+          stroke-width="2.2" stroke-linecap="round"/>`,
+
+  /** Air contact: a swept planform, pointing where it is going. */
+  aircraft: (c) => `
+    <path d="M16 4 L18.2 14.5 L28 20.5 L28 23 L18.2 20 L18.2 25.5 L21 28 L16 26.8
+             L11 28 L13.8 25.5 L13.8 20 L4 23 L4 20.5 L13.8 14.5 Z"
+          fill="${BACKING}" stroke="${c}" stroke-width="1.7" stroke-linejoin="round"/>`,
+
+  /** Land contact: a party on foot, drawn as a pair rather than a single figure. */
+  ground_party: (c) => `
+    <circle cx="12" cy="9.5" r="2.6" fill="none" stroke="${c}" stroke-width="1.7"/>
+    <path d="M12 12.5 V19 M12 19 L9 26 M12 19 L15 26 M8.5 15.5 H15.5"
+          fill="none" stroke="${c}" stroke-width="1.7" stroke-linecap="round"/>
+    <circle cx="21.5" cy="12" r="2.2" fill="none" stroke="${c}" stroke-width="1.5" opacity="0.75"/>
+    <path d="M21.5 14.5 V20 M21.5 20 L19 26 M21.5 20 L24 26 M18.5 17 H24.5"
+          fill="none" stroke="${c}" stroke-width="1.5" stroke-linecap="round" opacity="0.75"/>`,
+
   /** Operator-placed marker. The plainest thing on the map, on purpose. */
   marker: (c) => `
     <circle cx="16" cy="16" r="5.5" fill="none" stroke="${c}" stroke-width="1.8"/>
@@ -152,6 +232,21 @@ const SHAPES: Record<string, (c: string) => string> = {
           stroke="${c}" stroke-width="1.8" stroke-linecap="round"/>
     <circle cx="16" cy="16" r="1.4" fill="${c}"/>`,
 };
+
+/**
+ * The same shapes, as inline SVG markup for use in the DOM.
+ *
+ * 🔑 ONE SOURCE OF SHAPES FOR THE MAP AND THE PANELS. The spiderfy draws real icons rather
+ * than dots or coloured squares, and it has to be the SAME icon or the whole point of
+ * floating them out is lost: the operator is matching what they see in the fan against
+ * what they saw in the pile. Re-drawing them by hand in a second file is how those two
+ * silently diverge.
+ */
+export function iconMarkup(kind: string, size: number): string {
+  const shape = SHAPES[kind] ?? SHAPES.marker;
+  const color = KIND_COLOR[kind] ?? "#ffffff";
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${BOX} ${BOX}">${shape(color)}</svg>`;
+}
 
 /** Every image id this module registers. Exported so the map can assert they all arrived. */
 export const ICON_IDS = Object.keys(SHAPES);
@@ -260,6 +355,13 @@ export function iconImageExpression(): unknown[] {
     "case",
     // A vessel's identity, not its kind, decides its silhouette.
     ["==", ["get", "dark"], true], "vessel_dark",
-    ["match", ["get", "kind"], ...ICON_IDS.filter((k) => k !== "vessel_dark").flatMap((k) => [k, k]), "marker"],
+    // `vessel_dark` is chosen by identity above; `gateway_badge` is not a kind at all and
+    // is drawn by its own layer. Neither may be reached by matching on `kind`.
+    [
+      "match",
+      ["get", "kind"],
+      ...ICON_IDS.filter((k) => k !== "vessel_dark" && k !== "gateway_badge").flatMap((k) => [k, k]),
+      "marker",
+    ],
   ];
 }

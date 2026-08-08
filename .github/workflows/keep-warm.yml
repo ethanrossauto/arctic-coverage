@@ -1,0 +1,90 @@
+# Keeps the database awake, around the clock, so that whenever somebody opens the site the
+# first thing they do is not the slowest thing they do.
+#
+# WHY THIS EXISTS. The database scales to zero after five minutes of inactivity, and waking
+# it costs real time: measured cold, the first connection took 11.9 seconds, then 6.5, 1.4
+# and 0.7 as the compute came up. A visitor arriving at a quiet moment does not see a slow
+# page, they see a page that appears to be broken. This keeps the compute up so the first
+# request they make is the warm one.
+#
+# ⚠️ IT REMOVES THE COLD SPIKE AND NOTHING ELSE. Warm, a connection to the pooled endpoint
+# still costs a few hundred milliseconds and a command opens several. That is a separate
+# problem and no amount of pinging touches it.
+#
+# 🔑 IT RUNS AROUND THE CLOCK, DELIBERATELY, AND THAT SPENDS THE ALLOWANCE. A narrower
+# window would be cheaper, and it was the first version of this file, but it assumes
+# something nobody knows: when a visitor will arrive. A stranger reading this at their own
+# breakfast is the whole reason the site is up, and a cold start is what they would meet.
+#
+# The arithmetic, so the decision is checkable rather than a shrug. Awake at the 0.25 CU
+# floor costs about 6 CU-hours a day. The free plan allows 100 per project per month, and
+# a week of ordinary development had already spent 3.5, leaving roughly 96. So this runs
+# for about SIXTEEN DAYS before the allowance is gone.
+#
+# 🔴 EXCEEDING IT SUSPENDS THE COMPUTE OUTRIGHT until the next billing period or an
+# upgrade. It is not throttled, it stops, and the data is safe but the site is not. So the
+# failure mode of this file is the exact one it exists to prevent, arriving all at once and
+# lasting days.
+#
+# ⚠️ THEREFORE: UPGRADE BEFORE THE ALLOWANCE RUNS OUT, NOT AFTER. Launch is pay-as-you-go
+# with no monthly minimum at about $0.106 per CU-hour, so covering the tail of a month
+# costs a few dollars. Watch the billing page rather than waiting for this workflow to go
+# red, because by the time it does the site has already been down.
+#
+# ⚠️ GITHUB'S SCHEDULER DRIFTS, AND THIS DESIGN ASSUMES IT. Scheduled workflows are
+# best-effort and are delayed or dropped under load, sometimes by tens of minutes. Five
+# minutes is also the shortest interval GitHub accepts, which is exactly the suspend
+# window, so a single ping per run would leave no margin at all. Each run therefore pings
+# repeatedly for about four and a half minutes, so consecutive runs tile and a late one
+# still lands inside the previous run's shadow. This makes cold starts rare rather than
+# impossible; a dedicated external scheduler is the answer if they have to be impossible.
+
+name: keep the database warm
+
+on:
+  schedule:
+    # Every five minutes, every hour. Five is the shortest interval GitHub accepts and it
+    # is exactly the suspend window, which is why each run pings for four and a half
+    # minutes rather than once.
+    - cron: "*/5 * * * *"
+  # So it can be started by hand the moment it is wanted, rather than at the next slot.
+  workflow_dispatch:
+
+# Overlapping runs are pointless but harmless; queueing them would be worse, because a
+# backlog of delayed pings all firing at once warms nothing that is not already warm.
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Ping the health endpoint until the next run takes over
+        run: |
+          # The health endpoint runs a real query, so reaching it is what keeps the
+          # compute up. A static asset would be served from the edge and touch nothing.
+          URL="https://coverage.skryer.ca/api/healthz"
+          fail=0
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /tmp/out.json -w '%{http_code}' --max-time 45 "$URL" || echo 000)
+            reachable=$(python3 -c "import json;print(json.load(open('/tmp/out.json'))['database']['reachable'])" 2>/dev/null || echo "unknown")
+            echo "$(date -u '+%H:%M:%S')Z  ping $i  HTTP $code  database reachable: $reachable"
+            # ⚠️ A 200 IS NOT ENOUGH. The endpoint answers even when the database is
+            # unreachable, deliberately, so that "the app is up but the data is not" can
+            # be told apart from "the app is down". Checking only the status code would
+            # report a warm database while it was in fact unreachable.
+            if [ "$code" != "200" ] || [ "$reachable" != "True" ]; then
+              fail=$((fail + 1))
+            fi
+            [ "$i" -lt 5 ] && sleep 55
+          done
+          # Failing the run when every attempt failed makes a broken deployment visible in
+          # the Actions tab rather than silently pinging nothing for a fortnight.
+          if [ "$fail" -ge 5 ]; then
+            echo "::error::every ping failed; the site or its database is down"
+            exit 1
+          fi

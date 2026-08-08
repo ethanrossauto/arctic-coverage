@@ -39,6 +39,15 @@ from typing import Any
 from . import db
 
 # How long the world may go without a command before the next request resets it.
+#
+# 🔴 SET IT TO 0 TO DISABLE, AND THE BROWSER SUITE MUST. A full e2e run takes minutes and
+# issues no COMMANDS, only reads, so from this module's point of view the world is idle and
+# a reset fires partway through. Every `last_heard` is rewritten and every `created_at`
+# moves, so motion re-anchors and positions jump under whatever test is mid-assertion.
+#
+# That is not a hypothetical: it flaked a radar test in a 3.5 minute suite run, which then
+# passed on its own. A test that fails only in company is the most expensive kind, because
+# the obvious reading is that the test is wrong.
 IDLE_RESET_MINUTES = float(os.environ.get("IDLE_RESET_MINUTES", "5"))
 
 # 🔒 A SAFETY FLOOR ON HOW OFTEN A RESET CAN HAPPEN AT ALL. Without it, a bug in the
@@ -102,6 +111,8 @@ def _is_due(cur: Any, now: datetime) -> bool:
         # seeded seconds ago by hand.
         cur.execute("insert into world_state (id) values (1) on conflict do nothing")
         return False
+    if IDLE_RESET_MINUTES <= 0:
+        return False  # disabled: see the constant
     if now - state["last_activity"] < timedelta(minutes=IDLE_RESET_MINUTES):
         return False
     return now - state["last_reset"] >= timedelta(seconds=MIN_SECONDS_BETWEEN_RESETS)

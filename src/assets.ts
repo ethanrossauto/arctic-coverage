@@ -80,6 +80,10 @@ export interface Asset {
   meshConnected?: boolean;
   /** Server-computed staleness. `undefined` until the server ships it. */
   overdue?: boolean;
+  /** Contacts only: is it actually on our picture. Absent on anything that is not a contact. */
+  tracked?: boolean;
+  /** Contacts only: how many sensors are holding it, whether or not they can report. */
+  held?: number;
   /** The one flag, server-computed. `undefined` until the server ships it. */
   flag?: AssetFlag;
   /** Vessels only. `false` is the interesting case. */
@@ -102,6 +106,8 @@ interface WireAsset {
   created_by: "seed" | "user" | "llm";
   server_reachable?: boolean;
   mesh_connected?: boolean;
+  tracked?: boolean;
+  held?: number;
   overdue?: boolean;
   flag?: AssetFlag;
 }
@@ -128,6 +134,8 @@ export async function fetchAssets(kind?: AssetKind): Promise<Asset[]> {
     createdBy: a.created_by,
     serverReachable: a.server_reachable,
     meshConnected: a.mesh_connected,
+    tracked: a.tracked,
+    held: a.held,
     overdue: a.overdue,
     flag: a.flag,
   }));
@@ -321,6 +329,38 @@ export const KIND_LABEL: Record<AssetKind, string> = {
   marker: "Marker",
 };
 
+/**
+ * Contacts the console cannot honestly claim to have.
+ *
+ * 🔒 THE DEFAULT VIEW CLAIMS ONLY WHAT ACTUALLY ARRIVED, and these two buckets did not.
+ * They are different problems with different answers, which is why they are one field with
+ * two values rather than a single "unknown" flag:
+ *
+ * - **`detected_not_reported`** — a sensor IS holding it and cannot deliver the report.
+ *   Counter-intuitive, and it is still excluded: if the report is not reaching you, you do
+ *   not have the contact. That is a LINK fault, not a coverage gap, and the answer is to
+ *   fix the relay.
+ * - **`untracked`** — nothing holds it and it is not talking, so the console **cannot
+ *   legitimately know it exists**. This one is read out of the seeded world rather than
+ *   derived from the sensor network, which is the same class of claim as a modelled
+ *   measurement.
+ *
+ * ⛔ NEITHER MAY EVER REACH A DEFAULT COUNT, SUMMARY LINE OR STATUS BADGE, and `untracked`
+ * least of all. Revealing them has to be a deliberate act by the operator.
+ */
+export type UnknownState = "detected_not_reported" | "untracked" | null;
+
+export function unknownState(asset: Asset): UnknownState {
+  // `tracked` is absent on anything that is not a contact, and absent is not `false`.
+  if (asset.tracked !== false) return null;
+  return (asset.held ?? 0) > 0 ? "detected_not_reported" : "untracked";
+}
+
+/** Is this contact an adversary? Ordinary traffic that is simply quiet is not one. */
+export function isHostile(asset: Asset): boolean {
+  return asset.props?.hostile === true;
+}
+
 // ---------------------------------------------------------------------------
 // The mesh link graph
 // ---------------------------------------------------------------------------
@@ -377,223 +417,142 @@ export async function fetchMesh(): Promise<MeshStatus> {
 // Sea ice
 // ---------------------------------------------------------------------------
 
+/**
+ * One date's measurement grid, as measured. NOT a map shape.
+ *
+ * 🔒 The store holds domain objects and the renderer turns them into whatever it draws, so
+ * what crosses this boundary is a grid of concentrations with the header needed to place
+ * it. Building the texture is the map's job and lives in the map.
+ */
 export interface IceLayer {
-  /** The date actually shown, which is the nearest vendored measurement. */
+  /** The date shown, which is one of the vendored measurements and never between two. */
   date: string;
-  grid: unknown;
-  /** Arctic-wide ice extent on that date, in km2, computed on the source grid. */
+  /** Every date available, so the control can offer only real measurements. */
+  dates: string[];
+  /** Arctic-wide extent on that date, in km2, computed on the SOURCE grid at build time. */
   extentKm2: number;
   caveat: string;
   citation: string;
-  /** Every date available, so the control can offer only real measurements. */
-  dates: string[];
-  iceCells: number;
+
+  /** One byte per cell, `0-100` percent, `poleHoleValue` for unmeasured. Row 0 is SOUTH. */
+  cells: Uint8Array;
+  cols: number;
+  rows: number;
+  /** Lon/lat of the south-west corner of cell (0,0). */
+  origin: [number, number];
+  /** Degrees per cell, lon then lat. */
+  step: [number, number];
+  poleHoleValue: number;
 }
 
-/** The vendored measurement set, exactly as scripts/build_ice_history.py wrote it. */
-interface IceFile {
-  kind: string;
+interface IceIndex {
   origin: [number, number];
   step: [number, number];
   cols: number;
   rows: number;
   dates: string[];
-  concentration: Record<string, string>;
+  /** A template, e.g. `ice/{date}.png`. */
+  tiles: string;
   extent_km2: Record<string, number>;
   poleHoleValue: number;
   source: { citation: string; caveat: string };
 }
 
-let icePromise: Promise<IceFile> | null = null;
+let indexPromise: Promise<IceIndex> | null = null;
 
 /**
- * The whole vendored measurement set, fetched once.
+ * The grid header and date list, fetched once.
  *
- * 🔑 MEASURED, NOT MODELLED. Every value here is sea ice concentration observed by
- * satellite on that date and published by NSIDC. There is no model in this path, which is
- * the entire reason it replaced one: nothing to calibrate and nothing to defend.
- *
- * ⚠️ CONCENTRATION IS NOT THICKNESS. It is the fraction of sea surface covered by ice on a
- * 25 km grid, and it says nothing about what will bear a load. The UI shows `caveat`
- * wherever it shows the layer.
+ * 🥇 THE MEASUREMENTS THEMSELVES ARE FETCHED PER DATE, and that is the whole reason this
+ * shape exists. The previous payload was every date base64'd into one JSON: 11.8 MB on
+ * disk, 1.4 MB gzipped, and a visitor downloaded all fifty-five before seeing one. A
+ * greyscale PNG per date is about 11 KB, so the first paint now costs one date instead of
+ * five years.
  */
-function iceFile(): Promise<IceFile> {
-  if (!icePromise) {
-    icePromise = fetch("/data/ice.json").then((r) => {
-      if (!r.ok) throw new Error(`ice measurements failed to load: ${r.status}`);
-      return r.json() as Promise<IceFile>;
+function iceIndex(): Promise<IceIndex> {
+  if (!indexPromise) {
+    indexPromise = fetch("/data/ice-index.json").then((r) => {
+      if (!r.ok) throw new Error(`ice index failed to load: ${r.status}`);
+      return r.json() as Promise<IceIndex>;
     });
   }
-  return icePromise;
-}
-
-function decode(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+  return indexPromise;
 }
 
 /**
- * Build the drawable grid for whichever measurement is nearest the requested date.
+ * Decode one date's greyscale PNG back into one byte per cell.
  *
- * ⚠️ SNAPS TO A REAL MEASUREMENT rather than interpolating between two. Interpolating
- * would invent a value nobody observed, which is exactly the property this layer exists to
- * avoid. The returned `date` is the one actually shown, so the UI can say so.
+ * ⚠️ ROW 0 IS THE SOUTHERNMOST ROW, which is upside down relative to how images are
+ * normally stored and matches the grid's own convention. Verified against the data rather
+ * than assumed: on a March date the first row is almost all open water, which is 55 N, and
+ * the last is solid ice, which is 89 N. Getting this backwards renders a plausible-looking
+ * Arctic with the ice in the wrong hemisphere of the frame.
+ *
+ * The image is greyscale, so all three channels carry the same number and the red one is
+ * as good as any.
  */
-/**
- * Soften the shading between measured cells, WITHOUT changing the resolution.
- *
- * 🔑 THIS REPLACED AN UPSAMPLER, AND THE DIFFERENCE IS THE WHOLE POINT. The old version
- * subdivided every cell and interpolated, which looked right and cost four times the
- * polygons. That was affordable while the vendored grid was coarse. It stopped being
- * affordable the moment the build shipped 960 x 175: the same trick would have drawn
- * 672,000 cells and it froze the display for twelve seconds.
- *
- * A neighbourhood average at the SAME resolution buys the same softness for a fraction of
- * the cost, because the geometry does not change at all. Only the values do, and adjacent
- * values being closer together is exactly what makes a gradient read as a gradient rather
- * than as a grid.
- *
- * 🔒 THE ICE EDGE STAYS WHERE THE SATELLITE PUT IT. Whether a cell is drawn at all is
- * decided on its ORIGINAL value against the 15% threshold, never on the softened one. So
- * the boundary on screen is still the boundary NSIDC publishes; softening changes how the
- * inside is shaded, not where the ice is. The extent figure in the footer is computed on
- * the source grid at build time and is untouched by any of this.
- *
- * 🔒 THE POLE HOLE IS NEVER AVERAGED, and a cell whose neighbourhood touches it is left
- * exactly as measured. The hole is a sentinel meaning "the instrument cannot see here",
- * not a concentration. Blending it with a real reading would draw a gradient across the
- * one region of the map that is honestly unknown, and it has its own colour precisely so
- * that never happens.
- *
- * ⚠️ It costs polygons even so, because softened neighbours are less likely to be
- * identical and the run merge below has less to merge: 13,052 becomes 23,465 on a dense
- * date. That is the price of the gradient and it is worth paying at this size.
- */
-function soften(cells: Uint8Array, cols: number, rows: number, hole: number): Uint8Array {
-  const out = new Uint8Array(cells);
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const i = r * cols + c;
-      if (cells[i] === hole) continue;
+async function decodeTile(url: string, cols: number, rows: number): Promise<Uint8Array> {
+  const img = new Image();
+  img.decoding = "async";
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error(`ice tile failed to decode: ${url}`));
+    img.src = url;
+  });
 
-      let sum = 0;
-      let n = 0;
-      let touchesHole = false;
-      for (let dy = -1; dy <= 1 && !touchesHole; dy++) {
-        const rr = r + dy;
-        if (rr < 0 || rr >= rows) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          // Longitude wraps: the grid closes the circle, so the column east of the last
-          // is the first. Clamping instead would leave a seam down the antimeridian.
-          const cc = (((c + dx) % cols) + cols) % cols;
-          const w = cells[rr * cols + cc];
-          if (w === hole) {
-            touchesHole = true;
-            break;
-          }
-          // Zero is open water, a real 0% reading, so it belongs in the average: that is
-          // what feathers the ice edge instead of leaving it a cliff.
-          sum += w;
-          n++;
-        }
-      }
-      if (!touchesHole && n > 0) out[i] = Math.round(sum / n);
-    }
-  }
-  return out;
+  const canvas = document.createElement("canvas");
+  canvas.width = cols;
+  canvas.height = rows;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("no 2d context available to decode the ice tile");
+  ctx.drawImage(img, 0, 0);
+
+  const rgba = ctx.getImageData(0, 0, cols, rows).data;
+  const cells = new Uint8Array(cols * rows);
+  for (let i = 0; i < cells.length; i++) cells[i] = rgba[i * 4];
+  return cells;
 }
 
+const tileCache = new globalThis.Map<string, Promise<Uint8Array>>();
+
+/**
+ * The measurement nearest the requested date.
+ *
+ * ⚠️ SNAPS TO A REAL MEASUREMENT rather than interpolating between two. Interpolating would
+ * invent a value nobody observed, which is exactly the property this layer exists to keep.
+ * The returned `date` is the one actually shown, so the control can say so.
+ */
 export async function fetchIce(on: string): Promise<IceLayer> {
-  const f = await iceFile();
+  const f = await iceIndex();
   const want = Date.parse(`${on}T00:00:00Z`);
-  const date = f.dates.reduce((best, d) =>
-    Math.abs(Date.parse(`${d}T00:00:00Z`) - want) < Math.abs(Date.parse(`${best}T00:00:00Z`) - want)
-      ? d
-      : best,
-  f.dates[0]);
+  const date = f.dates.reduce(
+    (best, d) =>
+      Math.abs(Date.parse(`${d}T00:00:00Z`) - want) <
+      Math.abs(Date.parse(`${best}T00:00:00Z`) - want)
+        ? d
+        : best,
+    f.dates[0],
+  );
 
-  const raw = decode(f.concentration[date]);
-  const shade = soften(raw, f.cols, f.rows, f.poleHoleValue);
-  const [lon0, lat0] = f.origin;
-  const [dlon, dlat] = f.step;
-  const cols = f.cols;
-  const rows = f.rows;
-
-  // 🥇 ADJACENT CELLS OF THE SAME VALUE ARE MERGED INTO ONE RECTANGLE, and this is the
-  // difference between a layer that draws and one that hangs.
-  //
-  // The vendored grid is 960 x 175, so a dense date is 62,030 cells above the ice-edge
-  // threshold. Emitted one polygon per cell, MapLibre's worker spends about ten seconds
-  // parsing and tiling them, and NOTHING ELSE DRAWS IN THE MEANTIME: the asset layer waits
-  // its turn behind the ice, so the map sat empty for twelve seconds while the footer
-  // already reported 76 assets. Measured on the real file.
-  //
-  // 🔒 IT LOSES NOTHING. Only cells carrying the IDENTICAL measured value are joined, so
-  // every rectangle still states exactly what the satellite recorded for the ground it
-  // covers. This is not smoothing, resampling or bucketing; it is the same picture with
-  // fewer draw calls. On that date it turns 62,030 polygons into 13,052.
-  //
-  // Runs are horizontal only. Merging vertically as well would need a proper rectangle
-  // decomposition for a fraction more, and this is already the difference between seconds
-  // and milliseconds.
-  const CHUNK_ROWS = 40;
-  const features: object[] = [];
-  const hole = f.poleHoleValue;
-  const drawable = (v: number) => !(v === 0 || (v < 15 && v !== hole));
-
-  for (let r = 0; r < rows; r++) {
-    // Yield between bands so a big grid cannot freeze the page while it builds. A
-    // macrotask, not a microtask: `await Promise.resolve()` stays in the same task and
-    // yields to nothing, which is the version of this that looks right and does nothing.
-    if (r > 0 && r % CHUNK_ROWS === 0) await new Promise((res) => setTimeout(res, 0));
-
-    const lat = lat0 + r * dlat;
-    let runStart = -1;
-    let runValue = -1;
-
-    const flush = (endCol: number) => {
-      if (runStart < 0) return;
-      const lon = lon0 + runStart * dlon;
-      const east = lon0 + endCol * dlon;
-      features.push({
-        type: "Feature",
-        properties: { concentration: runValue === hole ? -1 : runValue },
-        geometry: {
-          type: "Polygon",
-          coordinates: [[
-            [lon, lat], [east, lat], [east, lat + dlat], [lon, lat + dlat], [lon, lat],
-          ]],
-        },
-      });
-      runStart = -1;
-    };
-
-    for (let c = 0; c < cols; c++) {
-      const i = r * cols + c;
-      // 🔒 Drawn-or-not comes from the MEASUREMENT; the colour comes from the softened
-      // value. Deciding both on the softened one would let the shading move the ice edge.
-      if (!drawable(raw[i])) {
-        flush(c);
-        continue;
-      }
-      const v = raw[i] === hole ? hole : shade[i];
-      if (runStart >= 0 && v === runValue) continue;
-      flush(c);
-      runStart = c;
-      runValue = v;
-    }
-    flush(cols);
+  // Cached per date, because stepping back and forth through months is the normal way this
+  // control gets used and a tile is immutable once published.
+  let tile = tileCache.get(date);
+  if (!tile) {
+    tile = decodeTile(`/data/${f.tiles.replace("{date}", date)}`, f.cols, f.rows);
+    tileCache.set(date, tile);
   }
 
   return {
     date,
-    grid: { type: "FeatureCollection", features },
+    dates: f.dates,
     extentKm2: f.extent_km2[date] ?? 0,
     caveat: f.source.caveat,
     citation: f.source.citation,
-    dates: f.dates,
-    iceCells: features.length,
+    cells: await tile,
+    cols: f.cols,
+    rows: f.rows,
+    origin: f.origin,
+    step: f.step,
+    poleHoleValue: f.poleHoleValue,
   };
 }

@@ -31,6 +31,8 @@ export default function App() {
   const bbox = useStore((s) => s.bbox);
   const showMesh = useStore((s) => s.showMesh);
   const setShowMesh = useStore((s) => s.setShowMesh);
+  const showUndetected = useStore((s) => s.showUndetected);
+  const setShowUndetected = useStore((s) => s.setShowUndetected);
 
   const setAssets = useStore((s) => s.setAssets);
   const setMesh = useStore((s) => s.setMesh);
@@ -138,6 +140,19 @@ export default function App() {
             onChange={(e) => setShowMesh(e.target.checked)}
           />
           MESH LINKS
+        </label>
+
+        {/* ⛔ Deliberately not labelled with a count. One of these buckets is a contact
+            nothing is holding, and putting a number for it in the top strip would be the
+            console asserting knowledge it does not have. The checkbox reveals; it does not
+            advertise. */}
+        <label className="toggle" title="contacts the network cannot confirm: held but unable to report, or held by nothing at all">
+          <input
+            type="checkbox"
+            checked={showUndetected}
+            onChange={(e) => setShowUndetected(e.target.checked)}
+          />
+          UNCONFIRMED
         </label>
       </header>
 

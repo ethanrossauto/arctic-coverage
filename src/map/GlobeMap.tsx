@@ -36,7 +36,12 @@
  */
 import { useEffect, useRef, useState } from "react";
 // MapLibre v6 removed the default export; everything is a named import now.
-import { config as maplibreConfig, Map as MapLibreMap, type GeoJSONSource } from "maplibre-gl";
+import {
+  config as maplibreConfig,
+  Map as MapLibreMap,
+  type GeoJSONSource,
+  type ImageSource,
+} from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 // 🔴 MapLibre parses ALL geometry in a web worker, and it must be told where that
 // worker lives. Get this wrong and the map renders NOTHING while the rest of the
@@ -55,10 +60,11 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // broken build ship.
 maplibreConfig.WORKER_URL = "/maplibre/maplibre-gl-worker.mjs";
 
-import { isGateway, isUnreachable, ringState, weakAssetIds } from "../assets";
+import { isGateway, isUnreachable, ringState, unknownState, weakAssetIds } from "../assets";
 import { useStore } from "../store";
 import { viewportBbox } from "./bounds";
 import { buildIcons, iconImageExpression, ICON_PIXEL_RATIO } from "./icons";
+import { buildIceTexture } from "./iceTexture";
 import { labelImage, labelImageExpression, labelImageId, LABEL_PIXEL_RATIO } from "./labels";
 
 const COLOR = {
@@ -95,6 +101,8 @@ const COLOR = {
   unreachable: "#6b7683",
   /** What the operator clicked. */
   selected: "#7fe3c0",
+  /** What the last command's answer points at. Warmer than selection so the two read apart. */
+  highlight: "#ffd166",
   degraded: "#ffd166",
   land: "#111b26",
   coast: "#2b4258",
@@ -130,6 +138,8 @@ export function GlobeMap() {
   const mesh = useStore((s) => s.mesh);
   const ice = useStore((s) => s.ice);
   const showMesh = useStore((s) => s.showMesh);
+  const showIce = useStore((s) => s.showIce);
+  const showUndetected = useStore((s) => s.showUndetected);
   const track = useStore((s) => s.track);
 
   // ---- create the map once -------------------------------------------------
@@ -151,54 +161,58 @@ export function GlobeMap() {
         sources: {
           land: { type: "geojson", data: "/data/land.json" },
           graticule: { type: "geojson", data: "/data/graticule.json" },
-          // Declared here with empty data rather than added later, so it can sit
-          // between the ocean and the land in the layer order. Ice is on the sea and
-          // under the coastline, and getting that order wrong makes the archipelago
-          // vanish under a blue wash every March.
-          ice: { type: "geojson", data: emptyFC() },
+          // 🔴 AN IMAGE SOURCE, NOT GEOJSON, and that is what stopped it looking pixelated.
+          // A fill layer draws one polygon per cell, and polygons have hard edges however
+          // small you make them, so the grid is always visible. A raster layer hands the
+          // grid to the GPU as a texture and `raster-resampling: linear` interpolates
+          // between cells for free.
+          //
+          // Declared here rather than added later so it can sit between the ocean and the
+          // land in the layer order: ice is on the sea and under the coastline, and getting
+          // that order wrong makes the archipelago vanish under a blue wash every March.
+          //
+          // ⚠️ A 1x1 TRANSPARENT PIXEL UNTIL REAL DATA ARRIVES. An image source must have a
+          // valid url when it is added, and the coordinates are patched in with the first
+          // real frame, once the grid header says where the grid actually is.
+          ice: {
+            type: "image",
+            url:
+              "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk" +
+              "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+            coordinates: [
+              [-180, 89],
+              [180, 89],
+              [180, 55],
+              [-180, 55],
+            ],
+          },
         },
         layers: [
           { id: "ocean", type: "background", paint: { "background-color": COLOR.ocean } },
           {
-            // 🔑 COLOUR IS CONCENTRATION, AND IT CLAIMS NOTHING ELSE.
+            // 🔑 COLOUR IS CONCENTRATION, AND IT CLAIMS NOTHING ELSE. What is drawn is the
+            // fraction of sea surface the satellite measured as ice-covered on this date.
+            // Nothing is inferred from it and no thickness is implied.
             //
-            // This layer used to colour by "can a heavy vehicle cross this", derived from
-            // a modelled thickness. That model is gone and so is the claim: what is drawn
-            // now is the fraction of sea surface the satellite measured as ice-covered,
-            // and nothing is inferred from it.
-            //
-            // ⚠️ Dense ice is brighter, which is the intuitive direction, but the ramp
-            // starts at 15% because that is the standard threshold for "ice edge" in every
-            // published extent figure. Below it, cells are dropped rather than drawn faint,
-            // so the edge on screen is the same edge NSIDC counts.
+            // The colour ramp lives in buildIceTexture() rather than here, because MapLibre
+            // 6.2 has no `raster-color`: the paint properties are brightness, contrast,
+            // hue-rotate, saturation, opacity, resampling and fade. Read out of the shipped
+            // bundle rather than assumed, after a plan that depended on it.
             id: "ice",
-            type: "fill",
+            type: "raster",
             source: "ice",
             paint: {
-              // 🔴 ANTIALIAS OFF, AND IT HAS TO STAY OFF. Turning it on looks like the
-              // obvious fix for a blocky layer and does the opposite: MapLibre antialiases
-              // each polygon's own edge, so every one of the thousands of adjacent cells
-              // draws a seam against its neighbours and the whole ice field gains a visible
-              // mesh. Tried, screenshotted, reverted. Smoothness comes from shading between
-              // samples, not from softening edges that should not be visible at all.
-              "fill-antialias": false,
-              "fill-color": [
-                "case",
-                // The pole hole is UNMEASURED, not ice-free, and gets its own colour so it
-                // never reads as either ice or open water.
-                ["<", ["get", "concentration"], 0], COLOR.icePoleHole,
-                [
-                  "interpolate", ["linear"], ["get", "concentration"],
-                  15, COLOR.iceThin,
-                  60, COLOR.iceMid,
-                  95, COLOR.iceDense,
-                ],
-              ],
-              "fill-opacity": [
-                "case",
-                ["<", ["get", "concentration"], 0], 0.18,
-                ["interpolate", ["linear"], ["get", "concentration"], 15, 0.12, 95, 0.34],
-              ],
+              // 🥇 THE ONE LINE THAT FIXED THE PIXELATION. `nearest` is what a fill layer
+              // effectively gives you; `linear` is the GPU interpolating between measured
+              // cells, which is a visual treatment of a real measurement rather than
+              // invented data.
+              "raster-resampling": "linear",
+              // Per-pixel alpha is baked into the texture from concentration, so the layer
+              // itself is fully opaque and the ramp decides what shows through.
+              "raster-opacity": 1,
+              // No cross-fade. Changing month is a jump between two measurements, and
+              // dissolving between them would put a blend of two dates on screen.
+              "raster-fade-duration": 0,
             },
           },
           {
@@ -359,6 +373,54 @@ export function GlobeMap() {
         },
       });
 
+      // ---- what a command's answer points at --------------------------------
+      //
+      // 🔑 SEPARATE FROM SELECTION, because they answer different questions. Selection is
+      // "the one thing I clicked"; highlight is "every asset in the answer you just got".
+      // A query can highlight nine assets while one of them is selected, and collapsing
+      // the two would make "show me the drones" look like it clicked five things at once.
+      //
+      // Drawn as a wide soft halo rather than a ring, so it reads as illumination falling
+      // on the answer rather than as another condition badge competing with the rings.
+      m.addLayer({
+        id: "asset-highlight",
+        type: "circle",
+        source: "asset-points",
+        paint: {
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 2, 11, 6, 17],
+          "circle-color": COLOR.highlight,
+          "circle-opacity": [
+            "case", ["boolean", ["feature-state", "highlighted"], false], 0.3, 0,
+          ],
+          "circle-blur": 0.55,
+        },
+      });
+
+      // ---- contacts the network cannot confirm --------------------------------
+      //
+      // 🔑 REUSES THE MEANINGS THIS DISPLAY ALREADY HAS rather than inventing two colours.
+      // `detected_not_reported` is a LINK fault, something is watching and cannot deliver,
+      // which is exactly what the weak-link orange already says. `untracked` is a thing we
+      // cannot hear about at all, which is what the unreachable grey already says. A
+      // dashed ring, because dashed already means inferred rather than reported.
+      m.addLayer({
+        id: "asset-unknown",
+        type: "circle",
+        source: "asset-points",
+        filter: ["!=", ["get", "unknown"], "none"],
+        paint: {
+          "circle-radius": 15,
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-stroke-color": [
+            "match", ["get", "unknown"],
+            "detected_not_reported", COLOR.weak,
+            COLOR.unreachable,
+          ],
+          "circle-stroke-width": 1.4,
+          "circle-stroke-opacity": 0.85,
+        },
+      });
+
       // ---- the condition ring ---------------------------------------------
       //
       // 🔑 THREE RINGS, THREE QUESTIONS, AND THE COLOURS ARE NOT DECORATION.
@@ -426,7 +488,14 @@ export function GlobeMap() {
         // screen is how an operator forgets a node exists. Fading says "this is where
         // it was when we last heard it", which is exactly true: the server stops
         // advancing a position it cannot hear, so a faded icon is also a stationary one.
-        "icon-opacity": ["case", ["==", ["get", "ring"], "unreachable"], 0.45, 1],
+        "icon-opacity": [
+          "case",
+          // Faded harder than an unreachable asset: this one may not be there at all.
+          ["==", ["get", "unknown"], "untracked"], 0.3,
+          ["==", ["get", "unknown"], "detected_not_reported"], 0.45,
+          ["==", ["get", "ring"], "unreachable"], 0.45,
+          1,
+        ],
       };
       // Kinds that travel, and so align to the map and carry a heading. The two contact
       // kinds are here because an aircraft drawn without a heading points north while its
@@ -572,6 +641,23 @@ export function GlobeMap() {
     // is recomputed whenever the camera settles rather than on every frame.
     m.on("moveend", () => setBbox(viewportBbox(m)));
 
+    // ---- lift the loading curtain ----------------------------------------
+    //
+    // 🔑 ON THE FIRST REAL FRAME, NOT ON MOUNT. The curtain in index.html exists to cover
+    // the gap before anything is on screen, and React mounting is well before that: the
+    // style has to load, the worker has to parse the basemap and the GPU has to draw it.
+    // Lifting at mount would move the blank frame rather than remove it.
+    //
+    // `idle` is MapLibre saying it has finished drawing everything it currently can, which
+    // is the closest thing it offers to "there is a picture now". `once`, because the curtain
+    // is lifted exactly one time and every later idle is just the map settling after a pan.
+    //
+    // 🔒 The curtain's own 15 second watchdog stays the backstop. A signal that is never
+    // sent must not be able to hang the page, so this only ever makes it lift EARLIER.
+    m.once("idle", () => {
+      (window as { consoleReady?: () => void }).consoleReady?.();
+    });
+
     // ---- click to select, and ask when the click is ambiguous ------------
     //
     // 🔑 HIT-TESTED ON THE ICON LAYERS, NOT THE RING OR THE LABEL. The icon is the thing
@@ -715,6 +801,11 @@ export function GlobeMap() {
       "asset-points",
       assets
         .filter((a) => a.lat !== null && a.lon !== null)
+        // 🔒 THE DEFAULT PICTURE CLAIMS ONLY WHAT ARRIVED. A contact the network cannot
+        // confirm is not drawn until the operator asks for it, because one of those buckets
+        // is held by nothing at all and the console has no honest basis for knowing it is
+        // there. Revealing them is a deliberate act, which is what the checkbox makes it.
+        .filter((a) => showUndetected || unknownState(a) === null)
         .map((a) =>
           point([a.lon as number, a.lat as number], {
             id: a.id,
@@ -725,12 +816,15 @@ export function GlobeMap() {
             // property, so the nominal case has to be a value like any other.
             ring: ringState(a, weak, now) ?? "none",
             gateway: isGateway(a),
+            // "none" rather than null, because a MapLibre filter cannot compare against a
+            // property that is absent.
+            unknown: unknownState(a) ?? "none",
             dark: dark(a),
             heading: headingOf(a),
           }),
         ),
     );
-  }, [assets, mesh, ready]);
+  }, [assets, mesh, ready, showUndetected]);
 
   // The position history a command asked for, and nothing else. Null clears it, which is
   // what makes a trail belong to the question that produced it rather than accumulating.
@@ -750,14 +844,22 @@ export function GlobeMap() {
     );
   }, [track, ready]);
 
-  // Sea ice for the selected date. Replaced wholesale rather than diffed: it is one
-  // GeoJSON blob and the map's own tiler handles the rest. This is the expensive one,
-  // so it now runs only when the timebar actually moves.
+  // Sea ice for the selected date, uploaded as one texture.
+  //
+  // 🥇 THIS USED TO BE TENS OF THOUSANDS OF POLYGONS and is now a single image. The layer
+  // was a GeoJSON fill with one rectangle per cell, which is why it looked pixelated: a
+  // polygon has a hard edge however small it is. Chasing that with more resolution took
+  // the payload to 11.8 MB and made it worse, not better. A texture plus
+  // `raster-resampling: linear` is the actual fix, and it is also far cheaper.
   useEffect(() => {
     const m = map.current;
     if (!m || !ready || !ice) return;
-    const src = m.getSource("ice") as GeoJSONSource | undefined;
-    src?.setData(ice.grid as never);
+    const src = m.getSource("ice") as ImageSource | undefined;
+    if (!src) return;
+    const { url, coordinates } = buildIceTexture(ice);
+    // Coordinates travel with the image because the grid header decides where it belongs,
+    // and the placeholder added at style time knows nothing about the real grid.
+    src.updateImage({ url, coordinates });
   }, [ice, ready]);
 
   // Mesh links. Endpoints are looked up from the asset list rather than sent as
@@ -822,6 +924,28 @@ export function GlobeMap() {
     lastSelected.current = selectedId;
   }, [selectedId, ready, assets]);
 
+  // Highlight, pushed as feature state for the same reason selection is: a query that
+  // lights up nine assets must not re-serialise all 76 features to do it.
+  //
+  // ⚠️ The previous set is cleared explicitly. Feature state is not exclusive, so without
+  // this a display accumulates highlights until every asset is lit and the effect stops
+  // meaning anything.
+  const highlightIds = useStore((s) => s.highlightIds);
+  const lastHighlight = useRef<string[]>([]);
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready) return;
+    for (const id of lastHighlight.current) {
+      if (!highlightIds.includes(id)) {
+        m.setFeatureState({ source: "asset-points", id }, { highlighted: false });
+      }
+    }
+    for (const id of highlightIds) {
+      m.setFeatureState({ source: "asset-points", id }, { highlighted: true });
+    }
+    lastHighlight.current = highlightIds;
+  }, [highlightIds, ready, assets]);
+
   // Mesh visibility. A `visibility` layout change rather than emptying the source: the
   // geometry stays parsed and uploaded, so turning it back on costs nothing and the data
   // effect above keeps its one job.
@@ -839,6 +963,14 @@ export function GlobeMap() {
     if (!m || !ready) return;
     m.setLayoutProperty("mesh-links", "visibility", showMesh ? "visible" : "none");
   }, [showMesh, ready]);
+
+  // The ice layer, toggled the same way and for the same reason. This is what
+  // "show me the weather overlays" reaches: a layer the client already draws.
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready) return;
+    m.setLayoutProperty("ice", "visibility", showIce ? "visible" : "none");
+  }, [showIce, ready]);
 
   return <div ref={container} className="map" />;
 }

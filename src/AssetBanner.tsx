@@ -20,6 +20,7 @@ import {
   positionOf,
   ringState,
   speedOf,
+  unknownState,
   weakAssetIds,
   KIND_LABEL,
   type Asset,
@@ -124,6 +125,19 @@ export function AssetBanner() {
       // The air and land equivalent of the AIS question: is it announcing itself at all.
       value: typeof p.emitting === "boolean" ? (p.emitting ? "yes" : "NO") : null,
       tone: p.emitting === false ? "alert" : undefined,
+    },
+    {
+      label: "confirmed",
+      // 🔒 Spelled out rather than left to the ring, because the two buckets have different
+      // answers: one is a link to fix, the other is a contact nothing can see.
+      value:
+        unknownState(asset) === "detected_not_reported"
+          ? "NO, report cannot reach us"
+          : unknownState(asset) === "untracked"
+            ? "NO, held by nothing"
+            : null,
+      title: "whether the sensor network can actually confirm this contact",
+      tone: "alert",
     },
     {
       label: "held by",

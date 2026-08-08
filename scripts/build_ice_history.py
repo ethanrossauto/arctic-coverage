@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Vendor measured sea ice concentration from NSIDC.
 
-    python3 scripts/build_ice_history.py [--years 5] [--out public/data/ice.json]
+    python3 scripts/build_ice_history.py [--years 5]
+
+Writes `public/data/ice/YYYY-MM-DD.png`, one 8-bit greyscale image per date, plus
+`public/data/ice-index.json` carrying the grid header, the date list and the extent figures.
+One byte per cell: 0-100 is concentration percent, 255 is the pole hole.
 
 WHAT CHANGED, AND WHY IT IS THE WHOLE POINT. This replaces a modelled ice layer that
 computed thickness from climate normals through Lebedev, then bearing capacity through
@@ -38,12 +42,14 @@ import struct
 import sys
 import urllib.error
 import urllib.request
+import zlib
 from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / ".build" / "nsidc"
-OUT = ROOT / "public" / "data" / "ice.json"
+OUT_DIR = ROOT / "public" / "data" / "ice"
+OUT_INDEX = ROOT / "public" / "data" / "ice-index.json"
 
 BASE = "https://noaadata.apps.nsidc.org/NOAA/G02135/north/daily/geotiff"
 MONTH_DIR = ["01_Jan", "02_Feb", "03_Mar", "04_Apr", "05_May", "06_Jun",
@@ -89,27 +95,31 @@ ECC = 0.081816153
 # wrong in a way that was invisible. A degree of longitude shrinks towards the pole, so one
 # step is a different distance at every latitude:
 #
-#     at 0.25 x 0.75      55 N: 48 km      70 N: 29 km      80 N: 15 km
-#     at 0.20 x 0.375     55 N: 24 km      70 N: 14 km      80 N:  7 km
+#     at 0.25 x 0.75      55 N: 48 km      70 N: 29 km      85 N: 7 km
+#     at 0.20 x 0.375     55 N: 24 km      70 N: 14 km      85 N: 3.6 km
 #
-# The old settings were coarser than the source everywhere below 75 N, and the Northwest
-# Passage sits at 68 to 78 N. So the region this console is actually about was being drawn
-# from averaged-down data while the pole was oversampled.
+# 🔴 SO THE FINER GRID WAS AN OVERCLAIM AND IT WAS BRIEFLY SHIPPED. 3.6 km cells drawn from a
+# 25 km product is inventing detail the instrument never measured, and it is exactly the kind
+# of thing someone who works with gridded satellite data spots at a glance. The pixelation it
+# was meant to fix was never a data problem: polygons have hard edges however small you make
+# them, and the fix is interpolation at render time.
 #
-# ⚠️ THE PRICE IS PAID AT THE POLE AND IT IS UNAVOIDABLE HERE. Sampling finely enough for
-# 55 N means 7 km cells at 80 N, where the source has nothing finer than 25 km to give, so
-# most of the file is polar cells repeating their neighbours. A latitude-dependent longitude
-# step would fix it and would make every row a different width, which the wire format and the
-# renderer both assume is not the case. Worth doing if this were a product; not worth doing
-# for the gain, which is file size rather than truth.
+# ⚠️ A LAT/LON GRID CANNOT MATCH A POLAR GRID EVERYWHERE. A degree of longitude shrinks
+# towards the pole, so any single step either undersamples the south or oversamples the north.
+# 0.75 is chosen to be honest against 25 km in the middle latitudes, where the Northwest
+# Passage actually is, and to overclaim as little as possible above that.
 #
-# ⚠️ AND THE BOUNDS MOVE WITH THE STEP. They are cell ORIGINS, so the last cell has to land
-# exactly on the pole and exactly on the antimeridian: 89.8 + 0.2 = 90.0, and
-# 179.625 + 0.375 = 180.0. Changing a step without moving its bound opens a gap at the pole
-# and a seam down the antimeridian.
-OUT_LAT_STEP, OUT_LON_STEP = 0.2, 0.375
-OUT_SOUTH, OUT_NORTH = 55.0, 89.8
-OUT_WEST, OUT_EAST = -180.0, 179.625
+# ⚠️ THE BOUNDS MOVE WITH THE STEP. They are cell ORIGINS, so the last cell must land exactly
+# on a real edge: 179.25 + 0.75 = 180.0 closes the circle.
+#
+# 🔴 AND THE NORTHERN EDGE STOPS AT 89.0, NOT AT THE POLE. A MapLibre raster source cannot
+# reach 90: mercator is infinite there, so a corner coordinate at the pole resolves to an
+# out-of-range tile and the layer does not render AT ALL. Measured by Lane B: 89.5 fails, 89.0
+# renders. The lost cap is a fraction of a degree and it sits inside the pole hole, which is
+# already drawn in its own colour as unmeasured, so nothing true is lost.
+OUT_LAT_STEP, OUT_LON_STEP = 0.25, 0.75
+OUT_SOUTH, OUT_NORTH = 55.0, 88.75
+OUT_WEST, OUT_EAST = -180.0, 179.25
 
 
 def grid_to_latlon(col: int, row: int) -> tuple[float, float]:
@@ -227,10 +237,49 @@ def sample_dates(years: int, per_month: int = 1) -> list[date]:
     return out
 
 
+def png_greyscale(width: int, height: int, raw: bytes) -> bytes:
+    """One date as an 8-bit greyscale PNG.
+
+    🔑 WHY AN IMAGE AND NOT BASE64 BYTES IN A JSON BLOB. The renderer feeds this to a raster
+    layer, which wants an image, so shipping one removes a decode step rather than adding
+    one. And because each date is its own file, a visitor downloads the 8 KB for the date on
+    screen instead of the whole five-year history before the first frame. Measured: the old
+    single-bundle payload was 1,398 KB gzipped for all 55 dates.
+
+    Hand-written for the same reason the TIFF reader and the projection are: it is thirty
+    lines against a dependency to install, pin and explain. PNG's own zlib does the work, and
+    concentration data is mostly flat, so it compresses hard.
+
+    ⚠️ GREYSCALE, NOT COLOUR, DELIBERATELY. One byte is the concentration percent, so the file
+    stays the measurement and the palette stays a rendering decision. Baking colour in would
+    make every restyle a rebuild, and every rebuild a new full copy of this data in git
+    history. The client colours it.
+    """
+    rows_out = bytearray()
+    for y in range(height):
+        rows_out.append(0)  # filter type 0: none. The data is already flat and cheap to deflate.
+        rows_out += raw[y * width : (y + 1) * width]
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(rows_out), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--years", type=int, default=5)
-    ap.add_argument("--out", type=Path, default=OUT)
     args = ap.parse_args()
 
     # Precompute the source cell each output cell samples from. Done once for every date,
@@ -298,7 +347,9 @@ def main() -> int:
         "cols": cols,
         "rows": rows,
         "dates": sorted(frames),
-        "concentration": frames,
+        # ⚠️ NO PIXEL DATA HERE. Each date is its own PNG under `ice/`, named by date, so the
+        # client fetches only what it draws. This file is the header and the figures.
+        "tiles": "ice/{date}.png",
         "extent_km2": extents,
         "poleHoleValue": 255,
         "source": {
@@ -315,10 +366,30 @@ def main() -> int:
         },
     }
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(payload, separators=(",", ":")))
-    print(f"wrote {args.out} ({args.out.stat().st_size / 1024:.0f} KB, {len(frames)} dates)",
-          file=sys.stderr)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # 🔒 CLEAR STALE DATES FIRST. A rebuild with a different date set would otherwise leave
+    # orphans behind that the index no longer lists, which is the same fault the seed script
+    # had: an output directory nobody prunes is an output directory that accumulates.
+    for stale in OUT_DIR.glob("*.png"):
+        stale.unlink()
+
+    total = 0
+    # `iso_date` rather than `day`: the fetch loop above binds `day` as a `date`, and reusing
+    # the name here for its string key made the same identifier mean two types in one
+    # function. Caught by mypy, and it is the kind of thing that reads fine until someone
+    # calls a date method on it.
+    for iso_date, encoded in frames.items():
+        data = png_greyscale(cols, rows, base64.b64decode(encoded))
+        (OUT_DIR / f"{iso_date}.png").write_bytes(data)
+        total += len(data)
+
+    OUT_INDEX.write_text(json.dumps(payload, separators=(",", ":")))
+    print(
+        f"wrote {len(frames)} PNGs to {OUT_DIR} ({total / 1024:.0f} KB total, "
+        f"{total / max(1, len(frames)) / 1024:.1f} KB per date) "
+        f"and {OUT_INDEX.name} ({OUT_INDEX.stat().st_size / 1024:.0f} KB)",
+        file=sys.stderr,
+    )
     return 0
 
 

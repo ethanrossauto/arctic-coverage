@@ -1,14 +1,19 @@
 -- Arctic Coverage schema. Two tables, and the shape of them is a design position
 -- rather than a default, so the reasoning is here rather than in a wiki nobody reads.
 --
--- THE CORE DECISION: one entities table for six kinds, not six tables.
+-- THE CORE DECISION: one entities table for every kind, not a table per kind.
+--
+-- ⚠️ Written as "every kind" rather than a number on purpose. This line said "six kinds,
+-- not six tables" while the check constraint below permitted ten, because a count in prose
+-- does not move when a kind is added. The constraint is the list; this is the argument.
 --
 -- The kinds differ a lot. A mesh node is a static point with a battery. A Ranger
 -- patrol is a route with a position along it. A vessel is a moving contact that may
 -- or may not be broadcasting. Three ways to model that:
 --
 --   * A table per kind. Honest about the differences, and then every query that
---     asks "what is near here" becomes a six-way union, which is most queries.
+--     asks "what is near here" becomes a union across every kind, which is most
+--     queries.
 --   * One table with every field as a nullable column. One query surface, and
 --     twenty mostly-null columns that no constraint can keep honest.
 --   * One table, a shared core as real columns, per-kind detail in jsonb.

@@ -14,12 +14,14 @@ under test rather than mocked past.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 # The repo root, so `api` imports the same way it does under uvicorn. pytest puts the
 # test's own directory on the path and not the project's, and doing it here keeps the fix
@@ -528,9 +530,8 @@ def test_a_replayed_selection_becomes_the_same_plan_shape_the_parser_emits(world
     provider = llm.ReplayProvider(
         {
             "anything that has not checked in lately": {
-                "data_tool": "list_entities",
+                "steps": [{"tool": "list_entities", "overdue": True}],
                 "view_tool": "none",
-                "overdue": True,
                 "reasoning": "the request is about silence, not condition",
             }
         }
@@ -545,12 +546,152 @@ def test_a_replayed_selection_becomes_the_same_plan_shape_the_parser_emits(world
     assert log[-1]["tier"] == "llm"
 
 
+def test_tier_2_can_serialize_several_actions_from_one_utterance(world, log):
+    """🔴 THE CAPABILITY THIS TIER USED TO LOSE. The parser has expanded "isolate the
+    drones" into a multi-step plan for a while and the executor has always run one, but
+    tier 2 could only ever name a single command. So the sequencing vanished the moment a
+    phrasing fell through to the model, and it looked like a partial answer rather than a
+    missing feature."""
+    provider = llm.ReplayProvider(
+        {
+            "narrow it down to the drones and then open daymark 03": {
+                "steps": [
+                    {"tool": "list_entities", "kind": "uas"},
+                    {"tool": "describe_entity", "target": "Daymark 03"},
+                ],
+                "view_tool": "none",
+                "reasoning": "two actions were named, in that order",
+            }
+        }
+    )
+    plan = provider.select("Narrow it down to the drones and then open Daymark 03").to_plan()
+
+    assert plan == [
+        {"tool": "list_entities", "params": {"kind": "uas"}},
+        {"tool": "describe_entity", "params": {"target": "Daymark 03"}},
+    ]
+    assert executor.validate(plan) == []
+
+    outcome = executor.execute(plan, source="typed", tier="llm")
+    assert [r["ok"] for r in outcome["results"]] == [True, True]
+
+    # 🔑 The audit trail is the point of serializing rather than collapsing: each step is
+    # its own row under the one command_id, so "what did that sentence actually do" is a
+    # query rather than a guess.
+    assert [row["tool"] for row in log if row["tier"] == "llm"][-2:] == [
+        "list_entities",
+        "describe_entity",
+    ]
+
+
+def test_each_step_carries_its_own_parameters(world, log):
+    """One shared parameter bag could not express a two-command answer at all: `kind` on
+    one step and `target` on the other are indistinguishable from a single filter that
+    means neither."""
+    provider = llm.ReplayProvider(
+        {
+            "x": {
+                "steps": [
+                    {"tool": "list_entities", "kind": "uas", "target": ""},
+                    {"tool": "describe_entity", "target": "Daymark 03", "kind": ""},
+                ],
+                "view_tool": "none",
+            }
+        }
+    )
+    plan = provider.select("x").to_plan()
+
+    # An empty string is how the schema says "not specified", so it must not survive as a
+    # filter that matches nothing.
+    assert plan[0]["params"] == {"kind": "uas"}
+    assert plan[1]["params"] == {"target": "Daymark 03"}
+
+
+def test_no_data_command_is_an_empty_step_list_not_a_do_nothing_step(world, log):
+    """"none" was removed from the tool enum when steps became a list. An empty array
+    already says "no data command", so a do-nothing step would be a second spelling of one
+    answer and the choice between them would be arbitrary."""
+    assert "none" not in llm.DATA_TOOLS
+
+    provider = llm.ReplayProvider(
+        {"put it back": {"steps": [], "view_tool": "reset_view", "reasoning": "purely a view request"}}
+    )
+    plan = provider.select("put it back").to_plan()
+
+    assert plan == [{"tool": "reset_view", "params": {}}]
+
+
+def test_an_over_long_chain_is_refused_out_loud_rather_than_truncated(world, log):
+    """A clamp in the selection layer would be a second opinion that silently disagrees
+    with the validator. A truncated plan that runs is worse than a whole plan refused by
+    name, because the operator is told it worked."""
+    provider = llm.ReplayProvider(
+        {
+            "everything": {
+                "steps": [{"tool": "mesh_status"} for _ in range(executor.MAX_STEPS + 1)],
+                "view_tool": "none",
+            }
+        }
+    )
+    plan = provider.select("everything").to_plan()
+
+    assert len(plan) == executor.MAX_STEPS + 1
+    reasons = executor.validate(plan)
+    assert reasons and str(executor.MAX_STEPS) in reasons[0]
+
+
+def test_the_step_limit_the_model_is_told_is_the_one_the_validator_enforces():
+    """Two constants would agree today and diverge on the first edit, which is exactly how
+    `tools.py` ended up with two definitions of `is_overdue`.
+
+    ⚠️ It is asserted on the DESCRIPTION rather than on `maxItems` because structured
+    output does not accept `maxItems` and returns a 400 for it. The limit is therefore
+    told to the model in prose and enforced by `executor.validate`, and this is what stops
+    the sentence and the check drifting apart."""
+    steps = llm.response_schema()["properties"]["steps"]
+    assert f"At most {executor.MAX_STEPS}" in steps["description"]
+
+
+def test_the_schema_uses_no_keyword_the_api_rejects():
+    """🔴 A LIVE 400 THAT THE WHOLE SUITE STAYED GREEN THROUGH. `maxItems` on the steps
+    array took tier 2 down completely and the replay provider could not see it, because a
+    fixture never sends the schema anywhere. This walks the schema for the keywords that
+    are known not to survive the trip."""
+    rejected = {"maxItems", "minItems", "minLength", "maxLength", "pattern", "format"}
+
+    def walk(node, path="schema"):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                assert key not in rejected, f"{path}.{key} is not supported by structured output"
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                walk(value, f"{path}[{i}]")
+
+    walk(llm.response_schema())
+
+
 def test_the_model_cannot_name_a_tool_outside_the_enum():
     """The security boundary is the schema, not a downstream check."""
     schema = llm.response_schema()
-    assert "delete_everything" not in schema["properties"]["data_tool"]["enum"]
-    assert set(schema["properties"]["data_tool"]["enum"]) <= set(tools.REGISTRY) | {"none"}
+    step_tools = schema["properties"]["steps"]["items"]["properties"]["tool"]["enum"]
+    assert "delete_everything" not in step_tools
+    assert set(step_tools) <= set(tools.REGISTRY)
     assert schema["additionalProperties"] is False
+    # The per-step object is closed too. An open one would let a hallucinated parameter
+    # ride along inside a step and reach the validator as an unknown key.
+    assert schema["properties"]["steps"]["items"]["additionalProperties"] is False
+
+
+def test_an_unknown_tool_survives_to_the_validator_instead_of_being_dropped(world, log):
+    """Dropping it in the selection layer would turn a refusal the operator can read into
+    a plan that quietly does less than it was asked to."""
+    provider = llm.ReplayProvider({"x": {"steps": [{"tool": "delete_everything"}], "view_tool": "none"}})
+    plan = provider.select("x").to_plan()
+
+    assert plan == [{"tool": "delete_everything", "params": {}}]
+    reasons = executor.validate(plan)
+    assert any("delete_everything" in r and "not a tool" in r for r in reasons)
 
 
 def test_every_enumerated_tool_exists_in_the_registry():
@@ -613,6 +754,40 @@ def test_out_of_scope_requests_are_recognised_and_named(utterance):
 def test_the_parser_declines_rather_than_half_matching():
     """None is what sends an utterance to tier 2. A parser that guesses steals them."""
     assert parser.parse("which of these could reach the contact before it gets dark") is None
+
+
+def test_down_is_a_condition_only_where_it_says_something_is_down():
+    """🔴 FOUND BY A LIVE CALL, NOT BY THE SUITE. Bare, `\\bdown\\b` read "narrow it down to
+    the drones" as a maintenance filter and answered with one asset, confidently and
+    wrongly. "Down" is a direction and half of a dozen phrasal verbs before it is ever a
+    condition. Same class of collision as "dark", and the same fix."""
+    for said in ("which nodes are down", "what is down", "show me anything down"):
+        assert parser.parse(said) == [
+            {"tool": "list_entities", "params": {"status": "maintenance", **({"kind": "node"} if "nodes" in said else {})}}
+        ]
+
+    # The phrasing that actually bit, plus its relatives.
+    assert parser.parse("narrow it down to the drones") is None
+    assert parser.parse("cut it down to the vessels") is None
+
+
+def test_a_sentence_naming_two_actions_goes_to_the_tier_that_can_serialize_it():
+    """Every tier-1 branch answers a single intent and returns on the first match, so a
+    two-action utterance got whichever branch was checked first and the rest vanished
+    without a word. A partial answer is worse than declining: it is not a refusal the
+    operator can react to, it just looks like the answer."""
+    assert parser.parse("show me everything that has gone quiet, then reset the view") is None
+    assert parser.parse("list the drones and then open Daymark 03") is None
+    assert parser.parse("mesh status after that show me the nodes") is None
+
+
+def test_a_plain_and_is_not_a_sequence_and_still_answers_in_tier_1():
+    """⚠️ The guard above must never fire on a bare "and". "The nodes and the drones" is
+    one request with two filters, and deferring it would push a perfectly good
+    deterministic answer onto a model, for latency and money, for nothing."""
+    assert parser.parse("show me the nodes and the drones") is not None
+    assert parser.parse("which assets are overdue") is not None
+    assert parser.parse("isolate the drones") is not None
 
 
 # --------------------------------------------------------------------------
@@ -987,3 +1162,736 @@ def test_the_spoken_vocabulary_keeps_up_with_the_commands(world, log):
         assert kind.replace("_", " ") in spoken, f"kind '{kind}' cannot be hinted"
     for flag in freshness.FLAGS:
         assert flag in spoken, f"flag '{flag}' cannot be hinted to the transcriber"
+
+
+# --------------------------------------------------------------------------
+# One connection per request
+# --------------------------------------------------------------------------
+
+
+class _FakeConn:
+    """Enough of a psycopg connection to prove the sharing rules, and nothing more."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.rollbacks = 0
+        self.commits = 0
+        self.checks = 0
+
+    def cursor(self):
+        """Enough of a cursor for the pool's `select 1` liveness check.
+
+        ⚠️ THIS METHOD IS WHY THE FIRST VERSION OF THE POOL TEST FAILED, and the failure was
+        the pool being right: with no cursor the validation raised, so every pooled
+        connection looked dead and was replaced. A double that cannot answer the question
+        production asks reports a healthy component as broken.
+        """
+        conn = self
+
+        class _Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, *args, **kwargs):
+                if conn.closed:
+                    raise RuntimeError("connection is closed")
+                conn.checks += 1
+
+        return _Cursor()
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+    # Only used by the no-scope branch, which hands the connection to `with`.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+@pytest.fixture
+def fake_connections(monkeypatch):
+    """Every `_new_connection()` hands back a fresh fake, and we keep them all."""
+    made: list[_FakeConn] = []
+
+    def factory():
+        conn = _FakeConn()
+        made.append(conn)
+        return conn
+
+    # ⚠️ THE POOL OUTLIVES A TEST, WHICH IS THE WHOLE POINT OF IT. Without clearing it, one
+    # test's fake connection is handed to the next one and the count assertions below
+    # measure the previous test instead of this one.
+    db.close_pool()
+    monkeypatch.setattr(db, "_new_connection", factory)
+    yield made
+    db.close_pool()
+
+
+def test_a_request_opens_one_connection_and_everything_shares_it(fake_connections):
+    """🔴 THE LATENCY FIX ITSELF. Neon costs about 700 ms per connection warm, one command
+    opened three in series, and a multi-step plan opens more still: every tool call and
+    every audit row paid its own handshake. The queries are against a 76-row table and
+    were never the cost."""
+    with db.request_scope():
+        with db.connect() as first:
+            pass
+        with db.connect() as second:
+            pass
+        with db.connect() as third:
+            pass
+
+    assert len(fake_connections) == 1, "a request must open exactly one connection"
+    assert first is second is third
+    # 🔑 RETURNED TO THE POOL, NOT CLOSED. Closing it would throw away the ~1 s handshake
+    # that the pool exists to stop paying, so "not closed" is the assertion that the
+    # connection outlived the request.
+    assert not fake_connections[0].closed
+    assert fake_connections[0].rollbacks == 1, "checked in dirty is checked in rolled back"
+
+
+def test_a_request_that_never_queries_opens_nothing(fake_connections):
+    """The scope is lazy on purpose. Opening one up front would move the cost rather than
+    remove it, and the static and window routes never touch the database at all."""
+    with db.request_scope():
+        pass
+
+    assert fake_connections == []
+
+
+def test_outside_a_request_every_call_owns_its_own_connection(fake_connections):
+    """Scripts, the seeder and the tests take this branch, and it behaves exactly as the
+    whole codebase did before the change."""
+    with db.connect():
+        pass
+    with db.connect():
+        pass
+
+    assert len(fake_connections) == 2
+    assert all(c.closed for c in fake_connections), (
+        "the no-scope branch owns its connection outright and must not pool it: "
+        "scripts and the seeder run there and should behave exactly as they always did"
+    )
+
+
+def test_a_failed_statement_rolls_back_so_it_cannot_poison_the_rest_of_the_request(fake_connections):
+    """🔴 THE ONE GENUINELY NEW FAILURE MODE THE SHARING INTRODUCES. Postgres refuses every
+    later statement on a connection whose transaction is aborted. Unshared, that connection
+    was thrown away and nobody noticed. Shared, the very next thing the executor does after
+    a tool raises is write the audit row explaining why, so without this the failure would
+    eat its own explanation."""
+    with db.request_scope():
+        with pytest.raises(ValueError):
+            with db.connect():
+                raise ValueError("the tool blew up")
+
+        assert fake_connections[0].rollbacks == 1
+
+        # And the connection is still usable for the audit row that follows.
+        with db.connect() as conn:
+            assert conn is fake_connections[0]
+
+    assert len(fake_connections) == 1
+
+
+def test_the_shared_branch_never_commits_on_your_behalf(fake_connections):
+    """Every writer in this codebase calls `conn.commit()` itself. Committing again at
+    block exit would silently turn a caller that deliberately did not commit into one
+    that did."""
+    with db.request_scope():
+        with db.connect():
+            pass
+
+    assert fake_connections[0].commits == 0
+
+
+# --------------------------------------------------------------------------
+# A tier-1 guess that resolves to nothing is escalated, not refused
+# --------------------------------------------------------------------------
+
+
+def test_a_referent_that_matches_nothing_is_its_own_kind_of_refusal(world, log):
+    """🔴 THE SIGNAL THE ESCALATION RIDES ON. Zero matches and many matches are opposite
+    situations: many means "I understood you, narrow it", zero means "I did not understand
+    you". They cannot share an exception type, or the API cannot tell them apart."""
+    with pytest.raises(tools.Unresolved):
+        tools.describe_entity(target="unkowns")
+
+    # Still a ToolError, so nothing that does not care about the difference changed.
+    assert issubclass(tools.Unresolved, tools.ToolError)
+    assert not issubclass(tools.Unresolved, tools.Ambiguous)
+
+
+def test_the_executor_reports_unresolved_so_the_api_can_escalate(world, log):
+    """The executor does not know which tier wrote the plan or what a model call costs, so
+    it reports the fact and declines to make the decision."""
+    outcome = executor.execute(
+        [{"tool": "describe_entity", "params": {"target": "unkowns"}}],
+        source="typed",
+        tier="parser",
+    )
+    assert outcome["unresolved"] is True
+    assert outcome["results"][0]["ok"] is False
+
+    # An ordinary refusal must NOT set it, or everything escalates.
+    ordinary = executor.execute(
+        [{"tool": "task_uas", "params": {"target": "Daymark 05", "lat": 45.0, "lon": -75.7}}],
+        source="typed",
+        tier="parser",
+    )
+    assert ordinary["unresolved"] is False
+
+
+def test_the_parser_will_not_guess_a_single_asset_from_a_plural_or_an_all(world, log):
+    """🔴 THE BUG UNDERNEATH THE TYPO, and it survives correct spelling. "show me all
+    unknowns" is a filter over many things, so `focus_entity` was the wrong tool before a
+    misspelling was ever involved."""
+    assert parser.parse("show me all unkowns") is None
+
+    # ⚠️ "unknowns" SPELLED CORRECTLY IS A REAL COMMAND NOW, and it was not when this test
+    # was written. It answers with the unidentified contacts the network actually holds,
+    # so asserting None here would pin the parser to a gap that has since been filled.
+    # The misspelling above still declines, which is the behaviour this test is about.
+    assert parser.parse("show me all unknowns") == [{"tool": "show_unknown", "params": {}}]
+    assert parser.parse("show me the unknowns") == [{"tool": "show_unknown", "params": {}}]
+
+    # A plural tail that is not a known command still declines rather than guessing.
+    assert parser.parse("show me all stragglers") is None
+
+    # And it still names a single asset when the tail really is one.
+    assert parser.parse("show me daymark 03") == [
+        {"tool": "focus_entity", "params": {"target": "daymark 03"}}
+    ]
+    assert parser.parse("find kanguk") == [
+        {"tool": "focus_entity", "params": {"target": "kanguk"}}
+    ]
+
+
+def test_a_misspelled_target_reaches_tier_2_and_the_chain_is_recorded(world, log, monkeypatch):
+    """The whole round trip: the parser guesses a name, nothing resolves, the original
+    words go to the model, and the audit log ties the second command to the first."""
+    from api import index
+
+    provider = llm.ReplayProvider(
+        {
+            "show me daymark 3": {
+                "steps": [{"tool": "describe_entity", "target": "Daymark 03"}],
+                "view_tool": "none",
+                "reasoning": "the operator meant Daymark 03",
+            }
+        }
+    )
+    monkeypatch.setattr(llm, "default_provider", lambda: provider)
+    monkeypatch.setattr(index.ratelimit, "origin_allowed", lambda origin: True)
+    monkeypatch.setattr(
+        index.ratelimit, "check", lambda ip: type("V", (), {"allowed": True})()
+    )
+
+    first = executor.execute(
+        [{"tool": "focus_entity", "params": {"target": "daymark 3"}}],
+        source="typed",
+        tier="parser",
+        utterance="show me daymark 3",
+    )
+    assert first["unresolved"] is True
+
+    req = index.CommandRequest(utterance="show me daymark 3", source="typed")
+    response = index._escalate_to_tier_two(req, first, client_ip="1.2.3.4", origin=None)
+
+    assert response is not None, "an escalation that can run must not fall back"
+    body = json.loads(bytes(response.body))
+    assert body["tier"] == "llm"
+    assert body["escalated_from"] == "parser"
+    assert body["ok"] is True
+
+    # 🔗 Every row of the escalation hangs off the first command.
+    chained = [r for r in log if r.get("parent_command_id") == first["command_id"]]
+    assert [r["tool"] for r in chained] == ["llm_select", "plan", "describe_entity"]
+
+
+def test_an_escalation_that_cannot_run_keeps_the_honest_refusal(world, log, monkeypatch):
+    """⚠️ EVERY FAILURE PATH FALLS BACK. The operator already has a true sentence saying
+    the thing they named does not exist; a rate limit or a dead model must not replace it
+    with a worse one about the escalation."""
+    from api import index
+
+    monkeypatch.setattr(index.ratelimit, "origin_allowed", lambda origin: True)
+    monkeypatch.setattr(
+        index.ratelimit, "check", lambda ip: type("V", (), {"allowed": True})()
+    )
+    # No fixture for this utterance, so the provider raises LLMUnavailable.
+    monkeypatch.setattr(llm, "default_provider", lambda: llm.ReplayProvider({}))
+
+    first = executor.execute(
+        [{"tool": "focus_entity", "params": {"target": "nonsense"}}],
+        source="typed",
+        tier="parser",
+        utterance="show me nonsense",
+    )
+    req = index.CommandRequest(utterance="show me nonsense", source="typed")
+
+    assert index._escalate_to_tier_two(req, first, client_ip="1.2.3.4", origin=None) is None
+
+
+def test_an_escalation_never_escalates_and_a_model_plan_never_bounces_back(world, log):
+    """🔒 THE LOOP GUARD. `tier == "parser"` stops a model plan going back to the model,
+    and an already-chained command stops an escalation escalating."""
+    from_llm = executor.execute(
+        [{"tool": "describe_entity", "params": {"target": "unkowns"}}],
+        source="typed",
+        tier="llm",
+    )
+    # The flag is still reported; the API's condition is what refuses to act on it.
+    assert from_llm["unresolved"] is True
+
+
+# --------------------------------------------------------------------------
+# What tier 1 did with each word
+# --------------------------------------------------------------------------
+
+
+def test_the_trace_names_the_words_the_parser_threw_away():
+    """🔴 THE BUG THIS EXISTS FOR. Two utterances differing by three words came back
+    byte-identical, because the parser matched "parties", answered that, and discarded
+    "unkown" and "on foot" without a word. A partial match presented as a complete answer
+    is the characteristic failure of a deterministic parser, and it is invisible in the
+    answer."""
+    said = "show me all unkown parties on foot"
+    trace = parser.trace(said, parser.parse(said))
+
+    assert trace["ignored"] == ["unkown", "foot"]
+    assert "parties" in trace["consumed"]
+
+
+def test_a_clean_utterance_ignores_nothing():
+    """The trace has to be quiet on the ordinary case, or it is noise nobody reads and the
+    escalation below fires on everything."""
+    for said in (
+        "show me the drones",
+        "which assets are overdue",
+        "mesh status",
+        "what is not broadcasting",
+        "reset the view",
+        "isolate the drones",
+        "place a marker at 74.1 -95.2",
+    ):
+        assert parser.trace(said, parser.parse(said))["ignored"] == [], said
+
+
+def test_a_coordinate_is_never_reported_as_a_dropped_word():
+    """⚠️ A naive tokeniser turns "-95.9" into "95" and "9" and reports both as ignored,
+    which would escalate every task and place command in the app: the one shape where
+    every character already matters."""
+    said = "send daymark 05 to 73.0 -95.9"
+    assert parser.trace(said, parser.parse(said))["ignored"] == []
+
+
+def test_a_duration_is_not_reported_as_dropped_digits():
+    """"the last 12 hours" becomes `days=0.5`, so the digits that expressed it appear
+    nowhere in the plan and would otherwise read as words the parser lost."""
+    said = "history for daymark 3 for the last 12 hours"
+    assert parser.trace(said, parser.parse(said))["ignored"] == []
+
+
+def test_a_dropped_kind_is_caught():
+    """"the nodes and the drones" is two kinds and the parser can only answer one, so it
+    silently answers the second. That is a real partial match and must show."""
+    said = "show me the nodes and the drones"
+    assert "nodes" in parser.trace(said, parser.parse(said))["ignored"]
+
+
+def test_no_plan_means_nothing_was_thrown_away():
+    """A declined utterance goes onward whole. Reporting its words as "ignored" would
+    escalate an utterance that is already being escalated."""
+    trace = parser.trace("something nobody anticipated", None)
+    assert trace["ignored"] == []
+    assert trace["matched"] is None
+
+
+def test_a_second_request_reuses_the_pooled_connection(fake_connections):
+    """🔴 THE 85% FIX. Opening a connection costs ~1.0 s measured; the query it carries
+    costs 0.13 s. The request scope cut three connections per command to one, and one per
+    request still paid the handshake. A connection that outlives the request is the only
+    thing that stops paying it."""
+    for _ in range(3):
+        with db.request_scope(), db.connect():
+            pass
+
+    assert len(fake_connections) == 1, "three requests, one handshake"
+
+
+def test_a_dead_pooled_connection_is_discarded_rather_than_handed_out(fake_connections):
+    """🔒 Neon closes idle connections on its own schedule. A pool that trusts what it
+    holds converts a slow request into a failed one, which is worse than the cost it was
+    trying to avoid."""
+    with db.request_scope(), db.connect():
+        pass
+    fake_connections[0].closed = True  # Neon hung up while it sat idle
+
+    with db.request_scope(), db.connect() as conn:
+        assert conn is not fake_connections[0]
+
+    assert len(fake_connections) == 2, "the dead one is replaced, not reused"
+
+
+def test_the_pool_is_bounded(fake_connections):
+    """An unbounded idle list is a connection leak with a friendlier name, against a
+    database that caps them."""
+    conns = [_FakeConn() for _ in range(db._POOL_MAX + 3)]
+    for c in conns:
+        db._checkin(c)
+
+    assert len(db._pool) == db._POOL_MAX
+    assert all(c.closed for c in conns if c not in db._pool), "the overflow is closed, not dropped"
+
+
+# --------------------------------------------------------------------------
+# "list them" — the previous answer
+# --------------------------------------------------------------------------
+
+RECENT = {
+    "recent": [
+        {"utterance": "how many unknown parties on foot", "summary": "3 matching", "tier": "llm",
+         "ids": ["uas-daymark-03", "uas-daymark-05"]},
+    ]
+}
+
+
+def test_them_binds_to_the_previous_answer_not_to_the_whole_world():
+    """🔴 THE BUG, VERBATIM FROM A LIVE SESSION:
+
+        > how many unknown parties on foot
+        · 3 matching
+        > list them
+        · 76 matching
+
+    "Them" reached no branch, fell through to the loose listing rule, matched no kind and
+    widened to everything. Answering a narrower question with a wider answer is the worst
+    shape of wrong available here, because 76 looks like a working command."""
+    plan = parser.parse("list them")
+    assert plan == [{"tool": "list_entities", "params": {"ids": executor.RESULT}}]
+
+    resolved = executor.resolve_context(plan, RECENT)
+    assert resolved[0]["params"]["ids"] == ["uas-daymark-03", "uas-daymark-05"]
+
+
+def test_them_actually_narrows_the_answer(world, log):
+    """End to end: the ids reach `list_entities` and it returns those two, not the world."""
+    plan = executor.resolve_context(parser.parse("show me them"), RECENT)
+    outcome = executor.execute(plan, source="typed", tier="parser")
+
+    assert outcome["results"][0]["data"]["ids"] == ["uas-daymark-03", "uas-daymark-05"]
+    assert len(WORLD) > 2, "the point is that the world is bigger than the answer"
+
+
+def test_them_with_no_previous_answer_refuses_and_says_why():
+    """⚠️ AN UNRESOLVABLE PLACEHOLDER IS A REFUSAL WITH A REASON, NEVER A SILENT DROP.
+    Dropping the parameter would widen the request back to every asset in the world, which
+    is the exact bug this branch exists to fix, reintroduced by the error path."""
+    with pytest.raises(executor.PlanRejected) as caught:
+        executor.resolve_context(parser.parse("list them"), {})
+    assert "them" in str(caught.value)
+
+    # A malformed history from the browser reads as "no previous answer", never a crash.
+    for junk in ({"recent": "nope"}, {"recent": []}, {"recent": [{"ids": "no"}]}, {"recent": [None]}):
+        with pytest.raises(executor.PlanRejected):
+            executor.resolve_context(parser.parse("list them"), junk)
+
+
+def test_an_empty_previous_answer_stays_empty(world, log):
+    """`ids=[]` must mean "those zero things", not "no filter". A truth test here would
+    turn "list them" after an empty answer into a listing of everything, which is the
+    original bug wearing a different hat."""
+    result = tools.list_entities(ids=[])
+    assert result.data["ids"] == []
+
+
+def test_frame_them_frames_rather_than_lists():
+    """Same referent, different verb. "Frame them" is a camera request and `frame_entities`
+    is the tool that takes a set."""
+    assert parser.parse("frame them") == [
+        {"tool": "frame_entities", "params": {"targets": executor.RESULT}}
+    ]
+
+
+def test_the_context_sent_to_the_model_is_bounded():
+    """🔒 It arrives from a browser and is about to be pasted into a paid API call. Three
+    turns and fifty ids is deixis; anything longer is memory, which is not what "them"
+    means."""
+    from api import index
+
+    fat = {"bbox": {"global": True}, "recent": [
+        {"utterance": "u" * 500, "summary": "s" * 500, "tier": "llm", "ids": [f"e-{i}" for i in range(500)]}
+        for _ in range(20)
+    ]}
+    trimmed = index._model_context(fat)
+
+    assert len(trimmed["recent"]) == 3
+    assert len(trimmed["recent"][0]["ids"]) == 50
+    assert len(trimmed["recent"][0]["utterance"]) == 200
+    assert trimmed["bbox"] == {"global": True}, "the rest of the context is untouched"
+
+
+def test_every_command_a_refusal_SUGGESTS_actually_works():
+    """🔴 THE SUGGESTION IS PART OF THE CLAIM. A refusal here says "I cannot do that, try
+    this instead", and the "this" is a command the operator will type next. If it does not
+    work, the refusal is two failures in one sentence and the second one is the app's own
+    fault.
+
+    ⚠️ THIS IS THE STALENESS GUARD THE LIST ASKS FOR IN ITS OWN COMMENT. One of these had
+    already gone stale: the air-traffic refusal offered "show active flights in the zoom
+    window", and "active" is a filter this world does not model, so the app's suggested
+    example was a partial match that had to go to the model. Tier 1 must answer it, or the
+    refusal is recommending the slowest path in the build.
+    """
+    quoted = []
+    for _pattern, message in parser.UNSUPPORTED:
+        quoted += re.findall(r'"([^"]+)"', message)
+
+    assert quoted, "a refusal that names nothing available is not doing its job"
+
+    for command in quoted:
+        plan = parser.parse(command)
+        assert plan is not None, f"refusal suggests {command!r}, which tier 1 cannot answer"
+        assert parser.trace(command, plan)["ignored"] == [], (
+            f"refusal suggests {command!r}, and the parser drops "
+            f"{parser.trace(command, plan)['ignored']} from it"
+        )
+        assert executor.validate(plan) == [], f"refusal suggests {command!r}, which does not validate"
+
+
+def test_flights_is_a_synonym_the_shared_table_knows():
+    """A synonym one branch knows and `KIND_WORDS` does not is invisible to everything that
+    reads the table, `trace` included. That is how a correctly-answered command came to be
+    reported as a partial match and pushed to the model."""
+    assert parser.parse("show me the flights") == [
+        {"tool": "list_entities", "params": {"kind": "aircraft"}}
+    ]
+
+
+# --------------------------------------------------------------------------
+# "show unknown" — what the console may claim to have
+# --------------------------------------------------------------------------
+
+BUCKETS = {
+    "self_reporting": ["vsl-ais-01"],
+    "tracked": ["vsl-unk-01", "air-unk-01"],
+    "detected_not_reported": ["vsl-unk-03"],
+    "untracked": ["gnd-unk-02"],
+    "counts": {"self_reporting": 1, "tracked": 2, "detected_not_reported": 1, "untracked": 1},
+}
+
+
+@pytest.fixture
+def buckets(monkeypatch):
+    """The detection layer's answer, fixed, so the tool's RULES are what is under test."""
+    fake = type("D", (), {"coverage_summary": staticmethod(lambda assets: dict(BUCKETS))})
+    monkeypatch.setattr(tools, "_detect_module", lambda: fake)
+    return BUCKETS
+
+
+def test_show_unknown_claims_only_the_contacts_the_network_actually_holds(world, log, buckets):
+    """🔴 THE THREE-WAY RULE, AND THE TWO EXCLUSIONS ARE THE POINT.
+
+        tracked                 not talking, held, the report gets home   -> YES
+        detected_not_reported   held, and the report CANNOT get home      -> no
+        untracked               nothing holds it and it is not talking    -> no
+
+    `detected_not_reported` is the counter-intuitive one and the exclusion is deliberate:
+    if the report is not reaching you, you do not have the contact. A sensor holding
+    something it cannot deliver is a link fault, not coverage."""
+    result = tools.show_unknown()
+
+    assert result.data["ids"] == ["vsl-unk-01", "air-unk-01"]
+    assert result.ui_effects["highlight"] == ["vsl-unk-01", "air-unk-01"]
+
+    # 🔒 Neither excluded bucket may reach the set the display asserts.
+    claimed = set(result.data["ids"])
+    assert "vsl-unk-03" not in claimed, "a report that cannot get home is not coverage"
+    assert "gnd-unk-02" not in claimed
+    assert "vsl-ais-01" not in claimed, "a contact announcing itself is not unknown"
+
+
+def test_the_withheld_contacts_travel_but_are_never_counted_as_covered(world, log, buckets):
+    """The reveal toggle needs them, and a second round trip for something already computed
+    would be waste. They ride in `data` and never in `ids`."""
+    result = tools.show_unknown()
+
+    assert result.data["detected_not_reported"] == ["vsl-unk-03"]
+    assert result.data["untracked"] == ["gnd-unk-02"]
+    assert result.data["counts"] == {"covered": 2, "detected_not_reported": 1, "untracked": 1}
+
+
+def test_the_answer_says_out_loud_that_it_is_withholding_some(world, log, buckets):
+    """⚠️ A display that quietly narrows what it claims is the failure this whole
+    distinction exists to prevent. Saying how many were held back costs one clause."""
+    assert "cannot be confirmed from the network alone" in tools.show_unknown().message
+
+
+def test_show_unknown_degrades_rather_than_crashing_without_the_detection_layer(world, log, monkeypatch):
+    """🔒 `detect` is imported through a try in `api/index.py` so its absence costs a field
+    and never a route. A tool that assumed it was there would undo that."""
+    monkeypatch.setattr(tools, "_detect_module", lambda: None)
+    with pytest.raises(tools.ToolError) as caught:
+        tools.show_unknown()
+    assert "what is available" in str(caught.value).lower()
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    ["show unknown", "show me the unknowns", "unknown contacts", "what is unidentified",
+     "who is out there", "show me all unknowns"],
+)
+def test_the_ways_people_ask_for_unknowns(utterance):
+    assert parser.parse(utterance) == [{"tool": "show_unknown", "params": {}}]
+    assert parser.trace(utterance, parser.parse(utterance))["ignored"] == []
+
+
+def test_not_knowing_something_is_not_a_request_for_the_contact_list():
+    """"unknown" is ordinary English in this domain, so it is matched as a request rather
+    than as a bare word. Same care "dark" needed."""
+    assert parser.parse("i do not know where it is") is None
+
+
+# --------------------------------------------------------------------------
+# Serialized actions: one request, four things done to one asset
+# --------------------------------------------------------------------------
+
+
+def test_isolating_a_named_asset_does_all_four_things_in_one_request(world, log):
+    """🔴 THE SHAPE A SERIALIZED ACTION IS SUPPOSED TO HAVE: adjust the frame, filter the
+    picture, isolate the asset, open its details. It used to do three of the four, and the
+    missing one was the FILTER, because filtering to one asset needs its id and the parser
+    only ever had the words the operator typed."""
+    plan = parser.parse("isolate daymark 03")
+    assert [s["tool"] for s in plan] == ["focus_entity", "list_entities", "describe_entity"]
+    assert executor.validate(plan) == []
+
+    outcome = executor.execute(plan, source="typed", tier="parser")
+    assert [r["ok"] for r in outcome["results"]] == [True, True, True]
+
+    effects = outcome["ui_effects"]
+    assert "camera" in effects, "adjusts frame"
+    assert "select" in effects, "isolates the asset"
+    # Filters: the middle step narrowed the world to exactly that one asset.
+    assert outcome["results"][1]["data"]["ids"] == ["uas-daymark-03"]
+    assert outcome["results"][2]["message"].startswith("Daymark 03"), "opens details"
+
+
+def test_the_subject_is_bound_from_the_step_that_resolved_it(world, log):
+    """The parser cannot know the id and must not: working from words alone is what lets it
+    be tested with no database. So the placeholder is bound between steps, at the only
+    moment the id exists."""
+    plan = parser.parse("isolate daymark 03")
+
+    # Still a placeholder on the way in.
+    assert plan[1]["params"]["ids"] == [executor.SUBJECT]
+    assert plan[2]["params"]["target"] == executor.SUBJECT
+
+    executor.execute(plan, source="typed", tier="parser")
+
+    # The audit log records what actually RAN, so the placeholder must be gone from it.
+    ran = [r for r in log if r.get("tool") in ("list_entities", "describe_entity")][-2:]
+    assert all(executor.SUBJECT not in json.dumps(r["params"]) for r in ran)
+
+
+def test_the_subject_is_the_FIRST_asset_named_not_the_latest():
+    """Letting a later step move the target would make a chain mean different things
+    depending on how far through it you looked."""
+    assert executor._bind_subject({"target": executor.SUBJECT}, "a-1") == {"target": "a-1"}
+    assert executor._bind_subject({"ids": [executor.SUBJECT]}, "a-1") == {"ids": ["a-1"]}
+    # Nothing resolved yet: left alone, so it reaches the tool and is refused by name
+    # rather than quietly widening to everything.
+    assert executor._bind_subject({"ids": [executor.SUBJECT]}, None) == {"ids": [executor.SUBJECT]}
+
+
+def test_an_unbound_subject_is_refused_rather_than_widening(world, log):
+    """⚠️ THE DANGEROUS FAILURE WOULD BE SILENT. If the placeholder were dropped instead of
+    passed through, `list_entities` would run with no filter and return the whole world in
+    answer to a request about one asset."""
+    outcome = executor.execute(
+        [{"tool": "list_entities", "params": {"ids": [executor.SUBJECT]}}],
+        source="typed",
+        tier="parser",
+    )
+    assert outcome["results"][0]["data"]["ids"] == [], "matches nothing, rather than everything"
+
+
+def test_isolating_a_kind_still_filters_and_frames(world, log):
+    """A kind has no single asset to select or open, so that branch stays two steps. The
+    four-action shape is about a named asset."""
+    plan = parser.parse("isolate the drones")
+    assert [s["tool"] for s in plan] == ["list_entities", "frame_entities"]
+
+
+def test_the_trace_reports_the_parameters_it_inferred():
+    """🔴 THE HALF NOBODY CAN SEE. The transcript already shows what was heard, so a misread
+    word is on screen. What is not on screen is what the parser made of it: a voice test
+    heard "which assets are overdue" as "Hydrophone Lancaster Sound 01 overdue", and the
+    whole difference between the right answer and the wrong one was an unannounced
+    `kind="hydrophone"`."""
+    said = parser.trace("which assets are overdue", parser.parse("which assets are overdue"))
+    misheard_text = "Hydrophone Lancaster Sound 01 overdue"
+    misheard = parser.trace(misheard_text, parser.parse(misheard_text))
+
+    assert said["extracted"] == {"overdue": True}
+    assert misheard["extracted"] == {"overdue": True, "kind": "hydrophone"}
+
+
+def test_a_placeholder_never_hides_the_value_the_operator_would_recognise():
+    """"Isolate daymark 01" resolves its own subject, so later steps carry `__subject__` on
+    the same key the first step carried "daymark 01". Letting the last write win would show
+    the operator an internal token instead of the name they said."""
+    trace = parser.trace("isolate daymark 01", parser.parse("isolate daymark 01"))
+    assert trace["extracted"]["target"] == "daymark 01"
+
+
+def test_a_declined_utterance_extracts_nothing():
+    assert parser.trace("something nobody anticipated", None)["extracted"] == {}
+
+
+def test_the_parser_trace_survives_an_escalation_to_tier_2(world, log, monkeypatch):
+    """🔴 THE REASON FOR THE CALL IS MORE USEFUL THAN THE CALL. Overwriting `thinking`
+    wholesale threw the trace away in exactly the case it was built for: a partial match.
+    A mis-transcription escalated because tier 1 could not place three of the operator's
+    words, and the response showed the model's reasoning with no hint that had happened."""
+    from api import index
+
+    provider = llm.ReplayProvider(
+        {
+            "hydrophone lancaster sound 01 overdue": {
+                "steps": [{"tool": "describe_entity", "target": "Hydrophone Lancaster Sound 01"}],
+                "view_tool": "none",
+                "reasoning": "a specific hydrophone is named",
+            }
+        }
+    )
+    monkeypatch.setattr(llm, "default_provider", lambda: provider)
+    monkeypatch.setattr(index.ratelimit, "origin_allowed", lambda origin: True)
+    monkeypatch.setattr(index.ratelimit, "check", lambda ip: type("V", (), {"allowed": True})())
+
+    client = TestClient(index.app)
+    body = client.post(
+        "/api/command",
+        json={"utterance": "Hydrophone Lancaster Sound 01 overdue", "source": "voice"},
+    ).json()
+
+    thinking = body["thinking"]
+    assert thinking["tier"] == "llm"
+    assert thinking["reasoning"], "the model still explains itself"
+
+    handed = thinking.get("parser")
+    assert handed, "the trace that explains WHY the model was called must survive"
+    assert handed["ignored"] == ["lancaster", "sound", "01"]
+    assert handed["extracted"] == {"overdue": True, "kind": "hydrophone"}

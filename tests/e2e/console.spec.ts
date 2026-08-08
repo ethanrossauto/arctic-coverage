@@ -53,8 +53,12 @@ test("the basemap and the world both load, and nothing is fetched off-origin", a
   );
   // The ice is a vendored file rather than an endpoint, and that is the point: the
   // measurements ship with the app, so no service can be down for them.
+  //
+  // ⚠️ Matches the INDEX, not a date. The payload is now one small header file plus a PNG
+  // per date fetched on demand, so waiting on a particular date's image would be waiting on
+  // whichever one the app happens to open with.
   const gotIce = page.waitForResponse(
-    (r) => r.url().includes("/data/ice.json") && r.status() === 200,
+    (r) => r.url().includes("/data/ice-index.json") && r.status() === 200,
   );
 
   pageOrigin = new URL(test.info().project.use.baseURL!).origin;
@@ -63,7 +67,17 @@ test("the basemap and the world both load, and nothing is fetched off-origin", a
   const entities = await (await gotEntities).json();
   const ice = await (await gotIce).json();
 
-  expect(entities.entities.length, "seeded entities").toBe(68);
+  // ⚠️ NOT A HARDCODED COUNT. This said `toBe(68)` and went red the moment the world grew
+  // to 76, which is the same rot the schema comment and the module docstring both carried:
+  // a number written down by hand does not move when a kind is added.
+  //
+  // What the test is actually for is catching a truncated or partial load, and the payload
+  // can answer that about itself. A floor catches an empty world without encoding a figure
+  // that changes every time the seed does.
+  expect(entities.entities.length, "the payload must agree with its own count").toBe(
+    entities.count,
+  );
+  expect(entities.entities.length, "a seeded world").toBeGreaterThan(50);
   expect(ice.kind, "the ice layer must be measured, never modelled").toBe("measured");
   expect(ice.dates.length, "vendored measurement dates").toBeGreaterThan(50);
 

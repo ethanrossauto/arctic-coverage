@@ -70,6 +70,12 @@ export default defineConfig({
     },
   ],
 
+  // ⚠️ `reuseExistingServer` MEANS `env` ONLY APPLIES TO A SERVER THIS CONFIG STARTS. If an
+  // API server is already running from a development session, it keeps whatever environment
+  // it was launched with, so the idle reset below is still armed and the flake can still
+  // happen locally. Restart the API before a run that has to be trustworthy. In CI nothing
+  // is running yet, so it always applies.
+  //
   // Skipped when pointing at a deployed URL: there is nothing local to start.
   webServer: process.env.PLAYWRIGHT_BASE_URL ? undefined : [
     {
@@ -77,6 +83,17 @@ export default defineConfig({
       url: "http://127.0.0.1:8000/api/healthz",
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
+      // 🔴 THE WORLD MUST NOT RESET UNDER A RUNNING SUITE. The server resets to seed after
+      // five minutes with no COMMAND, and a browser suite issues none: it only reads. This
+      // suite takes about three and a half minutes and the clock does not stop between
+      // runs, so a reset lands partway through, rewrites every `last_heard` and re-anchors
+      // motion, and whichever test is mid-assertion fails.
+      //
+      // ⚠️ A TEST THAT FAILS ONLY IN COMPANY IS THE EXPENSIVE KIND, because the obvious
+      // reading is that the test is wrong. It cost real time before it was diagnosed: the
+      // radar test passed alone and failed in a full run, and the data was correct both
+      // times. Zero disables the reset entirely.
+      env: { IDLE_RESET_MINUTES: "0" },
     },
     {
       command: "npm run dev -- --host 127.0.0.1 --port 5173",

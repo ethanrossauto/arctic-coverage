@@ -22,11 +22,19 @@ Steps that already ran have already committed (`db.insert_entity` commits per ca
 there is no rollback and this layer does not pretend to offer one. Atomicity is a
 property of the CHECK, not of the WRITE.
 
-Making it transactional would mean one connection held open across every step of a plan,
-with every tool taking a cursor it does not otherwise need, to buy something the shape of
-the plans does not really call for: the writing tools are `place_asset` and `task_uas`,
-and no plan the parser or the model produces contains two of them. That is a reason to
-leave it, not a reason to claim it was never a gap.
+🔴 THE REASON THIS PARAGRAPH USED TO GIVE HAS EXPIRED, AND THAT IS WORTH RECORDING RATHER
+THAN QUIETLY REWRITING. It said making execution transactional "would mean one connection
+held open across every step of a plan", and treated that as the prohibitive cost. As of the
+per-request connection in `db.py`, **that is exactly what already happens**: one connection
+is held for the whole request, so every step of a plan shares it. The obstacle named here
+was removed by a change made for an unrelated reason, latency, and nothing pointed that out.
+
+What actually stands in the way now is smaller and different: every writer calls
+`conn.commit()` for itself, so a plan-level transaction would mean taking that decision away
+from the tools. And the shape argument is unchanged and still the real one: the writing
+tools are `place_asset` and `task_uas`, and no plan either tier produces contains two of
+them, so there is no partial write to roll back. That is a reason to leave it, not a reason
+to claim it was never a gap.
 """
 from __future__ import annotations
 
@@ -37,7 +45,7 @@ import uuid
 from typing import Any
 
 from . import db
-from .tools import REGISTRY, Ambiguous, ToolError, ToolResult
+from .tools import REGISTRY, Ambiguous, ToolError, ToolResult, Unresolved
 
 # A plan longer than this is not a plan, it is a loop, and the model does not get one.
 MAX_STEPS = 8
@@ -143,6 +151,32 @@ def _required(fn: Any) -> list[str]:
 VIEWPORT = "__viewport__"
 SELECTION = "__selected__"
 
+# 🔴 WHAT THE LAST COMMAND ANSWERED WITH. "List them" means the three things you just
+# showed me, and until this existed it meant nothing at all: the placeholder was absent,
+# "them" bound to no state, and the request widened silently to the whole world.
+#
+#   > how many unknown parties on foot
+#   · 3 matching
+#   > list them
+#   · 76 matching
+#
+# 🔑 BOUND TO THE PREVIOUS RESULT SET, NOT TO THE PREVIOUS SENTENCE. Re-parsing the earlier
+# utterance would be a second guess at a question that has already been answered exactly;
+# the ids that came back are the only true record of what "them" refers to.
+RESULT = "__result__"
+
+# 🔴 THE ASSET THIS PLAN IS ABOUT, once one of its own steps has resolved it. The other
+# three placeholders are answered by the CLIENT: the viewport and the selection come in on
+# the context, and the previous result set comes in on the history. This one is answered by
+# the plan itself, mid-flight.
+#
+# It is what lets one request do all four of the things a serialized action is supposed to
+# do to a named asset. "Isolate Daymark 01" means: put the camera on it, filter the picture
+# to it, select it, and open its detail. The filter step needs the asset's id, the parser
+# only ever had the words "daymark 01", and the id does not exist until a step has run. So
+# the first step to name an asset fixes the subject and the rest of the plan refers to it.
+SUBJECT = "__subject__"
+
 # The words people actually use for the thing they are looking at. Deixis is not a corner
 # case in a map application: "this", "it", "that one" are how anyone refers to the asset
 # they just clicked, and a system that cannot resolve them forces the operator to type a
@@ -159,6 +193,100 @@ DEICTIC = {
     "the selection",
     "selected",
 }
+
+
+# The plural half of deixis. Kept apart from `DEICTIC` because they resolve against
+# different state and fail with different advice: "this" means the selection and is fixed
+# by clicking something, "them" means the last answer and is fixed by asking for one.
+PLURAL_DEICTIC = {
+    "them",
+    "those",
+    "these",
+    "they",
+    "the last lot",
+    "the last ones",
+    "that list",
+    "the list",
+    "the results",
+    "those ones",
+    "the same ones",
+}
+
+
+def _last_result_ids(context: dict[str, Any]) -> list[str]:
+    """The entity ids the previous command answered with.
+
+    🔒 READ FROM THE CLIENT'S `recent` HISTORY, NEWEST LAST, AND ONLY THE LAST ONE. "Them"
+    never reaches two turns back: an operator who says it means the thing on the screen in
+    front of them. Anything longer would be memory, and this is deixis.
+
+    ⚠️ SHAPE-CHECKED RATHER THAN TRUSTED. This comes from the browser, so a malformed entry
+    must read as "no previous answer" and produce the honest refusal, never an exception
+    from inside a parameter substitution.
+    """
+    recent = context.get("recent")
+    if not isinstance(recent, list) or not recent:
+        return []
+    last = recent[-1]
+    if not isinstance(last, dict):
+        return []
+    ids = last.get("ids")
+    if not isinstance(ids, list):
+        return []
+    return [i for i in ids if isinstance(i, str) and i]
+
+
+def _bind_subject(params: dict[str, Any], subject: str | None) -> dict[str, Any]:
+    """Replace the SUBJECT placeholder with the asset this plan has already resolved.
+
+    🔑 IT BINDS AT RUN TIME, WHICH IS THE ONLY TIME IT CAN. The parser knows the operator
+    typed "daymark 01"; it does not know which row that is, and it must not, because
+    working from words alone is what lets it be tested with no database. The id only exists
+    once a step has run, so the substitution happens here, between steps.
+
+    ⚠️ SCALAR OR INSIDE A LIST, because the tools differ: `describe_entity` takes one
+    `target`, `list_entities` takes a list of `ids`. Matching on the placeholder VALUE
+    rather than on the parameter name means neither this function nor the parser needs a
+    table of which parameters are plural.
+
+    An unbound placeholder is left exactly as it is. It then reaches the tool as the literal
+    string, resolves to nothing, and is refused by name, which is a visible failure rather
+    than a step that quietly widened to everything.
+    """
+    if subject is None:
+        return dict(params)
+    bound: dict[str, Any] = {}
+    for key, value in params.items():
+        if value == SUBJECT:
+            bound[key] = subject
+        elif isinstance(value, list):
+            bound[key] = [subject if v == SUBJECT else v for v in value]
+        else:
+            bound[key] = value
+    return bound
+
+
+def _with_ids(result: ToolResult) -> dict[str, Any]:
+    """Guarantee `data.ids` on any result that names an entity.
+
+    🔴 ONE PLACE, NOT EIGHT. Only `list_entities` and `show_unknown` filled this in, and
+    every other entity-bearing tool left it out: `describe_entity`, `focus_entity`,
+    `entity_history`, `place_asset` and the four writers all know exactly which asset they
+    acted on and none of them said so in a field anybody could read generically.
+
+    🔑 WHY IT MATTERS BEYOND TIDINESS. `data.ids` is what the client accumulates into the
+    conversation history, and it is what "list them" binds to. Without this, "tell me about
+    Daymark 03" followed by "frame them" has nothing to point at, so a perfectly reasonable
+    two-turn exchange dies on a tool that simply forgot to mention its own subject.
+
+    ⚠️ IT NEVER OVERWRITES. A tool that already reports its ids is authoritative, including
+    when it reports an EMPTY list: "those zero things" is an answer, and replacing it with
+    the entity_id would turn an empty answer into a one-item one.
+    """
+    data = dict(result.data)
+    if "ids" not in data and result.entity_id:
+        data["ids"] = [result.entity_id]
+    return data
 
 
 def resolve_context(
@@ -191,6 +319,16 @@ def resolve_context(
                          "window' has nothing to mean. Try naming a kind instead"]
                     )
                 params[key] = bbox
+            elif value == RESULT or (
+                isinstance(value, str) and value.strip().lower() in PLURAL_DEICTIC
+            ):
+                ids = _last_result_ids(context)
+                if not ids:
+                    raise PlanRejected(
+                        ["I do not have a previous answer to point at, so 'them' has "
+                         "nothing to mean yet. Ask for something first"]
+                    )
+                params[key] = ids
             elif value == SELECTION or (
                 isinstance(value, str) and value.strip().lower() in DEICTIC
             ):
@@ -263,9 +401,11 @@ def execute(
     # selection if there was one, then the plan, then what the plan did. Reading a
     # command_id top to bottom now reads as a chain.
     #
-    # ⚠️ The cost is one more connection per command, because `db.log_event` opens its
-    # own. That is a pre-existing property of the logging layer rather than something this
-    # row introduces, and a batched writer is the fix if it ever matters.
+    # ✅ THIS USED TO WARN THAT THE ROW COST ONE MORE CONNECTION, because `db.log_event`
+    # opened its own. It no longer does: `db.request_scope` holds one connection for the
+    # whole request and every audit write shares it. Kept as a correction rather than
+    # deleted, because the warning read as a standing cost of logging and it was really a
+    # property of how connections were managed two layers down.
     db.log_event(
         tool="plan",
         source=source,
@@ -279,10 +419,16 @@ def execute(
 
     results: list[dict[str, Any]] = []
     merged_effects: dict[str, Any] = {}
+    # Set only by an `Unresolved` refusal below. Reported in the outcome so the API can
+    # decide whether to escalate the utterance to tier 2 instead of showing a dead end.
+    unresolved = False
+    unresolved_ref: dict[str, Any] | None = None
+    # The asset this plan has resolved, once any step has named one. See SUBJECT.
+    subject: str | None = None
 
     for index, step in enumerate(plan):
         name = step["tool"]
-        params = step.get("params", {})
+        params = _bind_subject(step.get("params", {}), subject)
         spec = REGISTRY[name]
         started = time.perf_counter()
 
@@ -301,8 +447,16 @@ def execute(
                 entity_id=result.entity_id,
                 latency_ms=elapsed,
             )
-            results.append({"tool": name, "ok": True, "message": result.message, "data": result.data})
+            results.append(
+                {"tool": name, "ok": True, "message": result.message, "data": _with_ids(result)}
+            )
             merged_effects.update(result.ui_effects)
+            # 🔑 THE FIRST STEP TO NAME AN ASSET FIXES THE SUBJECT FOR THE REST OF THE PLAN.
+            # First rather than latest, deliberately: the steps after it are meant to be
+            # about the same thing, and letting a later step move the target would make a
+            # chain mean different things depending on how far through it you looked.
+            if subject is None and result.entity_id:
+                subject = result.entity_id
 
         except Ambiguous as exc:
             # 🔑 THE ONE REFUSAL THAT IS A QUESTION. Everything else the executor
@@ -350,6 +504,15 @@ def execute(
                 latency_ms=elapsed,
             )
             results.append({"tool": name, "ok": False, "message": str(exc)})
+            # 🔑 REPORTED, NOT DECIDED HERE. The executor does not know which tier wrote
+            # this plan or whether re-running the utterance is affordable, so it says what
+            # happened and lets the API decide. A referent that matched nothing is the one
+            # refusal worth escalating rather than showing.
+            if isinstance(exc, Unresolved):
+                unresolved = True
+                # The query that failed and everything that does exist, carried
+                # through so the escalated model call knows more than the first one.
+                unresolved_ref = {"query": exc.query, "available": exc.available}
             # ⚠️ STOP HERE. Later steps share referents with this one, so continuing
             # would act on assumptions this refusal just invalidated.
             break
@@ -401,6 +564,10 @@ def execute(
         # holds the one that did. Two accounts of the same command is the thing this
         # layer exists to prevent.
         "plan": plan,
+        # 🔑 "a referent matched nothing", which is a different thing from "this was
+        # refused". The API escalates on it when the plan came from the parser.
+        "unresolved": unresolved,
+        "unresolved_ref": unresolved_ref,
     }
 
 

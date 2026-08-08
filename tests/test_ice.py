@@ -15,24 +15,73 @@ Runs with no credentials, no network and no database: everything it reads is in 
 """
 from __future__ import annotations
 
-import base64
 import json
+import struct
+import zlib
+from functools import cache
 from pathlib import Path
 
 import pytest
 
-ICE = Path(__file__).resolve().parents[1] / "public" / "data" / "ice.json"
+DATA = Path(__file__).resolve().parents[1] / "public" / "data"
+ICE_INDEX = DATA / "ice-index.json"
+ICE_DIR = DATA / "ice"
 
 
 @pytest.fixture(scope="module")
 def ice() -> dict:
-    if not ICE.exists():
-        pytest.skip(f"{ICE} is not built; run scripts/build_ice_history.py")
-    return json.loads(ICE.read_text())
+    if not ICE_INDEX.exists():
+        pytest.skip(f"{ICE_INDEX} is not built; run scripts/build_ice_history.py")
+    return json.loads(ICE_INDEX.read_text())
+
+
+@cache
+def _decode_png(path: str) -> tuple[int, int, bytes]:
+    """Decode one 8-bit greyscale PNG back to raw pixels.
+
+    🔑 THIS DOUBLES AS A CHECK ON THE ENCODER. It asserts the header really says 8-bit
+    greyscale and that every row uses filter type 0, which is what the build claims to
+    write. A test that decoded leniently would pass on a file no raster layer could read.
+
+    Deliberately not a general PNG reader: it handles exactly the one shape this project
+    produces, and anything else fails loudly rather than being quietly coerced.
+    """
+    raw = Path(path).read_bytes()
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
+
+    pos, width, height, idat = 8, 0, 0, bytearray()
+    while pos < len(raw):
+        (length,) = struct.unpack(">I", raw[pos : pos + 4])
+        tag = raw[pos + 4 : pos + 8]
+        body = raw[pos + 8 : pos + 8 + length]
+        if tag == b"IHDR":
+            width, height, depth, colour = struct.unpack(">IIBB", body[:10])
+            assert depth == 8, f"{path} is {depth}-bit, expected 8"
+            assert colour == 0, f"{path} colour type {colour}, expected 0 (greyscale)"
+        elif tag == b"IDAT":
+            idat += body
+        elif tag == b"IEND":
+            break
+        pos += 12 + length
+
+    flat = zlib.decompress(bytes(idat))
+    stride = width + 1
+    assert len(flat) == stride * height, f"{path} has the wrong number of scanlines"
+
+    out = bytearray()
+    for y in range(height):
+        row = flat[y * stride : (y + 1) * stride]
+        assert row[0] == 0, f"{path} row {y} uses filter {row[0]}, expected 0"
+        out += row[1:]
+    return width, height, bytes(out)
 
 
 def cells(ice: dict, date: str) -> bytes:
-    return base64.b64decode(ice["concentration"][date])
+    width, height, pixels = _decode_png(str(ICE_DIR / f"{date}.png"))
+    assert (width, height) == (ice["cols"], ice["rows"]), (
+        f"{date}.png is {width}x{height} but the index declares {ice['cols']}x{ice['rows']}"
+    )
+    return pixels
 
 
 def value_at(ice: dict, date: str, lat: float, lon: float) -> int:
@@ -63,6 +112,32 @@ def test_one_measurement_per_month_over_five_years(ice):
     months = {d[:7] for d in dates}
     assert len(months) == len(dates), "two measurements fall in the same month"
     assert 55 <= len(dates) <= 61, f"expected about five years of months, got {len(dates)}"
+
+
+def test_every_declared_date_has_a_file_and_nothing_is_orphaned(ice):
+    """The index and the directory must agree in both directions.
+
+    A date in the index with no file is a broken request at runtime. A file with no index
+    entry is dead weight in a repo that publishes, and it is what happens when a rebuild
+    changes the date set and nobody prunes.
+    """
+    declared = set(ice["dates"])
+    on_disk = {p.stem for p in ICE_DIR.glob("*.png")}
+    assert declared - on_disk == set(), f"declared but missing: {sorted(declared - on_disk)}"
+    assert on_disk - declared == set(), f"orphaned files: {sorted(on_disk - declared)}"
+
+
+def test_the_northern_edge_stops_short_of_the_pole(ice):
+    """🔴 A MapLibre raster source cannot reach 90 N.
+
+    Mercator is infinite at the pole, so a corner coordinate there resolves to an
+    out-of-range tile and the layer does not render AT ALL. Measured: 89.5 fails, 89.0
+    renders. This pins the bound so a future change to the step cannot quietly push the top
+    edge back over it and blank the whole layer.
+    """
+    lat0 = ice["origin"][1]
+    top = lat0 + ice["step"][1] * ice["rows"]
+    assert top <= 89.0, f"the grid reaches {top} N; a raster source cannot render past 89.0"
 
 
 def test_every_date_decodes_to_exactly_the_declared_grid(ice):
@@ -163,13 +238,57 @@ def test_reliably_frozen_water_is_frozen_in_march(ice, name, lat, lon):
         assert v >= 80, f"{name} reports only {v}% ice on {d}"
 
 
-def test_the_pole_hole_is_present_and_is_not_ice_free(ice):
+def test_the_grid_stops_at_the_last_latitude_a_raster_source_will_render(ice):
+    """🔴 A MapLibre raster source cannot reach the pole.
+
+    Mercator is infinite at 90 N, so a corner coordinate there resolves to an out-of-range
+    tile and the layer does not draw AT ALL. Measured by Lane B on the live page: 89.5 fails,
+    89.0 renders. This pins the bound so a later change to the step cannot quietly push the
+    top edge over it and blank the entire ice layer with no error anywhere.
+    """
+    top = ice["origin"][1] + ice["step"][1] * ice["rows"]
+    assert top <= 89.0, f"the grid reaches {top} N; a raster source cannot render past 89.0"
+
+
+def test_the_pole_hole_appears_only_where_the_source_has_one_and_only_at_the_top(ice):
     """The satellite cannot see the pole, and unmeasured is not the same as open water.
 
-    Rendering the hole as ocean would be inventing a measurement, in the one place the
-    instrument is guaranteed to have none.
+    🔴 THE HOLE IS NOT THE SAME SIZE THROUGHOUT THE RECORD, which this test found rather
+    than assumed. Measured across all 55 vendored dates:
+
+        2022, 2023, 2024   no hole cell falls inside this grid at all
+        2025, 2026         every date has one, reaching down to 88.5 N
+
+    The split is clean at 2025-01, which is the signature of a change in the source product
+    rather than anything seasonal. Whatever the cause, the consequence for the display is
+    concrete and worth stating: **older dates legitimately show no pole hole, newer ones do.**
+    Anything drawing a legend entry for it has to tolerate its absence rather than treating an
+    empty result as a decode failure.
+
+    ⚠️ Asserting the hole is ALWAYS present is what this test used to do, and it was wrong for
+    36 of the 55 dates. Asserting it is always absent would now be wrong for the other 19. The
+    checkable property is that where it appears, it appears at the TOP, because a projection
+    or resample error is exactly what would scatter it.
     """
     hole = ice["poleHoleValue"]
-    assert hole > 100, "the pole hole must be distinguishable from any concentration"
+    assert hole > 100, "the sentinel must stay distinguishable from any concentration"
+
+    cols, lat0, dlat = ice["cols"], ice["origin"][1], ice["step"][1]
+    seen_any = False
     for d in ice["dates"]:
-        assert hole in set(cells(ice, d)), f"{d} has no pole hole at all"
+        px = cells(ice, d)
+        rows_with = [j for j in range(ice["rows"]) if hole in set(px[j * cols : (j + 1) * cols])]
+        if not rows_with:
+            continue
+        seen_any = True
+        lowest = lat0 + dlat * min(rows_with)
+        assert lowest >= 88.0, (
+            f"{d} has an unmeasured cell at {lowest:.2f} N. The pole hole cannot reach that "
+            f"far south, so this is a projection or resample error putting it in the wrong place."
+        )
+
+    assert seen_any, (
+        "no date carries the pole hole at all. That was true while the grid stopped at 84 N "
+        "and it made the legend describe something never drawn; if it is true again, either "
+        "the northern bound moved down or the sentinel stopped being written."
+    )

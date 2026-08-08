@@ -24,6 +24,7 @@ grep finds it.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -52,6 +53,25 @@ app = FastAPI(
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
+
+
+@app.middleware("http")
+async def one_connection_per_request(request: Request, call_next: Any) -> Any:
+    """Hold a single database connection open for the whole request.
+
+    🔴 THIS IS THE LATENCY FIX, AND THE MEASUREMENT IS WHY IT EXISTS. Neon scales to zero
+    and every fresh connection costs about 700 ms warm. One command opened three of them in
+    series before this, and a multi-step plan opens more: every tool call and every audit
+    row paid its own handshake. The queries themselves run against a 76-row table and are
+    not the cost.
+
+    ⚠️ MIDDLEWARE RATHER THAN A DECORATOR ON EACH ROUTE. A route added later inherits it
+    without knowing it exists, which is the only version of this that stays true after
+    somebody adds an endpoint in a hurry. The scope opens nothing by itself, so a request
+    that never touches the database still pays nothing.
+    """
+    with db.request_scope():
+        return await call_next(request)
 
 
 @app.get("/api/healthz")
@@ -183,9 +203,8 @@ def _add_tracking(rows: list[dict]) -> None:
 def mesh() -> JSONResponse:
     """Who can currently talk to whom, computed from live positions.
 
-    Derived per request and never stored, the same treatment satellite passes get. A
-    stored graph is a second source of truth that goes stale the moment an entity moves,
-    and everything here moves.
+    Derived per request and never stored. A stored graph is a second source of truth that
+    goes stale the moment an entity moves, and everything here moves.
 
     Read-only, so it is not logged, for the same reason `/api/entities` is not: the audit
     trail records actions taken, and looking at the world is not one.
@@ -231,6 +250,66 @@ def _mesh_model() -> dict:
     }
 
 
+def _model_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The context, bounded, before it is serialised into a prompt.
+
+    🔑 A FOLLOW-UP NEEDS THE THREAD. "Now just the ones on foot" is meaningless without the
+    turn before it, so the recent history goes to the model as well as to the placeholder
+    resolver.
+
+    🔒 BOUNDED HERE BECAUSE IT ARRIVES FROM A BROWSER. Everything in `context` is client
+    input, and it is about to be pasted into a paid API call: an oversized `recent` costs
+    tokens on every request and pushes the instructions further from the question. Three
+    turns and fifty ids is deixis, which is all this is for. Anything longer would be
+    memory, and memory is not what "them" means.
+    """
+    if not context:
+        return context
+    trimmed = dict(context)
+    recent = trimmed.get("recent")
+    if isinstance(recent, list):
+        turns = []
+        for turn in recent[-3:]:
+            if not isinstance(turn, dict):
+                continue
+            ids = turn.get("ids")
+            turns.append(
+                {
+                    "utterance": str(turn.get("utterance", ""))[:200],
+                    "summary": str(turn.get("summary", ""))[:200],
+                    "tier": turn.get("tier"),
+                    "ids": [i for i in ids if isinstance(i, str)][:50] if isinstance(ids, list) else [],
+                }
+            )
+        trimmed["recent"] = turns
+    return trimmed
+
+
+def _tier_two_blocked(
+    *, client_ip: str | None, origin: str | None, utterance: str | None, source: str
+) -> str | None:
+    """Why the model must not be called right now, or None if it may be.
+
+    🔑 ONE GUARD, TWO ENTRY POINTS. Tier 2 is reached either because the parser did not
+    recognise an utterance at all, or because a parser plan turned out to name something
+    that does not exist. Both cost the same money and both have to be metered the same
+    way, and the surest way to end up with one of them unmetered is to write the check
+    out twice.
+    """
+    if not ratelimit.origin_allowed(origin):
+        return "the reasoning layer is not available from this origin"
+    verdict = ratelimit.check(client_ip)
+    if not verdict.allowed:
+        db.log_event(
+            tool="rate_limited", source=source, result="rejected",
+            params={"utterance": utterance, "scope": verdict.scope,
+                    "used": verdict.used, "limit": verdict.limit},
+            detail=verdict.reason,
+        )
+        return verdict.reason
+    return None
+
+
 class CommandRequest(BaseModel):
     """What the client sends for every command, typed or from a button.
 
@@ -269,6 +348,10 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
 
     tier: str | None = None
     plan = req.plan
+    # A button posts a plan directly and no tier reasoned about it, so there is nothing
+    # to show. Initialised here rather than inside the utterance branch, because a name
+    # that exists on only one path is a NameError waiting for the other one.
+    thinking: dict[str, Any] = {"tier": None}
 
     if plan is None:
         if not req.utterance:
@@ -293,6 +376,27 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
 
         plan = parser.parse(req.utterance)
         tier = "parser"
+        thinking = parser.trace(req.utterance, plan)
+
+        # 🔴 A PARTIAL MATCH IS NOT AN ANSWER, and this is where it stops being presented as
+        # one. Every tier-1 branch matches on part of an utterance and returns on the first
+        # hit, so words outside that part are dropped in silence:
+        #
+        #   "show me all unkown parties"          -> the ground parties
+        #   "show me all unkown parties on foot"  -> the SAME ground parties
+        #
+        # Two different questions, one byte-identical answer, nothing anywhere admitting
+        # that "unkown" and "on foot" were thrown away. The parser's own contract says it
+        # declines rather than half-matching, and `trace` is what finally makes a half
+        # match visible enough to act on.
+        #
+        # ⚠️ THE PARSER PLAN IS KEPT AS A FALLBACK, NOT DISCARDED. If the model is rate
+        # limited or unavailable, a partial answer WITH its dropped words named is better
+        # than no answer at all, and the trace travels with it either way.
+        fallback: list[dict] | None = None
+        if plan is not None and thinking["ignored"]:
+            fallback = plan
+            plan = None
 
         if plan is None:
             # ---- TIER 2 ----------------------------------------------------
@@ -304,27 +408,23 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
             # Metered here and nowhere else: everything above this line is free, so
             # someone trying the example commands can never be throttled part-way
             # through a first look.
-            if not ratelimit.origin_allowed(origin):
+            blocked = _tier_two_blocked(
+                client_ip=client_ip, origin=origin, utterance=req.utterance, source=req.source
+            )
+            if blocked and fallback is None:
                 return JSONResponse(
-                    {"ok": False, "summary": "the reasoning layer is not available from this origin",
-                     "tier": "parser", "results": []},
-                    status_code=200, headers={"cache-control": "no-store"},
-                )
-            verdict = ratelimit.check(client_ip)
-            if not verdict.allowed:
-                db.log_event(
-                    tool="rate_limited", source=req.source, result="rejected",
-                    params={"utterance": req.utterance, "scope": verdict.scope,
-                            "used": verdict.used, "limit": verdict.limit},
-                    detail=verdict.reason,
-                )
-                return JSONResponse(
-                    {"ok": False, "summary": verdict.reason, "tier": "parser", "results": []},
+                    {"ok": False, "summary": blocked, "tier": "parser", "results": []},
                     status_code=200, headers={"cache-control": "no-store"},
                 )
 
+            selection = None
             try:
-                selection = llmlib.default_provider().select(req.utterance, req.context)
+                # A spend guard that fired is the same situation as a model that will not
+                # answer: tier 2 is not available for this utterance. Funnelling both into
+                # one path is what stops the fallback below existing in two versions.
+                if blocked:
+                    raise llmlib.LLMUnavailable(blocked)
+                selection = llmlib.default_provider().select(req.utterance, _model_context(req.context))
             except llmlib.LLMUnavailable as exc:
                 db.log_event(
                     tool="unparsed",
@@ -333,44 +433,83 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                     params={"utterance": req.utterance},
                     detail=f"no deterministic parse; tier 2 unavailable: {exc}",
                 )
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "summary": (
-                            "I could not parse that, and the reasoning layer is unavailable "
-                            f"({exc}). Try: \"mesh status\", \"show me the drones\", "
-                            "\"what is not broadcasting\", or \"send Daymark 05 to 73.0 -95.9\""
-                        ),
-                        "tier": "parser",
-                        "results": [],
-                    },
-                    status_code=200,
-                    headers={"cache-control": "no-store"},
-                )
+                if fallback is None:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "summary": (
+                                "I could not parse that, and the reasoning layer is unavailable "
+                                f"({exc}). Try: \"mesh status\", \"show me the drones\", "
+                                "\"what is not broadcasting\", or \"send Daymark 05 to 73.0 -95.9\""
+                            ),
+                            "tier": "parser",
+                            "results": [],
+                            "thinking": thinking,
+                        },
+                        status_code=200,
+                        headers={"cache-control": "no-store"},
+                    )
+                # ⚠️ THE PARTIAL MATCH IS BETTER THAN NOTHING, BUT ONLY BECAUSE IT ARRIVES
+                # LABELLED. `thinking.ignored` names the words that did not land and
+                # `degraded` says why the better answer was not available, so the operator
+                # is looking at an answer that admits what it is.
+                plan, tier = fallback, "parser"
+                thinking["degraded"] = f"tier 2 unavailable: {exc}"
 
-            plan = selection.to_plan()
-            tier = "llm"
-            # 🔑 The model call is logged BEFORE the plan runs, with its own cost. That
-            # ordering matters: a plan the validator then rejects still cost money, and an
-            # audit log that only records successful calls cannot tell you what tier 2
-            # spent.
-            db.log_event(
-                tool="llm_select",
-                source=req.source,
-                tier="llm",
-                result="ok",
-                params={"utterance": req.utterance, "selection": plan, **selection.usage},
-                detail=selection.reasoning,
-                latency_ms=selection.usage.get("latency_ms"),
-            )
+            if selection is not None:
+                plan = selection.to_plan()
+                tier = "llm"
+                # 🔴 THE PARSER'S TRACE SURVIVES THE ESCALATION, and it did not until now.
+                # Overwriting `thinking` wholesale threw away the one thing that explains
+                # WHY the model was called, and it did so in exactly the case the trace was
+                # built for: a partial match. A mis-transcription heard as "Hydrophone
+                # Lancaster Sound 01 overdue" escalated because tier 1 could not place
+                # "lancaster", "sound" and "01" — and the response then showed the model's
+                # reasoning with no hint that three of the operator's words had gone
+                # unused. The reason for the call is more useful than the call.
+                handed_over = thinking if thinking.get("tier") == "parser" else None
+                thinking = {
+                    "tier": "llm",
+                    # 🔑 ALREADY COMPUTED AND PREVIOUSLY THROWN AWAY. The schema requires
+                    # the model to say why, it was logged as `detail` for an audit reader,
+                    # and the operator watching the screen never saw a word of it.
+                    "reasoning": selection.reasoning,
+                    "steps": len(plan),
+                    "model": selection.usage.get("model"),
+                    "latency_ms": selection.usage.get("latency_ms"),
+                    "cost_usd": selection.usage.get("cost_usd"),
+                }
+                # Only when tier 1 actually looked and came up short. A phrasing it never
+                # recognised at all has an empty trace, and showing "ignored: nothing" would
+                # imply it had an opinion it does not have.
+                if handed_over and (handed_over.get("ignored") or handed_over.get("matched")):
+                    thinking["parser"] = handed_over
+                # 🔑 The model call is logged BEFORE the plan runs, with its own cost. That
+                # ordering matters: a plan the validator then rejects still cost money, and an
+                # audit log that only records successful calls cannot tell you what tier 2
+                # spent.
+                db.log_event(
+                    tool="llm_select",
+                    source=req.source,
+                    tier="llm",
+                    result="ok",
+                    params={"utterance": req.utterance, "selection": plan, **selection.usage},
+                    detail=selection.reasoning,
+                    latency_ms=selection.usage.get("latency_ms"),
+                )
 
             if not plan:
                 return JSONResponse(
                     {
                         "ok": False,
-                        "summary": f"I understood that as no action. {selection.reasoning}",
-                        "tier": "llm",
+                        "summary": (
+                            f"I understood that as no action. {selection.reasoning}"
+                            if selection is not None
+                            else "I could not turn that into a command."
+                        ),
+                        "tier": tier,
                         "results": [],
+                        "thinking": thinking,
                     },
                     status_code=200,
                     headers={"cache-control": "no-store"},
@@ -398,10 +537,121 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
 
+    # 🔴 A TIER-1 GUESS THAT RESOLVED TO NOTHING GOES TO THE MODEL, NOT TO THE OPERATOR.
+    #
+    # The parser's own contract is that it returns None when it does not know and never
+    # guesses, "because a parser that half-matches steals the utterances the model should
+    # have had". A plan whose referent matches nothing is that theft, discovered one step
+    # too late: the utterance was not understood, and the component allowed to be
+    # uncertain never saw it. So the original words are re-run through tier 2 instead of
+    # showing a dead end.
+    #
+    # ⚠️ IT IS NOT ABOUT TYPOS, though a typo is what exposed it. The same escalation
+    # covers nicknames, partial names, an operator's shorthand and any phrasing nobody
+    # anticipated. And it makes the architecture's central claim stronger rather than
+    # weaker: "the parser was unsure" becomes a recorded, costed reason for a model call
+    # instead of an invisible wrong answer.
+    #
+    # 🔒 ONCE, AND ONLY FROM THE PARSER. `tier == "parser"` stops a model plan bouncing
+    # back to the model, and the absent `parent_command_id` stops an escalation escalating.
+    # Those two conditions are the loop guard.
+    if outcome.get("unresolved") and tier == "parser" and req.utterance and not req.parent_command_id:
+        escalated = _escalate_to_tier_two(req, outcome, client_ip=client_ip, origin=origin)
+        if escalated is not None:
+            return escalated
+
     outcome["ok"] = all(r["ok"] for r in outcome["results"])
     outcome["tier"] = tier
+    # 🔑 WHAT THE SYSTEM WAS THINKING, FOR WHICHEVER TIER DID IT. Tier 2 hands back the
+    # reasoning it was already required to produce; tier 1 hands back what it matched and,
+    # more usefully, which of the operator's words it did not use. Giving a person
+    # something to read during a wait is the small reason. The real one is that a dropped
+    # word is invisible in an answer and obvious in a trace.
+    outcome["thinking"] = thinking
     # `plan` is set by the executor and is the RESOLVED one; do not overwrite it with the
     # pre-resolution copy this function still holds.
+    return JSONResponse(outcome, headers={"cache-control": "no-store"})
+
+
+def _escalate_to_tier_two(
+    req: CommandRequest, first: dict, *, client_ip: str | None, origin: str | None
+) -> JSONResponse | None:
+    """Re-run the utterance through the model. None means "keep the original refusal".
+
+    🔑 EVERY FAILURE PATH RETURNS None RATHER THAN AN ERROR. The operator already has a
+    true, readable answer: the thing they named does not exist. If the model is rate
+    limited, unavailable, or produces nothing runnable, the right outcome is that original
+    sentence, not a worse one about the escalation. An optimisation that can only improve
+    the answer or leave it alone is one nobody has to reason about at 3am.
+
+    🔗 THE WHOLE CHAIN IS LOGGED UNDER THE FIRST COMMAND'S ID, so the audit trail reads
+    guess, escalation, answer. That is the same `parent_command_id` the clarification round
+    trip uses, and it is what the column exists for.
+    """
+    # ⚠️ CHECKED HERE AND NOT ONLY IN THE CALLER. There is nothing to re-run without the
+    # original words, and a guard that lives only at one call site is one refactor away
+    # from not existing.
+    if not req.utterance:
+        return None
+
+    parent = first.get("command_id")
+
+    if _tier_two_blocked(
+        client_ip=client_ip, origin=origin, utterance=req.utterance, source=req.source
+    ):
+        return None
+
+    # 🔑 THE ESCALATION TELLS THE MODEL WHAT THE PARSER LEARNED THE HARD WAY, and without
+    # this it is simply the same call twice. The system prompt instructs the model to pass
+    # a named asset through verbatim and let the system resolve it, which is right on a
+    # first attempt and exactly wrong here: passing "daymark 3" through again reproduces
+    # the failure that caused the escalation. Measured, that is precisely what happened.
+    #
+    # So the retry carries the name that did not match and every name that does. The model
+    # is not being asked to spell-check; it is being given the world it is choosing from.
+    ref = first.get("unresolved_ref") or {}
+    context = dict(req.context or {})
+    if ref.get("query"):
+        context["unresolved_reference"] = ref["query"]
+        context["known_asset_names"] = ref.get("available", [])
+
+    try:
+        selection = llmlib.default_provider().select(req.utterance, _model_context(context))
+    except llmlib.LLMUnavailable as exc:
+        db.log_event(
+            tool="unparsed", source=req.source, result="rejected",
+            command_id=parent, parent_command_id=parent,
+            params={"utterance": req.utterance, "escalated_from": "parser"},
+            detail=f"tier 1 named something that does not exist; tier 2 unavailable: {exc}",
+        )
+        return None
+
+    plan = selection.to_plan()
+    db.log_event(
+        tool="llm_select", source=req.source, tier="llm", result="ok",
+        parent_command_id=parent,
+        # `escalated_from` is what makes this call answerable in the log: it separates
+        # "the parser had no idea" from "the parser guessed and was wrong", which are
+        # different stories about the same money.
+        params={"utterance": req.utterance, "selection": plan,
+                "escalated_from": "parser", **selection.usage},
+        detail=selection.reasoning,
+        latency_ms=selection.usage.get("latency_ms"),
+    )
+    if not plan:
+        return None
+
+    try:
+        outcome = executor.execute(
+            plan, source=req.source, tier="llm", utterance=req.utterance,
+            parent_command_id=parent, context=req.context,
+        )
+    except (executor.PlanRejected, RuntimeError):
+        return None
+
+    outcome["ok"] = all(r["ok"] for r in outcome["results"])
+    outcome["tier"] = "llm"
+    outcome["escalated_from"] = "parser"
     return JSONResponse(outcome, headers={"cache-control": "no-store"})
 
 

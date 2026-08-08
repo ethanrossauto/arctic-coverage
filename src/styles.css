@@ -311,3 +311,72 @@ b.alert { color: var(--err); }
 .picker .pflag.maintenance { color: #ffd166; }
 .picker .pflag.weak { color: #ff9f43; }
 .picker .pflag.unreachable { color: #6b7683; }
+
+/* ---- the clarification chips --------------------------------------------------
+   Sits between the transcript and the input, which is where the operator's eye already is
+   after reading the question. */
+.clarify {
+  padding: 8px 10px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--accent);
+}
+.clarify .cq { color: var(--text); margin-bottom: 7px; }
+.clarify .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.clarify .chip {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  padding: 4px 9px; text-align: left;
+  background: #0f1a24; border: 1px solid var(--line); cursor: pointer;
+}
+.clarify .chip:hover:not(:disabled) { border-color: var(--accent); }
+.clarify .chip:hover:not(:disabled) .clabel { color: var(--accent); }
+/* An option with no runnable plan. Readable, deliberately not pressable. */
+.clarify .chip.flat { cursor: default; opacity: 0.75; border-style: dashed; }
+.clarify .clabel { color: var(--text); }
+.clarify .cdetail { color: var(--dim); font-size: 10px; }
+.clarify .cmore { color: var(--dim); font-size: 10px; margin-top: 6px; }
+
+/* ---- the thinking, and the escalation note -------------------------------------
+   Both hang under the answer they belong to and are deliberately quieter than it: an
+   explanation must never compete with the thing it explains. */
+.activity .thinking {
+  display: block;
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 11px;
+  white-space: pre-wrap;      /* the parser trace arrives as lines */
+  overflow-wrap: anywhere;
+}
+.activity .escalated {
+  display: block;
+  margin-top: 3px;
+  color: var(--dim);
+  font-size: 10px;
+  font-style: italic;
+}
+/* The chip becomes a button only when there is something behind it, so a chip that does
+   nothing never invites a click. */
+.activity button.tier {
+  font: inherit; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 2px;
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  cursor: default;
+}
+.activity button.tier.has { cursor: pointer; border-style: dashed; }
+.activity button.tier.has:hover { color: var(--accent); border-color: var(--accent); }
+.activity button.tier.llm { color: var(--warn); border-color: #4a3f22; }
+
+/* Input level while recording. Deliberately not a number: it answers "is it hearing me",
+   which is a question a bar answers better than a figure. */
+.cmdbar .meter {
+  flex: 0 0 46px; height: 4px;
+  background: #17222c; border-radius: 2px; overflow: hidden;
+}
+.cmdbar .meterfill {
+  display: block; width: 100%; height: 100%;
+  background: var(--err);
+  transform-origin: left center;
+  transition: transform 80ms linear;
+}

@@ -44,12 +44,11 @@ export function IceTimebar() {
   const setScrubbing = useStore((s) => s.setIceScrubbing);
 
   // 🔑 THE PICKER HOLDS A CHOICE, THE BUTTON APPLIES IT, and that split is the reason the
-  // button exists. Rebuilding the ice layer costs a couple of hundred milliseconds of main
-  // thread, so a select that applied on change paid it for every month you passed through:
-  // once per keystroke when arrowing down the list, and once per option on a platform that
-  // fires change while the list is still open. Choosing is now free and only committing
-  // costs anything.
-  const [pending, setPending] = useState<string | null>(null);
+  // button exists. Changing month fetches that month's measurement tile, so a select that
+  // applied on change paid for every month you passed through: once per keystroke when
+  // arrowing down the list, and once per option on a platform that fires change while the
+  // list is still open. Choosing is now free and only committing costs anything.
+  const [chosen, setChosen] = useState<string | null>(null);
 
   // ⚠️ MEMOISED, AND NOT FOR TIDINESS. `ice?.dates ?? []` builds a NEW empty array on every
   // render whenever `ice` is absent, so it is a fresh reference each time. It is a
@@ -68,7 +67,7 @@ export function IceTimebar() {
   useEffect(() => {
     if (!scrubbing || i < 0 || dates.length === 0) return;
     const t = setTimeout(() => {
-      setPending(null);
+      setChosen(null);
       setIceDate(dates[(i + 1) % dates.length]);
     }, STEP_MS);
     return () => clearTimeout(t);
@@ -86,9 +85,20 @@ export function IceTimebar() {
   // one deliberate action already, so making them wait behind GO would be ceremony; and
   // leaving a pending value behind would show the picker on one month while the map drew
   // another, which is the exact confusion the button is meant to remove.
+  // 🔑 DERIVED, NOT SYNCED. A choice only counts while it differs from what is drawn, so
+  // "is something waiting" is a question about the current render rather than a second
+  // piece of state to keep in step. An effect that watched the drawn date and cleared the
+  // choice did the same job and was the last lint error in the tree: calling setState from
+  // an effect to mirror a value you can compute is a cascading render for no reason.
+  //
+  // It also gives the behaviour the button needs for free. The picker keeps showing what
+  // you asked for while the tile loads, instead of snapping back to the old month and
+  // reading as though GO had failed.
+  const pending = chosen && chosen !== ice.date ? chosen : null;
+
   const step = (by: number) => {
     const n = Math.min(dates.length - 1, Math.max(0, i + by));
-    setPending(null);
+    setChosen(null);
     setIceDate(dates[n]);
   };
 
@@ -121,7 +131,7 @@ export function IceTimebar() {
       <select
         className="icepick"
         value={pending ?? ice.date}
-        onChange={(e) => setPending(e.target.value)}
+        onChange={(e) => setChosen(e.target.value)}
         aria-label="Sea ice measurement month"
       >
         {years.map((y) => (
@@ -139,10 +149,7 @@ export function IceTimebar() {
           there is anything outstanding rather than being a control you press hopefully. */}
       <button
         className="icego"
-        onClick={() => {
-          if (pending) setIceDate(pending);
-          setPending(null);
-        }}
+        onClick={() => pending && setIceDate(pending)}
         disabled={!pending || pending === ice.date}
         title="Draw the selected measurement"
       >

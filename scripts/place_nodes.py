@@ -14,8 +14,9 @@ WHY THIS IS A SCRIPT AND NOT RUNTIME CODE. The positions it produces are pasted 
 
 THE PROBLEM IT SOLVES. A chokepoint axis runs down the middle of a strait, because that
 is where the water a sensor watches is. A sensor node has to sit on a shore. And the
-nodes have to be close enough together to actually form a mesh, which at a 12 m mast
-means 28.5 km of radio horizon, so they are spaced at about 22 km for margin.
+nodes have to be close enough together to actually form a mesh. Ground to ground reach is
+25 km (see api/_lib/mesh.py), so they are spaced at about 22 km, leaving a couple of
+kilometres of margin for a coastline that is not a straight line and for a node going down.
 
 ⚠️ ONE SHORE PER CLUSTER, NOT BOTH. Alternating banks looks more thorough and would
 break the mesh: the straits here are 40-80 km wide, so a node on the far bank is out of

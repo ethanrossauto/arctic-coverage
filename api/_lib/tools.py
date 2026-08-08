@@ -64,6 +64,41 @@ class ToolError(Exception):
     """
 
 
+class Unresolved(ToolError):
+    """A referent matched nothing at all.
+
+    🔑 THE MIRROR OF `Ambiguous`, AND THE STRONGER SIGNAL OF THE TWO. Many matches means
+    "I understood you and need you to narrow it", which is a question worth asking. Zero
+    matches means "I did not understand you", and when the plan came from the
+    deterministic tier that usually means the parser guessed rather than declining.
+
+    So this one is not the end of the conversation: the API re-runs the original utterance
+    through tier 2 rather than showing the operator a dead end. A misspelling, a nickname,
+    a piece of an operator's own shorthand and a phrasing nobody anticipated all arrive
+    here, and all of them are things a model is better at than a regular expression.
+
+    ⛔ THE FIX IS ESCALATION, NEVER FUZZY MATCHING. Edit distance in `_resolve` would
+    answer the misspelling and buy a whole class of confidently wrong answers, which is
+    the failure this architecture exists to prevent. The model is the component that is
+    allowed to be uncertain.
+
+    A subclass for the same reason `Ambiguous` is one: every existing handler keeps
+    treating it as an ordinary refusal, and only the code that cares looks closer.
+
+    ⚠️ IT CARRIES THE QUERY AND WHAT DOES EXIST, for the same reason `Ambiguous` carries
+    its candidates. The first version threw both away into a formatted sentence, and the
+    escalation it exists to feed then re-sent the model the identical utterance with no
+    new information, so the model passed the same dead name straight back. An escalation
+    that tells the model nothing it did not already know is not a retry, it is the same
+    call twice.
+    """
+
+    def __init__(self, message: str, *, query: str = "", available: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.query = query
+        self.available = available or []
+
+
 class Ambiguous(ToolError):
     """The request was understood; it just named more than one thing.
 
@@ -211,8 +246,22 @@ def _require_one(text: str, entities: list[dict[str, Any]]) -> dict[str, Any]:
     """
     matches = _resolve(text, entities)
     if not matches:
+        # 🔴 `Unresolved`, NOT A PLAIN `ToolError`, AND THE DISTINCTION IS THE WHOLE POINT.
+        # Zero matches is the strongest signal there is that the utterance was not
+        # understood, and when the plan came from the deterministic tier it usually means
+        # the parser guessed. So the caller escalates to tier 2 instead of showing this
+        # message, and it can only do that if this failure is separable from every other
+        # thing a tool declines for. It is still a ToolError, so anything that does not
+        # care about the difference is unchanged.
         near = ", ".join(e["name"] for e in entities[:4])
-        raise ToolError(f'nothing here matches "{text}". Some of what exists: {near}')
+        raise Unresolved(
+            f'nothing here matches "{text}". Some of what exists: {near}',
+            query=text,
+            # Every name, not the four in the sentence. The sentence is for a person and
+            # four is plenty; the list is for the escalated model call, which needs the
+            # whole set to pick the one the operator meant.
+            available=[e["name"] for e in entities],
+        )
     if len(matches) > 1:
         raise Ambiguous(
             query=text,
@@ -332,6 +381,7 @@ def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
         "isolated": "true to return only assets on no mesh at all",
         "overdue": "true to return only assets that have not reported inside their kind's interval",
         "bbox": "restrict to what is on screen right now, for 'in the current zoom window'",
+        "ids": "restrict to these exact assets, for 'list them' after a previous answer",
     },
 )
 def list_entities(
@@ -341,6 +391,7 @@ def list_entities(
     isolated: bool | None = None,
     overdue: bool | None = None,
     bbox: dict[str, Any] | None = None,
+    ids: list[str] | None = None,
 ) -> ToolResult:
     """Assets, filtered.
 
@@ -355,6 +406,17 @@ def list_entities(
     """
     all_rows = _entities()
     rows = all_rows
+    if ids is not None:
+        # 🔑 THE CARRIER FOR "LIST THEM". The executor turns the `__result__` placeholder
+        # into the ids the previous command answered with, and this is what receives
+        # them. Applied FIRST so anything else the operator said narrows that set rather
+        # than competing with it: "list them, just the drones" is the intersection.
+        #
+        # ⚠️ An empty list means an empty answer, and must never be read as "no filter".
+        # `is not None` rather than a truth test is the whole difference: "list them"
+        # after an answer that found nothing should find nothing, not everything.
+        wanted = set(ids)
+        rows = [r for r in rows if r["id"] in wanted]
     if kind:
         rows = [r for r in rows if r["kind"] == kind]
     if status:
@@ -1110,3 +1172,88 @@ def schemas() -> list[dict[str, Any]]:
         {"name": t.name, "summary": t.summary, "params": t.params, "writes": t.writes}
         for t in REGISTRY.values()
     ]
+
+
+@tool(
+    "show_unknown",
+    "Contacts not announcing their own identity that the sensor network is actually holding.",
+    {},
+)
+def show_unknown() -> ToolResult:
+    """The unidentified contacts the console can legitimately claim to have.
+
+    🔑 AN UNKNOWN IS A CONTACT THAT IS NOT SELF-REPORTING, and that question is already
+    answered for all three contact kinds: AIS for a vessel, a transponder for an aircraft,
+    an emitter for a ground party. `detect.coverage_summary` splits exactly that set, so
+    nothing new is computed here and there is no second definition of "unknown" to keep in
+    step with the first.
+
+    🔴 ONLY `tracked` IS RETURNED AS THE ANSWER, and the two buckets left out are the whole
+    point of the tool:
+
+        tracked                 not talking, a sensor holds it, the report gets home  -> YES
+        detected_not_reported   a sensor holds it and CANNOT deliver the report       -> no
+        untracked               nothing holds it and it is not talking                -> no
+
+    ⚠️ `detected_not_reported` IS THE COUNTER-INTUITIVE EXCLUSION, and it is the strict
+    reading on purpose: if the report is not reaching you, you do not have the contact. A
+    sensor holding something it cannot deliver is a link fault, not coverage. So the
+    default display claims only what actually arrived.
+
+    🔒 `untracked` IS AN HONESTY PROBLEM, NOT JUST A FILTER. Nothing holds it and it is not
+    talking, so the console **cannot legitimately know it exists**: that set is read out of
+    the seeded world, not derived from the sensor network. Putting it behind a deliberate
+    act means the default view asserts nothing it cannot support, which is the same rule
+    the ice layer and the relay figures already follow. It must never re-enter a default
+    count, summary or status line.
+
+    Both excluded lists still travel in `data`, because the client's reveal toggle needs
+    them and a second round trip to fetch what was already computed would be waste.
+    """
+    detect = _detect_module()
+    summary = getattr(detect, "coverage_summary", None) if detect else None
+    if summary is None:
+        raise ToolError(
+            "this build does not compute which contacts are identified. What is available: "
+            "asset status, mesh connectivity, and which contacts are not broadcasting"
+        )
+
+    out = summary(_entities())
+    by_id = {r["id"]: r for r in _entities()}
+
+    covered = list(out.get("tracked", []))
+    stranded = list(out.get("detected_not_reported", []))
+    unheld = list(out.get("untracked", []))
+
+    rows = [by_id[i] for i in covered if i in by_id]
+    message = f"{len(covered)} unknown contact{'' if len(covered) == 1 else 's'} held by the network"
+    if stranded or unheld:
+        # ⚠️ NAMED, NOT SILENTLY DROPPED. The operator is being shown a smaller set than
+        # exists, and a display that quietly narrows what it claims is the failure this
+        # whole distinction is meant to prevent. Saying how many were withheld, and why,
+        # costs one clause.
+        message += f"; {len(stranded) + len(unheld)} more cannot be confirmed from the network alone"
+
+    return ToolResult(
+        ok=True,
+        message=message,
+        data={
+            "ids": covered,
+            "names": [r["name"] for r in rows],
+            "points": [
+                [r["lat"], r["lon"]]
+                for r in rows
+                if r.get("lat") is not None and r.get("lon") is not None
+            ],
+            # The reveal buckets. Present so a toggle costs no round trip; never counted
+            # in `ids`, which is what the default view asserts.
+            "detected_not_reported": stranded,
+            "untracked": unheld,
+            "counts": {
+                "covered": len(covered),
+                "detected_not_reported": len(stranded),
+                "untracked": len(unheld),
+            },
+        },
+        ui_effects={"highlight": covered},
+    )

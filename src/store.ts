@@ -63,6 +63,23 @@ export interface AssetPick {
   ids: string[];
 }
 
+/**
+ * One turn, kept so the NEXT command can resolve what "them" points at.
+ *
+ * 🔑 THIS IS DEIXIS, NOT MEMORY, and the distinction is what keeps it cheap. It exists so
+ * "list them" binds to the three things just shown rather than to the whole world, which is
+ * what happened before it: `how many unknown parties on foot` answered 3, and `list them`
+ * answered 76. Three turns is enough for that, and every extra turn is tokens on the next
+ * model call for no gain.
+ */
+export interface RecentTurn {
+  utterance: string;
+  summary: string;
+  tier: string | null;
+  /** Ids the answer actually returned. What "them" refers to. */
+  ids: string[];
+}
+
 /** One line in the on-screen transcript. */
 export interface CommandEntry {
   role: "user" | "system";
@@ -71,6 +88,16 @@ export interface CommandEntry {
   tier?: string;
   ok?: boolean;
   source?: "typed" | "voice";
+  /**
+   * Why the answer is what it is: the model's reasoning, or the parser's trace.
+   *
+   * ⚠️ AN EXPLANATION, NEVER THE ANSWER. The summary above is the executor's, written from
+   * what actually ran; this is an account of what was intended. They diverge exactly when a
+   * plan half-failed, so they are kept apart and shown apart.
+   */
+  thinking?: string;
+  /** The parser tried, could not resolve it, and the model was asked instead. */
+  escalatedFrom?: string;
 }
 
 /**
@@ -123,6 +150,23 @@ interface State {
    * read anything else.
    */
   showMesh: boolean;
+  /**
+   * Whether the sea-ice layer is drawn.
+   *
+   * "Show me the weather overlays" turns this on. 🔒 No server code reads the ice data and
+   * none ever will: the command layer asks the display to show a layer it already has,
+   * which is why this is client state and not a server fact.
+   */
+  showIce: boolean;
+  /**
+   * Whether contacts the network cannot confirm are drawn.
+   *
+   * 🔒 DEFAULT OFF, AND THAT IS THE POINT RATHER THAN A PREFERENCE. The default picture
+   * shows what actually reached us. Revealing what it cannot confirm has to be a deliberate
+   * act, because one of those buckets is a contact nothing is holding, which the console
+   * has no honest basis for knowing about at all.
+   */
+  showUndetected: boolean;
   /** Last computed viewport box. What a command means by "the current window". */
   bbox: ViewportBbox | null;
   selectedId: string | null;
@@ -136,12 +180,27 @@ interface State {
    * the log somewhere a refresh can erase it.
    */
   commandLog: CommandEntry[];
+  /**
+   * The last few turns, oldest first and NEWEST LAST.
+   *
+   * ⚠️ ORDER IS LOAD-BEARING: the server binds "them" to the last entry's ids. Successes
+   * only, because a refusal is not a thing "them" can point at.
+   */
+  recent: RecentTurn[];
   /** Where a command asked the camera to go. Null until one does. */
   camera: CameraTarget | null;
   /** The position history a command asked for. Null when nobody has asked. */
   track: AssetTrack | null;
   /** An unresolved click on overlapping assets. Null unless the operator is choosing. */
   picker: AssetPick | null;
+  /**
+   * Which assets a command's answer points at.
+   *
+   * 🔑 AN EMPTY ARRAY MEANS CLEAR, NOT "NO CHANGE". Every list query sends its full set
+   * each time, so the absence of an id is a statement that it is not in the answer. Treat
+   * `[]` as "highlight nothing" and the key being absent as "leave it alone".
+   */
+  highlightIds: string[];
 
   setAssets: (a: Asset[]) => void;
   setMesh: (m: MeshStatus) => void;
@@ -152,16 +211,25 @@ interface State {
   setError: (e: string | null) => void;
   setProjection: (p: Projection) => void;
   setShowMesh: (v: boolean) => void;
+  setShowIce: (v: boolean) => void;
+  setShowUndetected: (v: boolean) => void;
   setBbox: (b: ViewportBbox) => void;
   select: (id: string | null) => void;
   appendCommand: (e: CommandEntry) => void;
   setCamera: (c: CameraTarget | null) => void;
+  pushRecent: (t: RecentTurn) => void;
   setTrack: (t: AssetTrack | null) => void;
   setPicker: (p: AssetPick | null) => void;
+  setHighlight: (ids: string[]) => void;
 }
 
 /** How many transcript lines to keep. Enough to follow a demo, not a scrollback. */
 const LOG_LIMIT = 40;
+
+/** How many turns of conversational context travel with a command. */
+const RECENT_TURNS = 3;
+/** And how many ids one of those turns may carry. */
+export const RECENT_IDS = 50;
 
 export const useStore = create<State>((set) => ({
   assets: [],
@@ -178,12 +246,16 @@ export const useStore = create<State>((set) => ({
     ? "mercator"
     : "globe") as Projection,
   showMesh: true,
+  showIce: true,
+  showUndetected: false,
   bbox: null,
   selectedId: null,
   commandLog: [],
+  recent: [],
   camera: null,
   track: null,
   picker: null,
+  highlightIds: [],
 
   setAssets: (a) => set({ assets: a, loading: false, error: null }),
   setMesh: (m) => set({ mesh: m }),
@@ -194,12 +266,18 @@ export const useStore = create<State>((set) => ({
   setError: (e) => set({ error: e, loading: false }),
   setProjection: (p) => set({ projection: p }),
   setShowMesh: (v) => set({ showMesh: v }),
+  setShowIce: (v) => set({ showIce: v }),
+  setShowUndetected: (v) => set({ showUndetected: v }),
   setBbox: (b) => set({ bbox: b }),
   select: (id) => set({ selectedId: id }),
   appendCommand: (e) => set((s) => ({ commandLog: [...s.commandLog, e].slice(-LOG_LIMIT) })),
   setCamera: (c) => set({ camera: c }),
+  // Capped hard. This is the last thing said, not a session log.
+  pushRecent: (t) =>
+    set((s) => ({ recent: [...s.recent, t].slice(-RECENT_TURNS) })),
   setTrack: (t) => set({ track: t }),
   // Choosing one clears the list in the same update, so a stale pile can never sit over
   // the banner it just opened.
   setPicker: (p) => set({ picker: p }),
+  setHighlight: (ids) => set({ highlightIds: ids }),
 }));

@@ -113,9 +113,15 @@
 
         // 🔒 THE WATCHDOG IS THE IMPORTANT HALF. A curtain that waits for a signal will hang
         // forever the day that signal is not sent, and a permanently "Loading..." page is a
-        // far worse failure than a map that appears a moment early. So the wait is bounded
-        // and the bound is short.
-        setTimeout(lift, 6000);
+        // far worse failure than a map that appears a moment early. So the wait is bounded.
+        //
+        // ⚠️ 15 SECONDS, RAISED FROM 6, AND THE RAISE IS A SYMPTOM NOT A FIX. At 6 seconds
+        // the curtain was lifting on a half-built map, because nothing calls consoleReady()
+        // yet and a cold load genuinely takes longer than that: the basemap alone is 671 KB
+        // gzipped and the two API reads are round trips to a database in another region.
+        // **The real fix is calling consoleReady() when the map has actually drawn**, at
+        // which point this number stops mattering for anything except genuine failure.
+        setTimeout(lift, 15000);
       })();
     </script>
 

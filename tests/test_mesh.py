@@ -554,13 +554,26 @@ def test_the_client_and_server_agree_on_the_mesh_kinds():
 
 
 def test_the_reporting_interval_is_not_derived_from_the_overdue_threshold():
-    """They are different quantities and the bug was deriving one from the other. A node
-    tolerating two hours of silence does not mean it speaks every half hour."""
+    """They are different quantities and the bug was deriving one from the other. How often
+    a radio speaks is a fact about the radio; how long silence is tolerated is a judgement
+    about the mission.
+
+    ⚠️ THE SEPARATION IS ASSERTED AS MISSED BEACONS, NOT AS A RATIO OF MAGNITUDES. This
+    first demanded a hundredfold gap, which was a number I invented and which forbade any
+    realistic threshold: a drone reported late after three minutes is 36 missed beacons,
+    which is an entirely sensible thing to want and failed a rule that wanted 100.
+    """
     for kind, interval in freshness.REPORT_INTERVAL_SECONDS.items():
-        threshold_s = freshness.OVERDUE_MINUTES.get(kind, 0) * 60
         assert interval <= 10.0, f"{kind} claims to beacon only every {interval}s"
-        if threshold_s:
-            assert interval < threshold_s / 100, (
-                f"{kind}'s beacon is within two orders of magnitude of its patience "
-                "threshold, which is how the two got confused in the first place"
-            )
+        threshold_s = freshness.OVERDUE_MINUTES.get(kind, 0) * 60
+        if not threshold_s:
+            continue
+        missed = threshold_s / interval
+        assert missed >= 20, (
+            f"{kind} is called overdue after only {missed:.0f} missed beacons, which is "
+            "close enough to normal radio behaviour to cry wolf"
+        )
+        assert threshold_s <= 60 * 60, (
+            f"{kind} tolerates {missed:.0f} missed beacons before saying a word, which is "
+            "the scale that let an asset nobody had heard from for hours read as nominal"
+        )

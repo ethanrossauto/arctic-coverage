@@ -178,9 +178,13 @@ def test_a_radar_is_never_overdue(world, log):
 
 
 def test_overdue_counts_from_the_instant_not_the_wall_clock():
-    row = {"kind": "node", "last_heard": heard(121)}
-    assert tools.is_overdue(row, NOW) is True
-    assert tools.is_overdue({"kind": "node", "last_heard": heard(119)}, NOW) is False
+    """⚠️ THE BOUNDARY IS READ FROM THE TABLE, NOT TYPED IN. This pinned 119 and 121 against
+    a node threshold of 120 minutes, so retuning that number to something an operator would
+    actually accept broke a test whose subject is that `now` is injectable. A test that
+    fails when a tunable value is tuned is a test about the wrong thing."""
+    limit = freshness.OVERDUE_MINUTES["node"]
+    assert tools.is_overdue({"kind": "node", "last_heard": heard(limit + 1)}, NOW) is True
+    assert tools.is_overdue({"kind": "node", "last_heard": heard(limit - 1)}, NOW) is False
 
 
 # --------------------------------------------------------------------------

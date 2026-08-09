@@ -37,12 +37,53 @@ from typing import Any
 # all, which is the interoperability problem stated as data rather than as prose. An asset
 # cannot be overdue to a network it was never on, and giving them a threshold would make
 # twelve sites permanently overdue and bury the four that really are.
+# 🔑 EVERY ONE OF THESE IS A NUMBER OF MISSED BEACONS, NOT A GUESS. Everything reports
+# every five seconds, so a threshold is really "how many reports may go missing before an
+# operator should be told", and each is defensible in one sentence:
+#
+#   launch_site   5 min   a fixed installation on mains or a genset with its own satellite
+#                         terminal. It has no reason to be quiet, and six of the eleven
+#                         gateways sit on one, so silence here strands a whole cluster.
+#   uas           3 min   airborne, endurance measured in tens of minutes, and the most
+#                         valuable thing in the air. Losing it is worth interrupting someone.
+#   aircraft      5 min   a contact moving at 400 km/h is 33 km from its last fix after five
+#                         minutes, so the position stops being useful before the asset does.
+#   node         10 min   a mast-mounted mesh radio, fixed and mains-independent. Long enough
+#                         to ride out a squall, a reboot or a brief fade; short enough to
+#                         notice a mast that has actually gone down.
+#   vessel       10 min   AIS transmits every few seconds under way, so ten minutes of
+#                         silence from a ship that was broadcasting is a real event.
+#   hydrophone   20 min   a seabed unit relaying through a surface buoy. Sea state and ice
+#                         interrupt that hop routinely and it recovers on its own.
+#   patrol       30 min   dismounted troops behind terrain. A valley or a ridge takes them
+#                         off the mesh for a while and that is normal, not a fault.
+#   ground_party 30 min   a contact on foot, masked by the same terrain as a patrol.
+#
+# ⚠️ THESE USED TO BE ONE TO FOUR HOURS, which is a scale nothing here justified: it meant
+# tolerating between 720 and 2,880 missed reports before saying a word. Four kinds had no
+# entry at all, so `launch_site`, `aircraft` and `ground_party` could never be reported
+# late however long they were silent, and a ground party untracked for 4.7 hours sat on the
+# map reading nominal beside a vessel in the identical state reading overdue.
+#
+# ⚠️ `radar` IS ABSENT ON PURPOSE, NOT BY OMISSION. Those sites are not on the mesh at
+# all, which is the interoperability problem stated as data rather than as prose. An asset
+# cannot be overdue to a network it was never on, and giving them a threshold would make
+# twelve sites permanently overdue and bury the four that really are.
+#
+# 🔒 NOTHING ON THE MAP MOVES BECAUSE OF A NUMBER IN THIS TABLE. `motion.advance` draws to
+# the last report that arrived, so these decide a LABEL and a ring colour, never whether the
+# display is telling the truth about where something is. That separation is deliberate: when
+# freezing was keyed on this table, a generous threshold meant animating an asset nobody had
+# heard from in nearly four hours.
 OVERDUE_MINUTES: dict[str, int] = {
-    "node": 120,
-    "hydrophone": 180,
-    "uas": 60,
-    "patrol": 240,
-    "vessel": 60,
+    "uas": 3,
+    "launch_site": 5,
+    "aircraft": 5,
+    "node": 10,
+    "vessel": 10,
+    "hydrophone": 20,
+    "patrol": 30,
+    "ground_party": 30,
 }
 
 # 🔑 HOW OFTEN A WORKING ASSET SPEAKS, WHICH IS NOT THE SAME QUANTITY AS THE ONE ABOVE AND
@@ -71,6 +112,25 @@ REPORT_INTERVAL_SECONDS: dict[str, float] = {
 }
 
 DEFAULT_REPORT_INTERVAL_SECONDS = 5.0
+
+# 🔑 HOW FAR BACK A SEEDED `last_heard` HAS TO SIT BEFORE THE ASSET COUNTS AS DELIBERATELY
+# SILENT. Whether an asset was laid down working or broken is a fact about the SCENARIO, and
+# this is the one number that decides it.
+#
+# 🔴 IT USED TO BE THE KIND'S OVERDUE THRESHOLD, AND THAT COUPLING WAS A REAL BUG. Retuning
+# a threshold then silently reclassified assets as broken: dropping the hydrophone number to
+# an operational twenty minutes turned every unit in the Lancaster Sound array that had been
+# seeded with thirty minutes of harmless scatter into a permanently dead one, the barrier
+# went dark, and every contact it was holding stopped being reported. The browser suite
+# caught it as `detected unknown` reaching zero, which is three steps downstream of the edit.
+#
+# ⚠️ SO IT IS DELIBERATELY NOT PER KIND AND NOT TUNABLE ALONGSIDE THE DISPLAY. A threshold
+# says how long an operator waits before worrying; this says what the world was set up to
+# be. Tying the second to the first meant a display preference could rewrite the scenario.
+# Sixty minutes sits in the wide gap between the two populations the seed actually creates:
+# working assets are laid down reporting, and the handful that are meant to be silent are
+# seeded hours or days back.
+SEEDED_SILENT_MINUTES = 60.0
 
 FLAGS = ("nominal", "maintenance", "overdue")
 
@@ -168,9 +228,6 @@ def _was_healthy_at_birth(row: dict[str, Any], now: datetime | None = None) -> b
     last = minutes_since_heard(row, now)
     if last is None:
         return False  # never reported at all: a radar site, not ours to speak for
-    threshold = OVERDUE_MINUTES.get(row.get("kind", ""))
-    if threshold is None:
-        return True
 
     born = row.get("created_at")
     if isinstance(born, str):
@@ -185,7 +242,7 @@ def _was_healthy_at_birth(row: dict[str, Any], now: datetime | None = None) -> b
 
     now = now or datetime.now(UTC)
     stale_at_birth = (born - (now - timedelta(minutes=last))).total_seconds() / 60.0
-    return stale_at_birth <= threshold
+    return stale_at_birth <= SEEDED_SILENT_MINUTES
 
 
 def _stamp(row: dict[str, Any], now: datetime, age_s: float = 0.0) -> None:

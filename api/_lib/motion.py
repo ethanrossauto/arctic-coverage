@@ -327,29 +327,58 @@ def advance(rows: list[dict[str, Any]], now: datetime | None = None) -> None:
         props = row.get("props") or {}
         if props.get("motion_frozen"):
             continue
-        # 🔴 FROZEN IS KEYED ON WHETHER WE ARE TRACKING IT, NOT ON WHETHER IT IS LATE.
-        # An asset of ours that has gone quiet stays where it last reported, because
-        # animating it onward would be the display inventing a position. That rule is right
-        # and it was being applied to the wrong set: a CONTACT is not reporting to us at
-        # all, so judging it by its own silence froze the very things the sensor network
-        # exists to watch. Ships with routes and speeds sat motionless in Lancaster Sound.
-        #
         # 🔑 A CONTACT IS THE WORLD, NOT A REPORT. It keeps moving whether or not anything
         # is holding it, which is precisely what makes the coverage view worth having: the
         # contact nobody can see is still going somewhere. The display already declares that
         # bucket as simulation ground truth rather than an observation, and hides it behind
         # a control by default, so moving it claims nothing that was not already disclosed.
-        if row.get("overdue") and row.get("kind") not in CONTACT_KINDS:
-            continue
-
+        #
+        # 🔴 OUR OWN ASSETS ARE DRAWN UP TO THE LAST PACKET THAT ARRIVED, AND NOT ONE SECOND
+        # FURTHER. This is the claim the whole console rests on: every metre of movement it
+        # draws was carried by a report that actually reached us.
+        #
+        # It used to freeze on the `overdue` flag instead, and that is a DIFFERENT AND
+        # WEAKER TEST. Overdue is a patience threshold, so between the moment an asset went
+        # quiet and the moment it had been quiet long enough to worry about, the display
+        # kept animating it from nothing. Measured live: a Ranger patrol last heard 3.77
+        # hours earlier, still flagged nominal because its threshold is generous, moved
+        # 229.7 m in 45 seconds on screen. That is the display inventing a position, which
+        # this file's own opening paragraph calls the one thing it must never do.
+        #
+        # 🔑 SO THE CLOCK IS THE ASSET'S, NOT THE WALL'S. Advancing to `last_heard` rather
+        # than to `now` is one rule where there were two, and it is better in three ways: a
+        # healthy asset is stamped within a beacon of now so nothing visible changes; a
+        # silent one stops exactly when its packets stopped; and it comes to rest at the
+        # position it held WHEN LAST HEARD rather than at the position it was seeded with,
+        # which is what the old freeze actually did. Motion no longer depends on a threshold
+        # at all, so tuning one can never again decide whether the map tells the truth.
         started = _as_datetime(row.get("created_at"))
         if started is None:
             continue
+
+        if row.get("kind") in CONTACT_KINDS:
+            as_of = now
+        else:
+            heard = _as_datetime(row.get("last_heard"))
+            # Never heard at all, so there is no reported position to carry forward and no
+            # honest way to draw movement. A radar site and a marker both land here, and
+            # neither one moves anyway.
+            if heard is None:
+                continue
+            # ⚠️ `min`, NOT just `heard`. A history query asks for a moment in the past, and
+            # for any `when` before the last report the answer is that moment, not the
+            # report. Clamping only bites once the question runs past what we were told.
+            as_of = min(now, heard)
         # ⚠️ NOT CLAMPED AT ZERO. A negative value means "before this row existed", which
         # is exactly what a history query asks for: run the same route backwards. Clamping
         # it made every historical sample return the seed position, so a four-day track of
         # a patrol moving at 18 km/h came back 4 km long.
-        hours = (now - started).total_seconds() / 3600.0
+        #
+        # ⚠️ AND IT IS `as_of`, NOT `now`. That is the whole edit above: our own assets run
+        # on the clock of their last report, contacts run on the wall clock. Everything
+        # derived from this line inherits it, the drone's battery included, which is right:
+        # if we cannot hear a drone we cannot claim to know how much fuel it has left.
+        hours = (as_of - started).total_seconds() / 3600.0
 
         # 🔋 A DRONE BURNS ITS BATTERY, LANDS, RECHARGES AND GOES UP AGAIN. Endurance and
         # altitude are both derived here, so the number in the info panel is the number the

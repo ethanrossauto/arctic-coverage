@@ -232,6 +232,21 @@ _PAYLOADS = ["eo_ir", "rf", "magnetic"]
 # and could not say a node was nearly flat while still reporting on time. Those are two
 # facts that usually travel together and sometimes do not, and the interesting rows are
 # exactly the ones where they come apart.
+# 🔑 "IT JUST REPORTED", AND IT IS ZERO RATHER THAN A SCATTER OF MINUTES. Everything healthy
+# beacons every five seconds, so at the instant the world is laid down a working asset has
+# just been heard from. `freshness.refresh` re-stamps it on every read anyway, jittered per
+# asset within one beacon, so the only job this value has is to say which side of the line an
+# asset starts on: reporting, or deliberately silent.
+#
+# 🔴 IT USED TO BE FOUR TO FIFTY MINUTES OF SPREAD, WHICH READ AS REALISTIC SCATTER AND WAS
+# A BUG WAITING FOR A TUNING PASS. It was harmless only because the thresholds were one to
+# four hours. The moment those came down to values an operator would accept, the same seed
+# would have turned most of the network dark at the next reseed: nodes seeded up to 46
+# minutes stale against a 10 minute threshold, drones on the pad at 26 against 3. Scatter
+# that means something belongs at read time; scatter in a seed is just a number to trip over.
+_REPORTING = 0.0
+
+
 _NODE_STALENESS: dict[str, tuple[float, int]] = {
     "node-nares-05": (410.0, 44),    # late, but the battery is fine: something else is wrong
     "node-victoria-03": (1670.0, 0), # nothing for over a day, and flat
@@ -261,7 +276,7 @@ def _nodes() -> list[Asset]:
         for i, (lat, lon) in enumerate(points, start=1):
             node_id = f"node-{cluster_key}-{i:02d}"
             stale_minutes, battery = _NODE_STALENESS.get(
-                node_id, (float(7 + (i * 3) % 40), 55 + (i * 7) % 40)
+                node_id, (_REPORTING, 55 + (i * 7) % 40)
             )
             props = {
                 "cluster": cluster_key,
@@ -348,13 +363,21 @@ def _patrols() -> list[Asset]:
             lat=long_range[1][0],
             lon=long_range[1][1],
             geometry=line(long_range),
-            last_heard_minutes_ago=52.0,
+            # 🔑 THE PATROL YOU CAN WATCH MOVE, AND IT CARRIES THE TERMINAL THAT EARNS IT.
+            # Drawn movement has to be movement somebody reported. A patrol on a multi-day
+            # traverse is almost never inside 25 km of a mast, so without a way of its own to
+            # reach the outside world nothing it does can arrive and the map must leave it
+            # where it was last heard. Satellite comms on a long-range patrol is ordinary
+            # kit, and it is exactly what makes this one honest to animate: fourteen people
+            # a long way from anything, reporting every five seconds through their own uplink.
+            last_heard_minutes_ago=_REPORTING,
             props={
                 "members": 14,
                 "progress_pct": 48,
                 "next_waypoint": "Prince of Wales Strait north",
                 "transport": "atv",
                 "speed_kmh": 22,
+                "backhaul": "satellite",
             },
         ),
         Asset(
@@ -364,6 +387,9 @@ def _patrols() -> list[Asset]:
             lat=75.20,
             lon=-95.50,
             geometry=line(resolute_loop),
+            # Out on its loop and off the mesh: no terminal of its own and rarely inside
+            # 25 km of a mast, so it is heard only when something bridges it. That is the
+            # case a drone at the midpoint exists to demonstrate.
             last_heard_minutes_ago=19.0,
             props={"members": 6, "progress_pct": 22, "next_waypoint": "Cape Martyr", "transport": "snowmobile", "speed_kmh": 18},
         ),
@@ -408,7 +434,7 @@ def _uas() -> list[Asset]:
                 lon=lon,
                 alt_m=0.0 if state != "on_station" else 3200.0,
                 status="maintenance" if state == "maintenance" else "nominal",
-                last_heard_minutes_ago=2.0 if state == "on_station" else 26.0,
+                last_heard_minutes_ago=_REPORTING,
                 props={
                     "base": base,
                     "state": state,
@@ -497,7 +523,7 @@ def _hydrophones() -> list[Asset]:
                 # One unit is unserviceable. `maintenance` rather than a vaguer word,
                 # because the only thing an operator can do about it is send someone.
                 status="maintenance" if i == 6 else "nominal",
-                last_heard_minutes_ago=float(4 + (i * 9) % 50),
+                last_heard_minutes_ago=_REPORTING,
                 props=props,
             )
         )
@@ -828,7 +854,7 @@ def _launch_sites() -> list[Asset]:
                 lon=lon,
                 alt_m=0.0,
                 status="nominal",
-                last_heard_minutes_ago=float(3 + len(key) % 11),
+                last_heard_minutes_ago=_REPORTING,
                 props={
                     "settlement": settlement,
                     "runway_m": runway,

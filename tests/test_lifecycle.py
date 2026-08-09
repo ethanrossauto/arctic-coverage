@@ -21,9 +21,10 @@ from api._lib import db, lifecycle
 
 
 class _FakeCursor:
-    def __init__(self, state: dict | None, executed: list[tuple[str, object]]) -> None:
+    def __init__(self, state: dict, executed: list[tuple[str, object]]) -> None:
         self._state = state
         self.executed = executed
+        self._row: dict | None = state
 
     def __enter__(self) -> _FakeCursor:
         return self
@@ -32,17 +33,46 @@ class _FakeCursor:
         return False
 
     def execute(self, sql: str, params: object = None) -> None:
-        self.executed.append((" ".join(sql.split()), params))
+        flat = " ".join(sql.split())
+        self.executed.append((flat, params))
+
+        # 🔑 THE DOUBLE MODELS THE CONDITIONAL UPDATE, because that statement IS the guard.
+        # A stand-in that always returns a row would report the race as fixed while leaving
+        # it wide open, which is the failure mode this repo has already paid for twice.
+        if "update world_state" in flat and "returning id" in flat:
+            cause, idle_s, floor_s = params  # type: ignore[misc]
+            now = datetime.now(UTC)
+            idle_ok = (now - self._state["last_activity"]).total_seconds() >= float(idle_s)
+            floor_ok = (now - self._state["last_reset"]).total_seconds() >= float(floor_s)
+            if idle_ok and floor_ok:
+                self._state["last_activity"] = now
+                self._state["last_reset"] = now
+                self._state["last_reset_cause"] = cause
+                self._row = {"id": 1}
+            else:
+                self._row = None
+        elif flat.startswith("insert into world_state"):
+            # `_ensure_row` uses `on conflict do nothing` and must not move anything.
+            # `mark_activity` and `_reset_world` use `do update set`, and they must.
+            if "do update set" in flat:
+                now = datetime.now(UTC)
+                if "last_activity = now()" in flat:
+                    self._state["last_activity"] = now
+                if "last_reset = now()" in flat:
+                    self._state["last_reset"] = now
+            self._row = None
+        else:
+            self._row = self._state
 
     def executemany(self, sql: str, rows: object) -> None:
         self.executed.append((" ".join(sql.split()), f"{len(list(rows))} rows"))
 
     def fetchone(self) -> dict | None:
-        return self._state
+        return self._row
 
 
 class _FakeConn:
-    def __init__(self, state: dict | None, executed: list[tuple[str, object]]) -> None:
+    def __init__(self, state: dict, executed: list[tuple[str, object]]) -> None:
         self._state = state
         self.executed = executed
         self.commits = 0
@@ -253,17 +283,24 @@ def test_touching_is_a_post_and_reading_is_a_get(clock, logged):
 
     Answering "what is the state" must not change the state, or one open tab holds the
     world alive forever. Saying "a person did something" must.
+
+    ⚠️ ASSERTED ON THE EFFECT, NOT ON THE SQL. This counted statements containing
+    "last_activity = now()", and the atomic claim legitimately contains that text while
+    applying it only when its WHERE clause holds. Grepping the query made a correct guard
+    look like a violation. What matters is whether the clock moved.
     """
     client = TestClient(index.app)
-    _, executed = clock
+    state, _ = clock
+    # Inside the window, so nothing here is due a reset and the only thing that can move the
+    # clock is a deliberate act.
+    state["last_activity"] = datetime.now(UTC) - timedelta(minutes=5)
+    before = state["last_activity"]
 
     client.get("/api/world")
-    reads = sum(1 for sql, _ in executed if "last_activity = now()" in sql)
-    assert reads == 0, "polling the clock must never wind it"
+    assert state["last_activity"] == before, "polling the clock must never wind it"
 
     client.post("/api/world/touch")
-    writes = sum(1 for sql, _ in executed if "last_activity = now()" in sql)
-    assert writes == 1
+    assert state["last_activity"] > before, "a deliberate act must wind it"
 
 
 def test_the_reset_endpoint_refuses_with_429_and_the_seconds_to_wait(clock, logged):
@@ -276,3 +313,36 @@ def test_the_reset_endpoint_refuses_with_429_and_the_seconds_to_wait(clock, logg
     assert res.status_code == 429
     assert res.json()["retry_after_s"] == pytest.approx(50, abs=2)
     assert res.headers["retry-after"]
+
+
+def test_two_racing_requests_produce_exactly_one_reset(clock, logged):
+    """🔴 THE RACE, AS IT ACTUALLY HAPPENED, AND THE AUDIT LOG IS WHERE IT SHOWED UP.
+
+    The browser polls /api/entities and /api/mesh together every five seconds and /api/world
+    on its own timer, and three of those paths run the idle check. Every one of them read
+    `world_state`, all of them saw a reset was owed because none had written yet, and the
+    world was torn down and reseeded three times inside one second: rows 897, 898 and 899,
+    identical but for the id.
+
+    ⚠️ THE SIXTY-SECOND FLOOR DID NOT CATCH IT AND COULD NOT. It was evaluated from the same
+    stale read as the window it was meant to backstop. A floor checked non-atomically holds
+    only when requests happen to arrive one at a time.
+    """
+    state, _ = clock
+    state["last_activity"] = datetime.now(UTC) - timedelta(minutes=31)
+    state["last_reset"] = datetime.now(UTC) - timedelta(hours=1)
+
+    won = [lifecycle.reset_if_idle(seed_rows=[]) for _ in range(3)]
+
+    assert won == [True, False, False], "exactly one caller may do the work"
+    assert len(logged) == 1, "and the log records one reset, not three"
+
+
+def test_losing_the_claim_is_not_an_error(clock, logged):
+    """A caller that loses wanted the world reset and the world is being reset. There is
+    nothing to report and nothing to retry."""
+    state, _ = clock
+    state["last_activity"] = datetime.now(UTC) - timedelta(minutes=31)
+
+    assert lifecycle.reset_if_idle(seed_rows=[]) is True
+    assert lifecycle.reset_if_idle(seed_rows=[]) is False

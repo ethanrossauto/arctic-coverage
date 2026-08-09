@@ -56,7 +56,10 @@ export function collectPageProblems(page: Page): PageProblems {
  * through Postgres to the DOM is intact.
  */
 export async function waitForAppLoaded(page: Page): Promise<void> {
-  await page.getByText(/assets\s+\d+/).waitFor({ state: "visible", timeout: 30_000 });
+  // The colon is optional so this probe survives the strip's label being punctuated. It is
+  // a readiness check, not an assertion about wording, and it gates every browser test in
+  // this suite: pinning it to exact punctuation makes a cosmetic edit look like 19 failures.
+  await page.getByText(/assets:?\s+\d+/).waitFor({ state: "visible", timeout: 30_000 });
 }
 
 /**
@@ -66,7 +69,14 @@ export async function waitForAppLoaded(page: Page): Promise<void> {
  * about the ice must not pass merely because the assets arrived.
  */
 export async function waitForIceLoaded(page: Page): Promise<void> {
-  await page.locator(".timebar .icedate").waitFor({ state: "visible", timeout: 30_000 });
+  // ⚠️ KEYED ON THE MONTH PICKER, WHICH IS THE THING THAT CANNOT EXIST UNTIL THE
+  // MEASUREMENTS HAVE ARRIVED. The timebar renders "loading ice measurements…" and nothing
+  // else until then, so the picker's presence is the component's own statement that it has
+  // data. This waited on a `measurement N of M` readout instead, and removing that label
+  // from the display took six tests with it, most of them about other things entirely: a
+  // readiness probe aimed at a decorative label fails exactly as loudly as a broken app and
+  // means something completely different. Aim these at load-bearing markup.
+  await page.locator(".timebar .icepick").waitFor({ state: "visible", timeout: 30_000 });
 }
 
 /**

@@ -16,12 +16,9 @@
  * living in the README. It is the fraction of sea surface covered by ice on a 25 km grid.
  * A cell reading 90% says nothing about the particular hundred metres under a vehicle.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 
 import { useStore } from "./store";
-
-/** Milliseconds per measurement while playing. Slow enough to read the month. */
-const STEP_MS = 320;
 
 const MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 
@@ -37,11 +34,19 @@ function label(iso: string): string {
   return `${monthOf(iso)} ${yearOf(iso)}`;
 }
 
-export function IceTimebar() {
+/**
+ * `children` are placed at the RIGHT END of this row, and the slot exists so that the
+ * status strip below can hold nothing but counts.
+ *
+ * 🔑 A SLOT RATHER THAN A SECOND POSITIONED ELEMENT. This row is absolutely positioned at
+ * a fixed offset above the footer, and the one previous attempt in this file to keep two
+ * things at the same offset by giving both the same `bottom` is recorded three comments
+ * up as having silently overlapped when one of them grew. Passing the content in means
+ * there is one row, laid out by one flex container, and it cannot come apart.
+ */
+export function IceTimebar({ children }: { children?: ReactNode }) {
   const ice = useStore((s) => s.ice);
   const setIceDate = useStore((s) => s.setIceDate);
-  const scrubbing = useStore((s) => s.iceScrubbing);
-  const setScrubbing = useStore((s) => s.setIceScrubbing);
 
   // 🔑 THE PICKER HOLDS A CHOICE, THE BUTTON APPLIES IT, and that split is the reason the
   // button exists. Changing month fetches that month's measurement tile, so a select that
@@ -50,41 +55,29 @@ export function IceTimebar() {
   // list is still open. Choosing is now free and only committing costs anything.
   const [chosen, setChosen] = useState<string | null>(null);
 
-  // ⚠️ MEMOISED, AND NOT FOR TIDINESS. `ice?.dates ?? []` builds a NEW empty array on every
-  // render whenever `ice` is absent, so it is a fresh reference each time. It is a
-  // dependency of the playback effect below, which therefore tore down and re-armed its
-  // timeout on every render: play mode would step at whatever rate React happened to
-  // re-render rather than at STEP_MS. Found by react-hooks/exhaustive-deps.
+  // ⚠️ MEMOISED BECAUSE `ice?.dates ?? []` BUILDS A NEW EMPTY ARRAY EVERY RENDER while the
+  // measurements are still loading, and a fresh reference each time is a dependency that
+  // never settles. The specific bug it was written for is gone with the playback effect
+  // that used to read it; the reference is still worth keeping stable and the reason is no
+  // longer that one.
   const dates = useMemo(() => ice?.dates ?? [], [ice]);
   // Indexed off the date actually SHOWN, not off the requested one. Those differ until
   // the first snap resolves, and driving the control from the request would let it sit
   // somewhere the map is not.
   const i = ice ? dates.indexOf(ice.date) : -1;
 
-  // Play steps one measurement at a time and wraps. It is deliberately not tied to
-  // anything else on screen: this is five years of history, and nothing else here has a
-  // timeline at all.
-  useEffect(() => {
-    if (!scrubbing || i < 0 || dates.length === 0) return;
-    const t = setTimeout(() => {
-      setChosen(null);
-      setIceDate(dates[(i + 1) % dates.length]);
-    }, STEP_MS);
-    return () => clearTimeout(t);
-  }, [scrubbing, i, dates, setIceDate]);
-
   if (!ice || i < 0) {
     return (
       <div className="timebar">
         <span className="dim">loading ice measurements…</span>
+        {/* Rendered on the loading path too. The disclosure and the world controls have
+            nothing to do with ice, so having them appear only once a tile has downloaded
+            would blank the reset button for the first second of every visit. */}
+        {children && <span className="timebar-right">{children}</span>}
       </div>
     );
   }
 
-  // ⚠️ The steppers and play apply immediately and CLEAR the pending choice. They are each
-  // one deliberate action already, so making them wait behind GO would be ceremony; and
-  // leaving a pending value behind would show the picker on one month while the map drew
-  // another, which is the exact confusion the button is meant to remove.
   // 🔑 DERIVED, NOT SYNCED. A choice only counts while it differs from what is drawn, so
   // "is something waiting" is a question about the current render rather than a second
   // piece of state to keep in step. An effect that watched the drawn date and cleared the
@@ -96,11 +89,6 @@ export function IceTimebar() {
   // reading as though GO had failed.
   const pending = chosen && chosen !== ice.date ? chosen : null;
 
-  const step = (by: number) => {
-    const n = Math.min(dates.length - 1, Math.max(0, i + by));
-    setChosen(null);
-    setIceDate(dates[n]);
-  };
 
   // Grouped by year, because 55 flat options is a scroll and "which year am I in" is the
   // first thing you want to know. The groups come from the data rather than from a range,
@@ -116,17 +104,13 @@ export function IceTimebar() {
 
   return (
     <div className="timebar">
-      <button
-        className="play"
-        onClick={() => setScrubbing(!scrubbing)}
-        title="Step through every measurement, oldest to newest"
-      >
-        {scrubbing ? "❚❚" : "▶"}
-      </button>
-
-      <button className="stepbtn" onClick={() => step(-1)} disabled={i === 0} title="Previous measurement">
-        ‹
-      </button>
+      {/* 🔑 A MONTH AND A GO, AND NOTHING ELSE. This carried a play button and a stepper
+          either side of the picker, which is four ways to change one value. Stepping
+          through sixty measurements is a thing to watch rather than a thing to read, and
+          the select already reaches any month in one action. */}
+      <span className="dim caveat" title={`${ice.caveat}\n\n${ice.citation}`}>
+        measured sea ice concentration date
+      </span>
 
       <select
         className="icepick"
@@ -156,27 +140,7 @@ export function IceTimebar() {
         GO
       </button>
 
-      <button
-        className="stepbtn"
-        onClick={() => step(1)}
-        disabled={i === dates.length - 1}
-        title="Next measurement"
-      >
-        ›
-      </button>
-
-      {/* 🔑 THE SELECT IS THE READOUT. There was a separate date label here and it printed
-          the same month the picker already shows, two centimetres apart. One fact, one
-          place. What earns its own text is the thing the picker cannot say: WHICH of the
-          measurements you are on, so "one per month, five years" is legible rather than
-          implied by a list you would have to scroll to count. */}
-      <span className="icedate dim">
-        measurement {i + 1} of {dates.length}
-      </span>
-
-      <span className="dim caveat" title={`${ice.caveat}\n\n${ice.citation}`}>
-        measured sea ice concentration, not thickness
-      </span>
+      {children && <span className="timebar-right">{children}</span>}
     </div>
   );
 }

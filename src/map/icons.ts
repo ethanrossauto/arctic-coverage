@@ -60,6 +60,10 @@ export const KIND_COLOR: Record<string, string> = {
   // that is a decision about the data, not about this table.
   aircraft: "#d8dee9",
   ground_party: "#d8dee9",
+  // Held, and not saying who they are. Same red as the vessel that will not broadcast,
+  // because it is the same fact about the world.
+  aircraft_dark: "#ff5c5c",
+  ground_party_dark: "#ff5c5c",
   marker: "#c9d4e0",
   /**
    * The backhaul badge. Its own colour: being the way out is not a condition.
@@ -198,27 +202,30 @@ const SHAPES: Record<string, (c: string) => string> = {
    * getting a shape of its own: the operator should still read "node" at a glance, then
    * "and this one is the way out".
    *
-   * ⚠️ IT IS A BODY WITH SOLAR PANELS, NOT A DISH. The first version was a ground dish with
-   * uplink arcs, which reads as "radio" rather than as "satellite" and looked like every
-   * other antenna on the map. Panels either side of a bus is the shape everyone already
-   * knows, and it stays legible when the badge is only twenty pixels across.
+   * ⚠️ A DISH, AND IT HAS TO EARN THAT AGAINST TWO NEIGHBOURS. An earlier ground dish was
+   * replaced by a satellite body with panels precisely because it "looked like every other
+   * antenna on the map", and that objection was correct about the drawing rather than about
+   * dishes: `radar` and `node` are both a SYMMETRIC upward arc on a VERTICAL mast, so
+   * anything with that skeleton joins the crowd whatever the detail.
+   *
+   * So this one differs in skeleton, not in decoration. The face is tilted rather than
+   * upright and filled rather than a hairline arc, it carries a feed horn on an arm, and the
+   * waves radiate along the direction it points instead of sitting in concentric rings above
+   * a mast. At twenty pixels the eye gets "angled oval with a stalk" against "symmetric arc",
+   * which survives being small in a way that fine detail does not.
    *
    * Drawn by its own layer and offset clear of the icon, so it never competes with the
    * condition ring or covers the silhouette underneath.
    */
   gateway_badge: (c) => `
-    <rect x="12.4" y="10.6" width="7.2" height="10.8" rx="1.2"
-          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
-    <rect x="0.9" y="12.4" width="10" height="7.2" rx="0.8"
-          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
-    <rect x="22.1" y="12.4" width="10" height="7.2" rx="0.8"
-          fill="${BACKING}" stroke="${c}" stroke-width="2.2"/>
-    <path d="M5.9 12.4 V19.6 M27.1 12.4 V19.6" stroke="${c}" stroke-width="1.3"/>
-    <path d="M16 10.6 V6.2" stroke="${c}" stroke-width="2" stroke-linecap="round"/>
-    <circle cx="16" cy="4.6" r="1.9" fill="${c}"/>
-    <path d="M16 21.4 V24.4" stroke="${c}" stroke-width="2" stroke-linecap="round"/>
-    <path d="M11.6 29.4 A5.6 5.6 0 0 1 20.4 29.4" fill="none" stroke="${c}"
-          stroke-width="2.2" stroke-linecap="round"/>`,
+    <path d="M12.5 18 L11.5 27" stroke="${c}" stroke-width="2.4" stroke-linecap="round"/>
+    <ellipse cx="12.5" cy="15" rx="9.4" ry="4.6" transform="rotate(42 12.5 15)"
+             fill="${BACKING}" stroke="${c}" stroke-width="2.6"/>
+    <circle cx="16.9" cy="10.2" r="1.7" fill="${c}"/>
+    <path d="M12.7 4.7 A 10.5 10.5 0 0 1 22.5 11.8" fill="none" stroke="${c}"
+          stroke-width="1.9" stroke-linecap="round"/>
+    <path d="M16.1 2.5 A 13 13 0 0 1 24.6 10.1" fill="none" stroke="${c}"
+          stroke-width="1.7" stroke-linecap="round" opacity="0.6"/>`,
 
   /** Air contact: a swept planform, pointing where it is going. */
   aircraft: (c) => `
@@ -259,6 +266,21 @@ export function iconMarkup(kind: string, size: number): string {
 }
 
 /** Every image id this module registers. Exported so the map can assert they all arrived. */
+// 🔴 THE RED VARIANTS, ADDED WHEN "ANY DETECTED UNKNOWN IS RED" BECAME THE RULE. The table
+// above used to say air and land contacts take the neutral, and that if either should get
+// the red treatment a vessel gets, it was a decision about the data rather than about the
+// table. That decision has now been made: what earns red is being a contact this network
+// HOLDS and cannot identify, whatever it turns out to be flying or driving.
+//
+// ⚠️ THE SAME SILHOUETTE, NOT A NEW ONE. An unidentified aircraft is still an aircraft and
+// has to read as one; only the colour says we do not know whose it is. Reusing the shape
+// function is also what stops the two drifting apart the first time either is redrawn.
+//
+// 🔑 SEPARATE IMAGES BECAUSE THESE ARE FULL-COLOUR RASTERS, NOT SDFs, so `icon-color` cannot
+// tint them at runtime. One image per (shape, colour) pair is the cost of hand-drawn icons.
+SHAPES.aircraft_dark = SHAPES.aircraft;
+SHAPES.ground_party_dark = SHAPES.ground_party;
+
 export const ICON_IDS = Object.keys(SHAPES);
 
 function svg(kind: string): string {
@@ -363,7 +385,12 @@ export const ICON_PIXEL_RATIO = SCALE;
 export function iconImageExpression(): unknown[] {
   return [
     "case",
-    // A vessel's identity, not its kind, decides its silhouette.
+    // 🔑 IDENTITY BEFORE KIND, FOR ALL THREE CONTACT KINDS. What decides the red is whether
+    // this is something we are holding and cannot name, so the kind only chooses which red
+    // silhouette to draw. Ordered above the kind match because a contact is a vessel AND
+    // unidentified, and the second fact is the one worth seeing first.
+    ["all", ["==", ["get", "dark"], true], ["==", ["get", "kind"], "aircraft"]], "aircraft_dark",
+    ["all", ["==", ["get", "dark"], true], ["==", ["get", "kind"], "ground_party"]], "ground_party_dark",
     ["==", ["get", "dark"], true], "vessel_dark",
     // `vessel_dark` is chosen by identity above; `gateway_badge` is not a kind at all and
     // is drawn by its own layer. Neither may be reached by matching on `kind`.

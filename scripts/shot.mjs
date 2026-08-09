@@ -42,7 +42,8 @@ await page.goto(url, { waitUntil: "networkidle" });
 // one tool for looking at the display timed out against a display that was rendering
 // perfectly. A readiness probe aimed at an optional feature fails as loudly as a broken
 // app and means something entirely different.
-await page.getByText(/assets\s+\d+/).waitFor({ timeout: 30_000 });
+// Colon optional: a readiness probe must not break because a label gained punctuation.
+await page.getByText(/assets:?\s+\d+/).waitFor({ timeout: 30_000 });
 
 let colours = 0;
 const deadline = Date.now() + 45_000;

@@ -99,22 +99,63 @@ export async function touchWorld(): Promise<void> {
  * between a click and the next poll, and nothing else should be able to read or reason
  * about it.
  */
-let selfReset = false;
+let selfResetUntil = 0;
 
-/** Ask for a reset. Returns the seconds to wait when the floor has not elapsed. */
+/**
+ * How long this tab keeps taking responsibility for a reset it asked for.
+ *
+ * 🔴 ONE BUTTON PRESS PRODUCES MORE THAN ONE GENERATION, WHICH IS WHY A SINGLE-USE FLAG WAS
+ * NOT ENOUGH. The server stamps `last_reset` twice per reset: once when it claims the right
+ * to do it, atomically, which is what makes the floor a floor, and again when it lays the
+ * world back down about two seconds later. `generation` is read off that column, so the
+ * clock changes twice. The first change was correctly attributed to this tab and cleared the
+ * flag; the second then found nothing set and announced that a stranger had done it.
+ *
+ * ⚠️ A WINDOW RATHER THAN A COUNT, so a third write, or a slow reset landing across three
+ * polls, cannot bring the bug back in a new shape. Comfortably longer than a reset takes
+ * (measured at about two seconds) and comfortably shorter than the sixty second floor, so it
+ * cannot swallow a genuine notice: nobody else's reset can even be accepted inside it.
+ */
+const SELF_RESET_WINDOW_MS = 15_000;
+
+/**
+ * Ask for a reset. Returns the seconds to wait when the floor has not elapsed.
+ *
+ * 🔴 THE CLAIM IS STAKED BEFORE THE REQUEST, NOT AFTER IT, AND THE ORDER IS THE WHOLE BUG.
+ * Setting the flag on the response looks right and loses a race that is easy to hit: the
+ * server deletes and reseeds the world and only then answers, so for the second or so that
+ * takes, the new generation is already visible to anyone who asks. The clock is polled every
+ * five seconds, so a tick landing inside that window finds a changed world while this tab
+ * still believes it caused nothing, and the person who just pressed the button is told
+ * another viewer reset it. Measured against a real reset, that window is most of a second.
+ *
+ * ⚠️ CLEARED AGAIN IF NOTHING HAPPENED. A refused reset, the floor not elapsed or the
+ * request failing outright, must not leave the flag standing: it would swallow the next
+ * genuine notice, which is the one case this whole mechanism exists to deliver.
+ */
 export async function resetWorld(): Promise<{ ok: boolean; retryAfterS?: number }> {
-  const res = await fetch("/api/reset", { method: "POST" });
-  const body = (await res.json().catch(() => ({}))) as { retry_after_s?: number };
-  if (res.status === 429) return { ok: false, retryAfterS: body.retry_after_s ?? 60 };
-  if (res.ok) selfReset = true;
-  return { ok: res.ok };
+  selfResetUntil = Date.now() + SELF_RESET_WINDOW_MS;
+  try {
+    const res = await fetch("/api/reset", { method: "POST" });
+    const body = (await res.json().catch(() => ({}))) as { retry_after_s?: number };
+    if (!res.ok) selfResetUntil = 0;
+    if (res.status === 429) return { ok: false, retryAfterS: body.retry_after_s ?? 60 };
+    return { ok: res.ok };
+  } catch (e) {
+    selfResetUntil = 0;
+    throw e;
+  }
 }
 
-/** True once, for the tab that asked. Reading it clears it. */
-export function consumeSelfReset(): boolean {
-  const was = selfReset;
-  selfReset = false;
-  return was;
+/**
+ * Is this tab still answerable for the world changing under it?
+ *
+ * ⚠️ IT DOES NOT CLEAR ITSELF, and that is the fix rather than an oversight. See the window
+ * above: one reset moves the generation more than once, so a flag that emptied on the first
+ * change left the second one looking like somebody else's work.
+ */
+export function isSelfReset(): boolean {
+  return Date.now() < selfResetUntil;
 }
 
 /** `95` becomes `1:35`. Seconds are what a countdown is for. */
@@ -127,11 +168,18 @@ export function formatCountdown(seconds: number): string {
  * What to tell a viewer whose world just changed.
  *
  * ⚠️ THE CAUSE IS READ, NEVER ASSUMED. An idle reset was announced by the countdown, so the
- * notice is a confirmation of something expected. A reset somebody else asked for arrived
- * with no warning at all, and calling that one a timeout would be telling the viewer
- * something untrue about their own session.
+ * notice is a confirmation of something expected. A reset somebody asked for arrived with no
+ * warning at all, and calling that one a timeout would be telling the viewer something
+ * untrue about their own session.
+ *
+ * 🔑 THE MANUAL CASE DOES NOT NAME WHO DID IT, DELIBERATELY. It used to say "by another
+ * viewer", which is a claim this code cannot actually support: all it knows is that the
+ * generation moved and that this tab did not ask for it inside the last few seconds. A slow
+ * request, a second tab of your own, or a reset landing either side of that window all make
+ * "another viewer" a confident guess about a stranger who may not exist. What happened is
+ * that the world was reset, so that is what it says.
  */
 export function resetNoticeFor(cause: string | undefined, minutes: number): string {
-  if (cause === "manual") return "the shared world was reset by another viewer";
+  if (cause === "manual") return "the shared world was reset";
   return `the shared world was reset after ${Math.round(minutes)} minutes idle`;
 }

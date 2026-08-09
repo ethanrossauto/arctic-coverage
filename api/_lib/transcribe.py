@@ -18,6 +18,7 @@ to keep working when the microphone path does not.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any
@@ -62,11 +63,57 @@ MODEL = "gemini-3.5-flash-lite"
 # punctuates and capitalises into something the deterministic parser then misses, and a
 # spoken "mesh status" comes back as "Mesh status." and falls through to tier 2 for no
 # reason. Cheap prompt, real saving.
+# 🔴 "AS A SINGLE SHORT COMMAND" USED TO BE IN THIS PROMPT AND IT WAS ACTIVELY HARMFUL.
+# Verbatim and "as a command" are two instructions in tension, and the second one won:
+# asked out loud, "what is a backhaul" came back as "backhaul", so the operator watched the
+# console answer a question they had not asked and had no way to tell whether it had
+# misheard them or reinterpreted them.
+#
+# 🔑 THE TRANSCRIPT IS EVIDENCE, NOT INPUT. It is the only thing on screen that says what
+# the microphone actually received, which is what makes a misread visible rather than
+# mysterious. A transcriber that tidies an utterance into a command destroys the one signal
+# the display has for distinguishing "it did not hear me" from "it did not understand me",
+# and those need completely different reactions from the person at the keyboard.
+#
+# Spelling is a different matter and is still corrected: the vocabulary hint below exists so
+# that "Daymark" does not arrive as "day mark". Fixing how a word is written is not the same
+# as deciding which words were said.
 PROMPT = (
-    "Transcribe this audio verbatim as a single short command for a mapping console. "
+    "Transcribe this audio verbatim. Write down every word that was spoken, in the order "
+    "they were spoken. Do NOT shorten it, do not turn it into a command, do not drop "
+    "question words, and do not summarise: a question must come back as a question. "
     "Output only the words spoken, in lower case, with no trailing punctuation, no "
     "quotation marks and no commentary. Proper nouns keep their capitals. "
     "If the audio contains no intelligible speech, output exactly: NO_SPEECH"
+)
+
+# 🔴 TWO ANSWERS FROM ONE CALL, AND THE REASON IS A FAILURE THIS PATH HAD ALREADY MEASURED
+# ONCE. The vocabulary hint below is what makes asset names transcribe correctly, and it is
+# also what let "hide everything except for unknowns" come back as "hide everything except
+# UNKNOWN 01, UNKNOWN 02, UNKNOWN 03". The operator then reads their own sentence rewritten
+# into words they did not say, cannot tell whether the microphone failed or the system
+# decided something, and has no way to correct it.
+#
+# 🔑 SO THE SNAPPING IS SEPARATED FROM THE HEARING RATHER THAN SOFTENED. `heard` is what
+# the audio contained, with the hint list explicitly not applied. `command` is that same
+# sentence with names matched to what is on the map, which is the version worth running.
+# The display shows what was heard and says out loud when it assumed something.
+#
+# ⚠️ ONE CALL, NOT TWO. A second pass would double the cost and the latency of every spoken
+# command to produce a string the first call already has. The model is asked for both
+# fields at once, from the same audio.
+JSON_INSTRUCTION = (
+    "\n\nReturn a JSON object with exactly two string fields and nothing else:\n"
+    '"heard": the verbatim transcription described above, using ONLY the words actually '
+    "spoken. Never substitute a name from any list into this field, never expand a plural "
+    "into individual names, and never add a word the speaker did not say.\n"
+    '"command": the same sentence with any proper noun corrected to the spelling used on '
+    "the map, and with spoken numbers written as digits. If nothing needed correcting, "
+    'repeat "heard" exactly.\n'
+    'If the audio contains no intelligible speech, set both fields to "NO_SPEECH".\n'
+    "⚠️ The names listed below exist to spell real speech correctly. NEVER assemble a "
+    "command out of them to fill silence, faint audio or noise: if you cannot make out "
+    'actual words, the answer is "NO_SPEECH", not a plausible sentence.'
 )
 
 # 🔑 THE OPERATOR IS READING THEIR OWN SCREEN, SO THE SCREEN IS THE VOCABULARY. Almost
@@ -92,6 +139,13 @@ COMMAND_VOCABULARY: tuple[str, ...] = (
     # what to do
     "isolate", "frame", "focus", "zoom out", "reset the view", "place", "remove", "delete",
     "task", "send", "history", "track", "describe", "show", "list", "filter",
+    # 🔑 CHANGING WHAT IS DRAWN, and these are the words a test cannot notice are missing.
+    # The vocabulary check pins the static half to the code's enums, so a new fault, overlay
+    # or kind gets caught automatically. A new VERB is in no enum at all: nothing knew the
+    # display had learned "hide" until somebody said it and got the wrong command back, with
+    # every asset name in the sentence heard perfectly.
+    "hide", "unhide", "only", "except", "show only", "hide everything except",
+    "show all assets", "show everything", "bring back",
     # breaking and fixing, which are near-homophones of ordinary words
     "kill", "silence", "take down", "fault", "maintenance", "unserviceable", "out of service",
     "fix", "repair", "restore", "clear the fault",
@@ -120,6 +174,21 @@ ALLOWED_MIME = {
 
 class TranscriptionError(RuntimeError):
     """Voice is unavailable, or the audio was unusable. Never a crash."""
+
+
+class NoSpeech(TranscriptionError):
+    """There was nothing to transcribe. A real outcome, not a failure.
+
+    🔑 A SUBCLASS SO THE DISPLAY CAN TELL IT APART FROM A BROKEN MICROPHONE, which are two
+    situations needing opposite reactions. A missing key, an unsupported format or a
+    provider that will not answer are all worth telling somebody about. Silence is not:
+    they pressed record, said nothing, and already know it, and the level meter beside the
+    button is what answers "is it hearing me at all".
+
+    ⚠️ IT IS STILL LOGGED. The operator is not told, and the audit row is still written,
+    because "the microphone produced nothing" is worth being able to see afterwards even
+    though it is not worth interrupting anybody over.
+    """
 
 
 def normalise_mime(content_type: str | None) -> str:
@@ -179,24 +248,73 @@ def _live_vocabulary() -> list[str]:
 
 
 def build_prompt() -> str:
-    """The instruction plus whatever is on the map right now."""
+    """The instruction plus whatever is on the map right now.
+
+    ⚠️ THE OUTPUT INSTRUCTION IS APPENDED ON BOTH BRANCHES, and the first version of this
+    put it on only one. The branch it was missing from is the one that runs in production,
+    because a live world always has a vocabulary, so the model was never told to answer as
+    JSON and the reply always fell back to a single field. The feature would have been dead
+    everywhere except a database outage, and the fallback is silent by design, so nothing
+    would have said so.
+    """
     vocabulary = _live_vocabulary()
     if not vocabulary:
-        return PROMPT
+        return PROMPT + JSON_INSTRUCTION
 
     return (
         PROMPT
         + "\n\nThe speaker is looking at a map containing these names and is likely to "
-        "say some of them. When the audio is a close match to one, prefer its spelling "
-        "exactly as written here. Do NOT force a match: if the speaker clearly says "
-        "something else, transcribe what they said.\n"
+        'say some of them. These names apply to the "command" field ONLY: when the audio '
+        'is a close match to one, use its spelling exactly as written here in "command". '
+        "Do NOT force a match: if the speaker clearly says something else, keep what they "
+        'said. The "heard" field never uses this list at all.\n'
         + ", ".join(vocabulary)
         + "\n\nCoordinates are spoken as numbers and must be written as digits: "
         '"seventy three point two minus ninety five point nine" is "73.2 -95.9". '
         'Write "minus" or "negative" before a coordinate as a leading hyphen. '
         "Identifiers mixing a word and a number keep the number as digits: "
         '"barrow strait oh five" is "Barrow Strait 05".'
+        + JSON_INSTRUCTION
     )
+
+
+def _tidy(value: str) -> str:
+    """Belt and braces against punctuation the parser would then miss."""
+    return value.strip().strip('"').rstrip(".").strip()
+
+
+def _two_fields(raw: str) -> tuple[str, str]:
+    """`(heard, command)` out of the model's reply.
+
+    🔒 FALLS BACK TO ONE STRING RATHER THAN FAILING. The reply is asked for as JSON, and a
+    model can still return a bare sentence, wrap it in a code fence, or add a stray word.
+    None of that is worth losing an operator's command over: an unparseable reply is
+    treated as the transcription itself and used for both fields, which is exactly the
+    behaviour this path had before there were two.
+
+    ⚠️ THE FALLBACK IS INDISTINGUISHABLE FROM A CORRECTION-FREE UTTERANCE, on purpose. Both
+    mean "nothing was assumed", which is what the display needs to know.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        # A fenced block: drop the fence and any language tag on the opening line.
+        text = text.strip("`")
+        if "\n" in text:
+            first, rest = text.split("\n", 1)
+            if first.strip().lower() in ("json", ""):
+                text = rest
+    text = text.strip()
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            heard = _tidy(str(parsed.get("heard", "")))
+            command = _tidy(str(parsed.get("command", ""))) or heard
+            return heard or command, command
+    flat = _tidy(text)
+    return flat, flat
 
 
 def transcribe(audio: bytes, content_type: str | None) -> dict[str, Any]:
@@ -236,19 +354,19 @@ def transcribe(audio: bytes, content_type: str | None) -> dict[str, Any]:
         raise TranscriptionError(f"{type(exc).__name__}: {exc}") from exc
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    text = (response.text or "").strip()
+    heard, text = _two_fields(response.text or "")
 
     # The model was told to say this rather than invent words for silence. Treated as a
     # real outcome, not an error: the operator pressed record and said nothing.
     if not text or text == "NO_SPEECH":
-        raise TranscriptionError("no speech in that recording")
-
-    # Belt and braces against the model adding punctuation the parser would then miss.
-    text = text.strip().strip('"').rstrip(".").strip()
+        raise NoSpeech("no speech in that recording")
 
     usage = getattr(response, "usage_metadata", None)
     return {
         "text": text,
+        # What the audio actually contained, before any name was matched to the map. The
+        # display shows this, so the operator always reads their own sentence.
+        "heard": heard,
         "model": MODEL,
         "latency_ms": elapsed_ms,
         "audio_bytes": len(audio),

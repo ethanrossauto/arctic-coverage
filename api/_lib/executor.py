@@ -59,43 +59,74 @@ class PlanRejected(Exception):
     and four.
     """
 
-    def __init__(self, reasons: list[str]) -> None:
+    def __init__(self, reasons: list[str], *, command_id: str | None = None) -> None:
         super().__init__("; ".join(reasons))
         self.reasons = reasons
+        # 🔑 THE ID THE REJECTION WAS LOGGED UNDER, so a caller that escalates can hang the
+        # retry off it. Without this the model's second attempt was logged as an orphan and
+        # the audit panel showed two unrelated cards for one command: the plan that was
+        # refused, and an answer with no visible cause.
+        self.command_id = command_id
 
 
 def validate(plan: list[dict[str, Any]]) -> list[str]:
-    """Every reason this plan must not run. Empty means it may."""
+    """Every reason this plan must not run. Empty means it may.
+
+    🔴 THESE SENTENCES ARE READ BY AN OPERATOR, NOT ONLY BY A LOG. A rejected plan is one
+    of the ways this console answers, so a reason written as `step 1 (task_uas): altitude
+    99000.0 is out of range` puts a step index, a function name and a repr in front of
+    somebody who asked a question about a drone. Every reason below now says what is wrong
+    with the REQUEST, in the words the request was made in.
+
+    ⚠️ THE STEP NUMBER SURVIVES ONLY WHERE IT MEANS SOMETHING. In a single-step plan, which
+    is nearly all of them, "step 1" is noise: there is only one thing being asked for. In a
+    chain it is the only way to say WHICH part failed, so it is kept there and dropped
+    otherwise.
+    """
     reasons: list[str] = []
 
     if not isinstance(plan, list) or not plan:
-        return ["the plan is empty"]
+        return ["there was nothing here to run for that one"]
     if len(plan) > MAX_STEPS:
-        return [f"the plan has {len(plan)} steps; the limit is {MAX_STEPS}"]
+        return [
+            f"that asks for {len(plan)} actions at once, and {MAX_STEPS} is the most "
+            "this console will run in one command"
+        ]
+
+    many = len(plan) > 1
+
+    def where(i: int) -> str:
+        """`step 2: ` in a chain, nothing at all in a plan with one step."""
+        return f"step {i}: " if many else ""
 
     for i, step in enumerate(plan, start=1):
         if not isinstance(step, dict):
-            reasons.append(f"step {i} is not an object")
+            reasons.append(f"{where(i)}that part of the request did not arrive as a command")
             continue
         name = step.get("tool")
         if not name:
-            reasons.append(f"step {i} names no tool")
+            reasons.append(f"{where(i)}that part of the request names nothing to do")
             continue
         spec = REGISTRY.get(name)
         if spec is None:
             # ⚠️ THE ALLOWLIST IS THE REGISTRY ITSELF. A model that invents a plausible
             # tool name gets refused here rather than reaching a getattr somewhere.
-            reasons.append(f'step {i}: "{name}" is not a tool. Available: {", ".join(sorted(REGISTRY))}')
+            reasons.append(
+                f'{where(i)}there is no "{_action(name)}" command on this display. '
+                "What exists: " + ", ".join(_action(t) for t in sorted(REGISTRY))
+            )
             continue
 
         params = step.get("params", {})
         if not isinstance(params, dict):
-            reasons.append(f"step {i}: params must be an object")
+            reasons.append(f"{where(i)}the details of that request did not arrive in a usable form")
             continue
 
         unknown = set(params) - set(spec.params)
         if unknown:
-            reasons.append(f'step {i} ({name}): unknown parameters {", ".join(sorted(unknown))}')
+            reasons.append(
+                f"{where(i)}I cannot give {_action(name)} {_spoken(sorted(unknown))}"
+            )
 
         # ⚠️ MISSING IS AS INVALID AS WRONG, and this used to check only the second one.
         # `place_asset` with no `lat` passed validation cleanly and then died inside the
@@ -105,20 +136,80 @@ def validate(plan: list[dict[str, Any]]) -> list[str]:
         # being able to tell a bad request from a broken tool.
         missing = sorted(set(_required(spec.fn)) - set(params))
         if missing:
-            reasons.append(f'step {i} ({name}): missing required parameters {", ".join(missing)}')
+            # ⚠️ THE TOOL IS NOT NAMED HERE, DELIBERATELY. "to task uas I still need a
+            # latitude" trips over an identifier in the middle of a sentence, and the
+            # operator already knows what they asked for. In a chain, `where` says which
+            # step it was, which is the part they cannot infer.
+            reasons.append(f"{where(i)}I still need {_spoken(missing)} for that")
 
         # Numeric sanity, clamped here rather than trusted. A hallucinated latitude is
         # the single most likely bad value in a geographic tool call.
+        #
+        # ⚠️ THE NUMBER IS PRINTED PLAINLY, NOT AS A REPR. `999.0` reads as a value somebody
+        # said; `'999'` with the quotes a repr adds reads as a token a program is holding.
         for key in ("lat", "latitude"):
             if key in params and not _in_range(params[key], -90, 90):
-                reasons.append(f"step {i} ({name}): {key} {params[key]!r} is not a latitude")
+                reasons.append(
+                    f"{where(i)}{_plainly(params[key])} is not a latitude, "
+                    "which runs from -90 to 90"
+                )
         for key in ("lon", "longitude"):
             if key in params and not _in_range(params[key], -180, 180):
-                reasons.append(f"step {i} ({name}): {key} {params[key]!r} is not a longitude")
+                reasons.append(
+                    f"{where(i)}{_plainly(params[key])} is not a longitude, "
+                    "which runs from -180 to 180"
+                )
         if "altitude_m" in params and not _in_range(params["altitude_m"], 0, 30000):
-            reasons.append(f"step {i} ({name}): altitude {params['altitude_m']!r} is out of range")
+            reasons.append(
+                f"{where(i)}{_plainly(params['altitude_m'])} m is outside the altitude an "
+                "asset here can be given, which is 0 to 30000 m"
+            )
 
     return reasons
+
+
+#: Parameter names as an operator would say them. The schema calls them `lat` and
+#: `altitude_m` because that is what the tools take; a refusal is not the place to teach
+#: somebody the field names.
+_SPOKEN_PARAMS: dict[str, str] = {
+    "lat": "a latitude",
+    "lon": "a longitude",
+    "latitude": "a latitude",
+    "longitude": "a longitude",
+    "altitude_m": "an altitude",
+    "target": "something to act on",
+    "kind": "a kind of asset",
+    "days": "how far back to look",
+    "ids": "which assets",
+    "bbox": "an area",
+}
+
+
+def _spoken(names: list[str]) -> str:
+    """Parameter names joined the way they would be said out loud."""
+    said = [_SPOKEN_PARAMS.get(n, n.replace("_", " ")) for n in names]
+    if len(said) == 1:
+        return said[0]
+    return f"{', '.join(said[:-1])} and {said[-1]}"
+
+
+def _action(name: str) -> str:
+    """A tool name as words. `task_uas` is an identifier; "task uas" is nearly English."""
+    return name.replace("_", " ")
+
+
+def _plainly(value: Any) -> str:
+    """A number as a person would write it, for a sentence a person will read.
+
+    A whole number keeps no trailing `.0`, and anything that is not a number at all falls
+    back to its text rather than to a repr, because `'north'` in quotes is a programmer's
+    way of showing a value and a bare word is everyone else's.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(number)) if number.is_integer() else str(number)
 
 
 def _in_range(value: Any, lo: float, hi: float) -> bool:
@@ -391,14 +482,23 @@ def execute(
     utterance: str | None = None,
     parent_command_id: str | None = None,
     context: dict[str, Any] | None = None,
+    command_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate, then run every step under one command id.
 
     ⚠️ A REJECTED PLAN IS STILL LOGGED. An audit log that records only what succeeded
     cannot answer "what did someone try to do", which is most of what an audit log is
     for. It lands as `result='rejected'` with the reasons in `detail`.
+
+    🔑 THE CALLER MAY SUPPLY THE ID, AND THE API NOW DOES. This used to mint one here
+    unconditionally, which meant everything the API had already logged about the same
+    command, what tier 1 matched, what tier 2 was asked and what it cost, carried no id and
+    could not be joined to the steps that followed. One command produced a handful of
+    unrelated rows, and the record of a decision was scattered across them in timestamp
+    order. Minting it here is still the right default for any caller that has no id of its
+    own, which is what the tests do.
     """
-    command_id = str(uuid.uuid4())
+    command_id = command_id or str(uuid.uuid4())
 
     # Deixis is resolved BEFORE validation, so what gets validated, logged and run is what
     # the words actually meant. Validating the placeholder would check a string nobody
@@ -411,6 +511,9 @@ def execute(
             command_id=command_id, parent_command_id=parent_command_id,
             params={"plan": plan, "utterance": utterance}, detail="; ".join(exc.reasons),
         )
+        # Re-raised carrying the id it was just logged under, so an escalation attaches to
+        # this row rather than starting a story of its own.
+        exc.command_id = command_id
         raise
 
     reasons = validate(plan)
@@ -425,7 +528,7 @@ def execute(
             params={"plan": plan, "utterance": utterance},
             detail="; ".join(reasons),
         )
-        raise PlanRejected(reasons)
+        raise PlanRejected(reasons, command_id=command_id)
 
     # 🔴 THE DECISION IS A ROW, NOT JUST ITS CONSEQUENCES, and this was the hole in the
     # chain. A plan that FAILED validation logged the utterance; a plan that passed logged
@@ -569,7 +672,23 @@ def execute(
                 detail=f"{type(exc).__name__}: {exc}"[:400],
                 latency_ms=elapsed,
             )
-            results.append({"tool": name, "ok": False, "message": f"{name} failed: {exc}"})
+            # 🔴 THE EXCEPTION GOES IN THE LOG, NEVER ON THE SCREEN. This used to be
+            # `f"{name} failed: {exc}"`, so a database error put its own text in front of a
+            # visitor: constraint names, column names, whatever the driver had to say. It
+            # is the one path in this file where a Python exception reached the operator
+            # untouched, and the message it produced described this program's insides
+            # rather than anything about the Arctic.
+            #
+            # ⚠️ THE DETAIL DIRECTLY ABOVE IS UNCHANGED, so nothing is lost: the audit row
+            # still carries the exception type and its message, which is where somebody
+            # debugging this would look anyway.
+            results.append(
+                {
+                    "tool": name,
+                    "ok": False,
+                    "message": "that command hit an internal error, which has been recorded",
+                }
+            )
             break
 
     # 🔑 THE CAMERA IS A FUNCTION OF THE RESULT, NOT A SEPARATE DECISION.
@@ -588,6 +707,20 @@ def execute(
         auto = _frame_results(results)
         if auto:
             merged_effects["camera"] = auto
+
+    # 🔑 AND THE OTHER HALF OF SHOWING SOMEBODY SOMETHING: MAKE IT VISIBLE. The camera has
+    # always been aimed at the answer, while kind visibility is a sticky preference, so an
+    # operator who hid the drones an hour ago and then asked about one got the camera flown
+    # to a blank patch of map and a sentence describing an asset they could not see. Aiming
+    # at a thing and revealing it are one action from the operator's side.
+    #
+    # ⚠️ ONLY WHEN THE PLAN HAD NO OPINION OF ITS OWN. "Hide the radars" is a plan whose
+    # whole purpose is a visibility choice, and revealing whatever it reported would undo the
+    # command in the same breath as running it.
+    if "kinds" not in merged_effects:
+        reveal = _reveal_results(results)
+        if reveal:
+            merged_effects["kinds"] = {"mode": "show", "kinds": reveal}
 
     return {
         "command_id": command_id,
@@ -690,13 +823,73 @@ def _resubmit(
 
 def _summarise(results: list[dict[str, Any]]) -> str:
     if not results:
-        return "nothing ran"
+        # ⚠️ "nothing ran" WAS A NOTE TO A DEVELOPER. It reports on the executor's own
+        # bookkeeping, in front of somebody who asked a question about the Arctic and is
+        # owed an answer about it.
+        return "there was nothing here to do for that one"
     failed = [r for r in results if not r["ok"]]
     if failed:
         return failed[-1]["message"]
     if len(results) == 1:
         return results[0]["message"]
     return " · ".join(r["message"] for r in results)
+
+
+def _reveal_results(results: list[dict[str, Any]]) -> list[str] | None:
+    """The kinds an answer mentioned, so the operator can actually see what it named.
+
+    ⛔ UNDETECTED UNKNOWNS ARE EXCLUDED, AND THAT IS THE ONE RULE HERE. They sit behind a
+    control that is ticked by default because the console cannot legitimately claim to hold
+    them, and a command that happens to count one must not be the thing that reveals it. In
+    practice showing a KIND cannot unhide one anyway, since that filter is separate and per
+    asset rather than per kind, but the intent is written down rather than left to depend on
+    two filters staying independent forever.
+
+    🔒 NEVER RAISES, for the same reason the framing beside it does not: this decorates an
+    answer that has already succeeded, and returning None simply leaves the view alone.
+    """
+    try:
+        ids: set[str] = set()
+        for r in results:
+            if not r.get("ok"):
+                continue
+            data = r.get("data") or {}
+            for found in (data.get("ids") or []):
+                if isinstance(found, str):
+                    ids.add(found)
+            entity = data.get("asset") or data.get("entity")
+            if isinstance(entity, dict) and entity.get("id"):
+                ids.add(str(entity["id"]))
+        if not ids:
+            return None
+
+        rows = db.fetch_entities()
+
+        # ⚠️ THE TRACKING FLAGS ARE DECORATED AT THE API LAYER, NOT ON THE ROW. Reading
+        # `row["tracked"]` here silently excluded nothing, because the key does not exist on
+        # what `fetch_entities` returns, and the first live check revealed two kinds that
+        # were entirely undetected contacts. So the buckets come from the module that owns
+        # them rather than from a flag this layer cannot see.
+        undetected: set[str] = set()
+        try:
+            from . import detect
+
+            summary = detect.coverage_summary(rows)
+            undetected = set(summary.get("untracked") or []) | set(
+                summary.get("detected_not_reported") or []
+            )
+        except Exception:  # noqa: BLE001 - without it, nothing is revealed rather than too much
+            return None
+
+        kinds: set[str] = set()
+        for row in rows:
+            if row["id"] not in ids or row["id"] in undetected:
+                continue
+            if row.get("kind"):
+                kinds.add(str(row["kind"]))
+        return sorted(kinds) or None
+    except Exception:  # noqa: BLE001 - a decoration on an answer that already exists
+        return None
 
 
 def _frame_results(results: list[dict[str, Any]]) -> dict[str, Any] | None:

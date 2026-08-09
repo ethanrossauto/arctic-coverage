@@ -113,14 +113,19 @@ def reset_if_idle(
     the map is briefly stale. Taking the whole site down to avoid a stale map would be the
     larger harm, and the next request tries again anyway.
     """
+    if IDLE_RESET_MINUTES <= 0:
+        return False  # disabled: see the constant
     try:
+        idle_seconds = IDLE_RESET_MINUTES * 60.0
         if cur is not None:
-            due = _is_due(cur, _now())
+            _ensure_row(cur)
+            won = _claim(cur, "idle", idle_seconds=idle_seconds)
         else:
             with db.connect() as conn, conn.cursor() as own:
-                due = _is_due(own, _now())
+                _ensure_row(own)
+                won = _claim(own, "idle", idle_seconds=idle_seconds)
                 conn.commit()
-        if not due:
+        if not won:
             return False
 
         _reset_world(seed_rows=seed_rows, cause="idle")
@@ -173,22 +178,77 @@ def reset_now(*, seed_rows: list[dict[str, Any]] | None = None) -> dict[str, Any
     stale map. This one was asked for by a person who is watching, so a failure they never
     hear about is worse than an error they do.
     """
+    # 🔑 THE SAME ATOMIC CLAIM, with no idle requirement: a person pressing the button is not
+    # waiting for the world to go quiet, they are the activity. Only the floor applies, and it
+    # applies the same way it does to the idle path, because two callers pressing the button
+    # together is the identical race.
     with db.connect() as conn, conn.cursor() as cur:
+        _ensure_row(cur)
+        won = _claim(cur, "manual", idle_seconds=0.0)
         state = _read_state(cur)
-        if state is not None:
-            waited = (_now() - state["last_reset"]).total_seconds()
-            if waited < MIN_SECONDS_BETWEEN_RESETS:
-                return {
-                    "ok": False,
-                    "retry_after_s": int(round(MIN_SECONDS_BETWEEN_RESETS - waited)),
-                }
+        conn.commit()
+
+    if not won:
+        waited = (_now() - state["last_reset"]).total_seconds() if state else 0.0
+        return {
+            "ok": False,
+            "retry_after_s": max(1, int(round(MIN_SECONDS_BETWEEN_RESETS - waited))),
+        }
 
     _reset_world(seed_rows=seed_rows, cause="manual")
     return {"ok": True, **status()}
 
 
+def _ensure_row(cur: Any) -> None:
+    """The single world_state row, created once.
+
+    On a database that has never served a request there is nothing to update, so the claim
+    would find no row and the world would never reset. Inserting rather than resetting is
+    deliberate: the world was seeded seconds ago by hand, and starting the clock is the
+    correct first act.
+    """
+    cur.execute("insert into world_state (id) values (1) on conflict do nothing")
+
+
+def _claim(cur: Any, cause: str, *, idle_seconds: float) -> bool:
+    """Win the right to reset, atomically. True means this caller does it and nobody else.
+
+    🔴 THIS REPLACED A READ-THEN-DECIDE AND THE BUG IT FIXES WAS VISIBLE IN THE LOG. The
+    browser polls /api/entities and /api/mesh together every five seconds and /api/world on
+    its own timer, and three of those four paths run this check. Each one read `world_state`,
+    every one of them saw a reset was owed because none had written yet, and the world was
+    torn down and reseeded three times inside one second. The audit log showed three
+    identical `world_reset` rows, one per racing request.
+
+    ⚠️ THE SIXTY-SECOND FLOOR DID NOT HELP, and could not: it was evaluated from the same
+    stale read as the idle window. A floor that is checked non-atomically is not a floor, it
+    is a suggestion that holds whenever requests happen to arrive in single file.
+
+    🔑 SO THE DECISION AND THE CLAIM ARE ONE STATEMENT. The UPDATE carries both conditions in
+    its WHERE clause, so Postgres serialises the row and exactly one caller gets a row back.
+    Losing is not an error and needs no retry: somebody else is doing the work, and the
+    result the loser wanted is about to exist.
+    """
+    cur.execute(
+        """
+        update world_state
+           set last_activity = now(), last_reset = now(), last_reset_cause = %s
+         where id = 1
+           and now() - last_activity >= make_interval(secs => %s)
+           and now() - last_reset    >= make_interval(secs => %s)
+        returning id
+        """,
+        (cause, idle_seconds, MIN_SECONDS_BETWEEN_RESETS),
+    )
+    return cur.fetchone() is not None
+
+
 def _is_due(cur: Any, now: datetime) -> bool:
-    """Is a reset owed? Cheap, and safe to run on a caller's cursor."""
+    """Is a reset owed? Read-only, and used for reporting rather than for deciding.
+
+    ⚠️ NOT THE GATE. `_claim` decides, because deciding and acting have to be one statement.
+    This exists so `status` and the tests can ask the question without taking the claim.
+    """
     state = _read_state(cur)
     if state is None:
         # First ever request. Start the clock rather than resetting a world that was

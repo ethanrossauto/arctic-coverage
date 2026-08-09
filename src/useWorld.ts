@@ -11,7 +11,7 @@ import { useEffect } from "react";
 
 import { fetchAssets, fetchMesh } from "./assets";
 import { useStore } from "./store";
-import { consumeSelfReset, fetchWorld, resetNoticeFor, touchWorld } from "./world";
+import { fetchWorld, isSelfReset, resetNoticeFor, touchWorld } from "./world";
 
 /** How often the clock is read. Matched to the map's own poll: one rhythm, not two. */
 const POLL_MS = 5000;
@@ -54,7 +54,7 @@ export function useWorld(): void {
           // happened and would otherwise be told a stranger did it. Being driven off
           // `generation` is what lets this catch the unpredictable case, and it is also why
           // it cannot tell your own click from somebody else's without being told.
-          if (!consumeSelfReset()) {
+          if (!isSelfReset()) {
             setResetNotice(resetNoticeFor(w.cause, w.idleResetMinutes));
           }
           // Pull the fresh world now rather than waiting out the map's own poll. The reset

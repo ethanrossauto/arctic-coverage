@@ -32,6 +32,11 @@ from typing import Any
 from . import terrain
 from .mesh import EARTH_R_KM, haversine_km
 
+# The kinds that are contacts rather than kit of ours. They are the world being observed,
+# so their motion is ground truth and does not depend on our hearing from them. Kept beside
+# the motion rules rather than imported from `detect`, which imports this module.
+CONTACT_KINDS = frozenset({"vessel", "aircraft", "ground_party"})
+
 _SPEED_FIELDS = (("speed_kmh", 1.0), ("cruise_kmh", 1.0), ("speed_kn", 1.852))
 
 
@@ -322,7 +327,19 @@ def advance(rows: list[dict[str, Any]], now: datetime | None = None) -> None:
         props = row.get("props") or {}
         if props.get("motion_frozen"):
             continue
-        if row.get("overdue"):
+        # 🔴 FROZEN IS KEYED ON WHETHER WE ARE TRACKING IT, NOT ON WHETHER IT IS LATE.
+        # An asset of ours that has gone quiet stays where it last reported, because
+        # animating it onward would be the display inventing a position. That rule is right
+        # and it was being applied to the wrong set: a CONTACT is not reporting to us at
+        # all, so judging it by its own silence froze the very things the sensor network
+        # exists to watch. Ships with routes and speeds sat motionless in Lancaster Sound.
+        #
+        # 🔑 A CONTACT IS THE WORLD, NOT A REPORT. It keeps moving whether or not anything
+        # is holding it, which is precisely what makes the coverage view worth having: the
+        # contact nobody can see is still going somewhere. The display already declares that
+        # bucket as simulation ground truth rather than an observation, and hides it behind
+        # a control by default, so moving it claims nothing that was not already disclosed.
+        if row.get("overdue") and row.get("kind") not in CONTACT_KINDS:
             continue
 
         started = _as_datetime(row.get("created_at"))

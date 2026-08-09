@@ -338,7 +338,11 @@ def fetch_entities(kind: str | None = None) -> list[dict[str, Any]]:
         lifecycle.reset_if_idle(cur=cur)
         conn.commit()
         cur.execute(sql, params)
-        rows = [freshness.decorate(_serialise(row), now) for row in cur.fetchall()]
+        # 🔑 THE WORLD IS BROUGHT UP TO DATE HERE, AT THE ONE READ EVERYTHING GOES
+        # THROUGH. A working asset keeps reporting and a contact nobody is holding does
+        # not, which is what makes this a dashboard of what arrived rather than a snapshot
+        # that rots. `refresh` also applies `decorate`, because overdue depends on it.
+        rows = freshness.refresh([_serialise(row) for row in cur.fetchall()], now)
 
     # ⚠️ AND MOTION RUNS AFTER `decorate`, NOT BEFORE IT. `advance` only moves assets we
     # are currently hearing from, so it needs `overdue` to already be on the row. Run it

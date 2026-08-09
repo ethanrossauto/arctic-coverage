@@ -22,7 +22,7 @@
  */
 import { create } from "zustand";
 
-import type { Asset, IceLayer, MeshStatus } from "./assets";
+import type { Asset, AssetKind, IceLayer, MeshStatus } from "./assets";
 import type { WorldStatus } from "./world";
 import type { ViewportBbox } from "./map/bounds";
 
@@ -120,6 +120,16 @@ export interface CameraTarget {
 interface State {
   /** Every asset kind, straight from the database. Domain objects, never map shapes. */
   assets: Asset[];
+  /**
+   * The same assets, carried forward between server fixes so motion is smooth.
+   *
+   * 🔑 SEPARATE FROM `assets` BECAUSE ONLY ONE OF THEM IS TRUE. `assets` is what the server
+   * last said and is what every count, list and answer is computed from. This one is an
+   * estimate for drawing, refreshed once a second, and it must never become the input to
+   * the next estimate or to anything that reports a number. The map reads this; nothing
+   * else should.
+   */
+  displayAssets: Asset[];
   /** The computed radio link graph. Derived server-side, never stored anywhere. */
   mesh: MeshStatus | null;
   /** The sea ice picture for `iceDate`. Null until the first fetch returns. */
@@ -135,10 +145,24 @@ interface State {
    * them, because a value between two measurements is a value nobody observed.
    */
   iceDate: string;
-  /** Whether the timebar is stepping through the measurements on its own. */
-  iceScrubbing: boolean;
   loading: boolean;
   error: string | null;
+
+  /**
+   * What the PLACE control is set to. `kind` non-null means the map is armed.
+   *
+   * 🔑 EVERYTHING THE VOICE PATH CAN DO, THE HAND CAN DO. Placing was command-only, so the
+   * one action that changes the world had no manual route at all. Arming is two steps on
+   * purpose: choose what, then choose where, because a position is the one argument a menu
+   * cannot supply and a map click is the natural way to give it.
+   *
+   * ⚠️ NEVER NULL, AND THAT IS WHY THE FLAGS SIT INSIDE IT. They used to live in a nullable
+   * object, so neither could be set until a kind had been chosen and both boxes were greyed
+   * out until then. Ordering the operator's decisions for them is not this control's job:
+   * ticking UNKNOWN first and picking the kind afterwards is a perfectly ordinary way to
+   * think, and the flags outlive a change of kind for the same reason.
+   */
+  placing: { kind: AssetKind | null; unknown: boolean; backhaul: boolean };
 
   projection: Projection;
   /**
@@ -165,6 +189,20 @@ interface State {
    * advertises the withholding argues it better than one that merely permits the reveal.
    */
   hideUndetected: boolean;
+  /**
+   * Kinds the operator has switched off in the VIEW menu. Empty means everything is drawn.
+   *
+   * 🔑 STORED AS WHAT IS HIDDEN, NOT AS WHAT IS SHOWN, so a kind added to the world later
+   * appears by default instead of silently staying off until someone edits this list. The
+   * absent case has to be the visible one: a new sensor type that nobody can see, because a
+   * settings list predates it, is the kind of bug that looks like missing data.
+   *
+   * ⚠️ NOT THE SAME QUESTION AS `hideUndetected`, even though both hide things. That one is
+   * about what the console may honestly claim; this is a display preference about clutter,
+   * and the operator turned it on themselves. Which is why the status strip keeps counting
+   * the world rather than the view, and says how many kinds are off instead.
+   */
+  hiddenKinds: AssetKind[];
   /** Last computed viewport box. What a command means by "the current window". */
   bbox: ViewportBbox | null;
   selectedId: string | null;
@@ -222,15 +260,18 @@ interface State {
   auditOpen: boolean;
 
   setAssets: (a: Asset[]) => void;
+  setDisplayAssets: (a: Asset[]) => void;
   setMesh: (m: MeshStatus) => void;
   setIce: (i: IceLayer) => void;
   setIceDate: (d: string) => void;
-  setIceScrubbing: (v: boolean) => void;
   setLoading: (v: boolean) => void;
   setError: (e: string | null) => void;
+  setPlacing: (p: { kind: AssetKind | null; unknown: boolean; backhaul: boolean }) => void;
   setProjection: (p: Projection) => void;
   setShowIce: (v: boolean) => void;
   setHideUndetected: (v: boolean) => void;
+  toggleKind: (k: AssetKind) => void;
+  setHiddenKinds: (k: AssetKind[]) => void;
   setWorld: (w: WorldStatus) => void;
   setResetNotice: (n: string | null) => void;
   setAuditOpen: (v: boolean) => void;
@@ -254,12 +295,13 @@ export const RECENT_IDS = 50;
 
 export const useStore = create<State>((set) => ({
   assets: [],
+  displayAssets: [],
   mesh: null,
   ice: null,
   iceDate: new Date().toISOString().slice(0, 10),
-  iceScrubbing: false,
   loading: true,
   error: null,
+  placing: { kind: null, unknown: false, backhaul: false },
   // Projection can be pinned from the URL (?proj=mercator). Useful for linking
   // someone to a specific view, and it is how the renderer swap gets exercised
   // without a click during automated screenshots.
@@ -268,6 +310,7 @@ export const useStore = create<State>((set) => ({
     : "globe") as Projection,
   showIce: true,
   hideUndetected: true,
+  hiddenKinds: [],
   bbox: null,
   selectedId: null,
   commandLog: [],
@@ -280,16 +323,28 @@ export const useStore = create<State>((set) => ({
   resetNotice: null,
   auditOpen: false,
 
-  setAssets: (a) => set({ assets: a, loading: false, error: null }),
+  // A fix from the server is authoritative, so it snaps the drawn positions to it rather
+  // than easing toward them: the estimate existed only until the truth arrived.
+  // ⚠️ ARRIVING IS NOT BEING DRAWN, so this no longer clears `loading`. The map does that
+  // once it has actually painted the assets; see the asset effect in GlobeMap.
+  setAssets: (a) => set({ assets: a, displayAssets: a, error: null }),
+  setDisplayAssets: (a) => set({ displayAssets: a }),
   setMesh: (m) => set({ mesh: m }),
   setIce: (i) => set({ ice: i }),
   setIceDate: (d) => set({ iceDate: d }),
-  setIceScrubbing: (v) => set({ iceScrubbing: v }),
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e, loading: false }),
+  setPlacing: (p) => set({ placing: p }),
   setProjection: (p) => set({ projection: p }),
   setShowIce: (v) => set({ showIce: v }),
   setHideUndetected: (v) => set({ hideUndetected: v }),
+  setHiddenKinds: (k) => set({ hiddenKinds: k }),
+  toggleKind: (k) =>
+    set((s) => ({
+      hiddenKinds: s.hiddenKinds.includes(k)
+        ? s.hiddenKinds.filter((x) => x !== k)
+        : [...s.hiddenKinds, k],
+    })),
   setWorld: (w) => set({ world: w }),
   setResetNotice: (n) => set({ resetNotice: n }),
   setAuditOpen: (v) => set({ auditOpen: v }),

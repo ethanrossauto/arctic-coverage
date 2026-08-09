@@ -11,7 +11,7 @@
  */
 import { useEffect, useState } from "react";
 
-import { fetchAssets, fetchIce, fetchMesh, isOverdue } from "./assets";
+import { fetchAssets, fetchIce, fetchMesh, isOverdue, MESH_KINDS } from "./assets";
 import { AssetBanner } from "./AssetBanner";
 import { AssetPicker } from "./AssetPicker";
 import { AuditPanel } from "./AuditPanel";
@@ -19,19 +19,20 @@ import { CommandBar } from "./CommandBar";
 import { GlobeMap } from "./map/GlobeMap";
 import { IceTimebar } from "./IceTimebar";
 import { useStore } from "./store";
+import { PlaceMenu } from "./PlaceMenu";
+import { ViewMenu } from "./ViewMenu";
 import { useNow } from "./useNow";
+import { useDeadReckoning } from "./useDeadReckoning";
 import { useWorld } from "./useWorld";
 import { COUNTDOWN_VISIBLE_S, formatCountdown, resetWorld } from "./world";
 
 export default function App() {
   const assets = useStore((s) => s.assets);
   const mesh = useStore((s) => s.mesh);
-  const ice = useStore((s) => s.ice);
   const iceDate = useStore((s) => s.iceDate);
   const loading = useStore((s) => s.loading);
   const error = useStore((s) => s.error);
   const projection = useStore((s) => s.projection);
-  const bbox = useStore((s) => s.bbox);
   const hideUndetected = useStore((s) => s.hideUndetected);
   const setHideUndetected = useStore((s) => s.setHideUndetected);
   const world = useStore((s) => s.world);
@@ -47,12 +48,17 @@ export default function App() {
   const setProjection = useStore((s) => s.setProjection);
 
   /** The confirmation, and the cooldown message when the floor has not elapsed. */
+  const [viewOpen, setViewOpen] = useState(false);
+  const [placeOpen, setPlaceOpen] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
 
   // The shared world's clock, and the signal that a person is actually here.
   useWorld();
+  // Carries positions forward between the five second fixes. Costs no extra requests; see
+  // the module for why polling faster was the wrong answer.
+  useDeadReckoning();
 
   // Assets are the thing an operator is actually looking at, so they load on their
   // own and a failure in any derived layer below must not blank them.
@@ -123,6 +129,15 @@ export default function App() {
       .catch((e) => console.error("ice layer unavailable", e));
   }, [iceReady, iceDate, setIce]);
 
+  // 🔒 THE FAILURE PATH FOR THE LOADING CURTAIN. It is lifted when the asset icons actually
+  // reach the screen, which is the right signal and is unreachable when the fetch failed:
+  // no assets, no icons, no lift, and the viewer would sit behind "Loading..." until the
+  // 15 second watchdog in index.html gave up. An error is a perfectly good reason to stop
+  // waiting, and the strip below is already showing it, so let them see it.
+  useEffect(() => {
+    if (error) (window as { consoleReady?: () => void }).consoleReady?.();
+  }, [error]);
+
   // Counted here rather than in the store, because they are a function of the asset
   // list and nothing else. Caching a filter over 68 rows would cost more to invalidate
   // than to recompute.
@@ -130,7 +145,52 @@ export default function App() {
   // ⏱️ Read against wall time. The thresholds are hours (see OVERDUE_MINUTES), so a
   // count that refreshes when the assets do is as current as the data behind it.
   const now = useNow();
-  const overdue = assets.filter((a) => isOverdue(a, now)).length;
+
+  // 🔑 EVERY COUNT BELOW IS TAKEN OVER OUR OWN NETWORKED KIT, AND THAT IS WHAT MAKES THEM
+  // ADD UP. Each condition tracked here is a fact about equipment we operate: whether we
+  // can reach it, and what its last message said.
+  //
+  // ⛔ TWO THINGS ARE DELIBERATELY OUT OF THIS SET, for the same reason. A CONTACT is what
+  // the network is watching rather than part of it. A RADAR SITE is friendly but not ours:
+  // it carries `owned: false`, answers to its own operator and has never sent this console
+  // anything, so it can be neither reachable nor overdue TO US. Counting either one left a
+  // remainder no label could explain, and forced a third bucket into both groups whose only
+  // member was the radar layer.
+  const ours = assets.filter((a) => MESH_KINDS.has(a.kind));
+
+  // ── current status: can what this asset knows get here, right now ──────────────
+  //
+  // ⚠️ TAKEN FROM THE SERVER, NOT RECOMPUTED. Reachability is a property of the whole link
+  // graph, and this component holds no gateway roles, no ranges and no view of which relays
+  // are being heard. Counting it here would be a second answer to a question the server has
+  // already answered exactly.
+  //
+  // 🔑 BUILT BY SUBTRACTION SO THE PAIR CANNOT FAIL TO SUM. The cut-off bucket is the union
+  // of "no route home" and "past its own threshold", and `reachable` is whatever is left.
+  // Counting both independently would let an asset land in neither, and the strip would
+  // then contradict the total printed beside it.
+  const cutOffIds = mesh ? new Set(mesh.unreachable) : null;
+  // ⚠️ NULL UNTIL THE MESH LOADS, AND RENDERED AS "…" RATHER THAN AS 0. A zero would read
+  // as "nothing is cut off", which is the one answer that must never come from not having
+  // looked. Same rule the server's own scans follow.
+  const unreachable = cutOffIds
+    ? ours.filter((a) => cutOffIds.has(a.id) || isOverdue(a, now)).length
+    : null;
+  const reachable = unreachable === null ? null : ours.length - unreachable;
+
+  // ── last message: what this asset last told us about itself ────────────────────
+  //
+  // 🔑 A DIFFERENT QUESTION FROM THE ONE ABOVE, WHICH IS WHY BOTH ARE ON SCREEN. An asset
+  // cut off an hour ago still has a last message, and it said the kit was fine. So the two
+  // readings differ, and the gap between them is the story: everything last reported
+  // healthy, and we can only currently reach some of it.
+  //
+  // ⚠️ NOMINAL IS THE COMPLEMENT, NOT ITS OWN FILTER, so this pair sums like the one above.
+  // The cost, stated rather than hidden: an asset that has somehow never sent a message
+  // reads as nominal here, because with the radar layer out of the set there is no third
+  // bucket left for it to fall into. Nothing seeded or placeable is in that state today.
+  const maintenance = ours.filter((a) => a.flag === "maintenance").length;
+  const nominal = ours.length - maintenance;
   // 🔑 DETECTED UNKNOWN, WHICH IS THE ONLY UNKNOWN THIS STRIP MAY COUNT. We hold it and it
   // will not say what it is: a contact that genuinely arrived, identity missing.
   //
@@ -169,6 +229,12 @@ export default function App() {
           {projection === "globe" ? "GLOBE" : "MERCATOR"}
         </button>
 
+        <ViewMenu open={viewOpen} onOpenChange={setViewOpen} />
+
+        {/* Beside VIEW because they are the same sort of control: a menu that changes what
+            the map is doing. VIEW decides what is drawn, PLACE puts something new there. */}
+        <PlaceMenu open={placeOpen} onOpenChange={setPlaceOpen} />
+
         {/* ⛔ Deliberately not labelled with a count. One of these buckets is a contact
             nothing is holding, and putting a number for it in the top strip would be the
             console asserting knowledge it does not have.
@@ -197,46 +263,11 @@ export default function App() {
 
       <CommandBar />
 
-      <IceTimebar />
-
-      <footer className="strip bottom">
-        {loading && <span>loading…</span>}
-        {error && <span className="err">{error}</span>}
-
-        {assets.length > 0 && (
-          <>
-            <span>
-              assets <b>{assets.length}</b>
-            </span>
-            <span title="assets past the reporting threshold for their kind">
-              overdue <b className={overdue ? "warn" : undefined}>{overdue}</b>
-            </span>
-            <span title="contacts we hold that are not saying what they are">
-              detected unknown{" "}
-              <b className={detectedUnknown ? "alert" : undefined}>{detectedUnknown}</b>
-            </span>
-            {mesh && (
-              <span title="radio links up, connected groups, and assets on no mesh at all">
-                mesh <b>{mesh.links.length}</b> links · <b>{mesh.groups.length}</b> groups ·{" "}
-                <b className={mesh.isolated.length ? "warn" : undefined}>{mesh.isolated.length}</b> isolated
-              </span>
-            )}
-          </>
-        )}
-
-        {ice && (
-          <span className="dim" title={`${ice.caveat}\n\n${ice.citation}`}>
-            ice <b>{(ice.extentKm2 / 1e6).toFixed(1)}M km²</b> extent
-          </span>
-        )}
-
-        <span className="dim">
-          {/* Proof the viewport contract works under globe projection: a
-              pole-centred camera legitimately reports every longitude. */}
-          view {bbox ? (bbox.global ? "all longitudes" : `${bbox.west.toFixed(0)}…${bbox.east.toFixed(0)}°`) : "—"}
-          {bbox?.wraps ? " (wraps)" : ""} · {bbox ? `${bbox.south.toFixed(0)}…${bbox.north.toFixed(0)}°` : ""}
-        </span>
-
+      {/* 🔑 THE DISCLOSURE AND THE WORLD CONTROLS RIDE ON THE ICE ROW, not in the strip
+          below it, so that strip holds counts and nothing else. A status strip that also
+          carries a paragraph of disclosure and two buttons is a strip whose numbers have to
+          be hunted for, and the numbers are the reason it exists. */}
+      <IceTimebar>
         {/* 🔑 THE DISCLOSURE IS ALWAYS ON SCREEN, and the countdown only speaks near the
             end. Everyone here is looking at one shared world, so a reset lands on all of
             them; that cannot be prevented without giving each visitor a world of their own,
@@ -262,12 +293,69 @@ export default function App() {
               missed, and the answer to that is a legible label rather than opening it
               uninvited over somebody's map. */}
           <button onClick={() => setAuditOpen(!auditOpen)} title="the server-side record of every command">
-            AUDIT
+            LLM AUDIT
           </button>
           <button onClick={() => { setResetError(null); setConfirmReset(true); }}>
             RESET WORLD
           </button>
         </span>
+      </IceTimebar>
+
+      <footer className="strip bottom">
+        {loading && <span>loading…</span>}
+        {error && <span className="err">{error}</span>}
+
+        {assets.length > 0 && (
+          <>
+            <span
+              className="grp"
+              title="the equipment we operate and can hear from. Excludes contacts, which are what this network watches rather than part of it, and the early-warning radar sites, which are friendly but not ours and report to their own operator"
+            >
+              our assets <b>{ours.length}</b>
+            </span>
+
+            {/* 🔑 BOTH GROUPS SUM TO THE FRIENDLY TOTAL, and that is the property to protect
+                when editing either of them. Two independent readings of the same set: one
+                says whether we can hear it, the other says what it last told us. A number
+                on this strip that belongs to neither reading is a number nobody can
+                reconcile with the total printed beside it. */}
+            <span className="grp">
+              <span className="glabel">current status</span>
+              <span title="something we are hearing from leads all the way back to a backhaul">
+                reachable <b>{reachable ?? "…"}</b>
+              </span>
+              <span className="sep" />
+              <span title="no live route home, or past its own reporting threshold. Either way nothing it knows is arriving here">
+                unreachable/overdue{" "}
+                <b className={unreachable ? "warn" : undefined}>{unreachable ?? "…"}</b>
+              </span>
+            </span>
+
+            <span className="grp">
+              <span className="glabel">last message</span>
+              <span title="its last report said the kit was fine">
+                nominal <b>{nominal}</b>
+              </span>
+              <span className="sep" />
+              <span title="its last report said the kit needs attention">
+                maintenance <b className={maintenance ? "warn" : undefined}>{maintenance}</b>
+              </span>
+            </span>
+
+            {/* 🔑 RIGHT ALIGNED AND BOLD BECAUSE IT IS NOT ONE OF THE TOTALS. Everything to
+                the left counts our own kit twice over, two questions about one set. This
+                counts contacts, so it deliberately sits apart rather than reading as a
+                third group somebody would try to add up with the others. */}
+            <span
+              className="unkcount"
+              title="contacts we hold that will not say what they are. Counted apart from the totals: a contact is not one of ours"
+            >
+              detected unknown{" "}
+              <b className={detectedUnknown ? "alert" : undefined}>{detectedUnknown}</b>
+            </span>
+          </>
+        )}
+
       </footer>
 
       {/* Announced rather than silent. A world that changes with no explanation reads as a

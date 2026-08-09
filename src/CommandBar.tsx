@@ -16,7 +16,9 @@
  */
 import { useEffect, useRef, useState } from "react";
 
-import { fetchAssets, fetchMesh } from "./assets";
+import { ALL_KINDS, fetchAssets, fetchMesh } from "./assets";
+import { setCommandRunner } from "./commandRunner";
+import type { AssetKind } from "./assets";
 import { RECENT_IDS, useStore } from "./store";
 import type { AssetTrack, CameraTarget } from "./store";
 
@@ -58,6 +60,15 @@ interface UiEffects {
   refetch?: true;
   /** Turn a layer the client already draws on or off. No server code reads that layer's data. */
   overlay?: { layer: "ice"; visible: boolean };
+  /**
+   * Which KINDS are drawn. An intent, not a computed set.
+   *
+   * 🔑 THE SERVER CANNOT SEND A SET BECAUSE IT DOES NOT KNOW ONE. Which kinds are
+   * switched off is this browser's preference and lives here, so the server names what
+   * it was asked to do and this side resolves it. `only` and `all` are absolute, which
+   * is what makes "show only the vessels" mean the same thing wherever you started.
+   */
+  kinds?: { mode: "hide" | "show" | "only" | "all"; kinds: AssetKind[] };
   /** The command was ambiguous. Offer the candidates rather than guessing. */
   clarify?: Clarify;
   /**
@@ -206,9 +217,85 @@ const EXAMPLES = [
   "which assets are overdue",
 ];
 
+/**
+ * How long a command may run before the transcript says something, in milliseconds.
+ *
+ * Measured rather than chosen: tier 1 answers in 1.4 to 1.6 seconds warm and tier 2 in 12
+ * to 22. Anything in this gap separates "answered instantly" from "still working" without
+ * making the fast path flicker.
+ */
+const THINKING_AFTER_MS = 1200;
+
+/**
+ * What the history says when the request itself did not complete.
+ *
+ * 🔑 IT DESCRIBES THE SITUATION, NOT THE MECHANISM. The operator does not need to know
+ * whether it was a status code, a dropped socket or a body that would not parse; they need
+ * to know the console is not talking to the world and that trying again is reasonable.
+ * Every diagnostic version of this sentence ends up quoting an error class at somebody who
+ * cannot act on it.
+ */
+const UNREACHABLE =
+  "the console could not reach the world just then. Try that again in a moment.";
+
+/**
+ * How many lines survive a collapse.
+ *
+ * 🔑 FIVE, WHICH IS MORE THAN ONE EXCHANGE ON PURPOSE. A command is two lines, its words
+ * and the answer, and a spoken one that needed a correction is three. Cutting to exactly
+ * one exchange kept losing the context that made the latest answer make sense, so this
+ * holds the last one whole plus whatever came before it fits.
+ */
+const LATEST_EXCHANGE = 5;
+
+/**
+ * Did the correction actually change anything the operator would care about?
+ *
+ * 🔴 A NOTICE THAT FIRES EVERY TIME IS WALLPAPER, AND THIS ONE DID. Comparing the two
+ * strings exactly meant the console announced an assumption over sentences that were
+ * word-for-word identical, because the two fields come back from a model and differ by
+ * capitals on a proper noun, a stray comma, or a trailing full stop. Told about an
+ * assumption on every single command, an operator stops reading the line, and then misses
+ * the one time it says something real.
+ *
+ * 🔑 SO THE TEST IS THE WORDS, NOT THE CHARACTERS. Case, punctuation and runs of
+ * whitespace are stripped from both sides before comparing, which leaves exactly the
+ * difference worth announcing: a word that was swapped, added or dropped. "hide everything
+ * except for unknowns" against "hide everything except UNKNOWN 01, UNKNOWN 02" still
+ * differs and still speaks up. "mesh status" against "Mesh status." does not.
+ *
+ * ⚠️ DIGITS ARE NOT PUNCTUATION AND ARE DELIBERATELY KEPT. "daymark oh three" becoming
+ * "Daymark 03" is a real substitution, and it is one of the two the vocabulary hint exists
+ * to make, so it has to survive this comparison.
+ */
+function meaningfullyDifferent(heard: string, running: string): boolean {
+  const bare = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  return bare(heard) !== bare(running);
+}
+
 export function CommandBar() {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  /**
+   * Whether to show a pending line where the answer will appear.
+   *
+   * 🔑 DELAYED, NOT IMMEDIATE, AND THE DELAY IS THE WHOLE DESIGN. Tier 1 answers in about
+   * 1.5 seconds and needs nothing: a placeholder that appears and is replaced in the same
+   * breath is a flicker, which reads worse than a short wait. Tier 2 takes 12 to 22
+   * seconds, and for that long an unchanged screen is indistinguishable from a command
+   * that was dropped. So the line waits out the tier-1 case and then says what is
+   * happening.
+   *
+   * ⚠️ THE CLIENT CANNOT KNOW WHICH TIER WILL ANSWER. It is one request, and the tier comes
+   * back with the reply, so the elapsed time is the only signal available before then.
+   */
+  const [waiting, setWaiting] = useState(false);
+  const activityRef = useRef<HTMLDivElement>(null);
   const [recording, setRecording] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
   /** Live input level, 0 to 1. Shown while recording so "it is listening" is visible. */
@@ -223,6 +310,7 @@ export function CommandBar() {
   const setTrack = useStore((s) => s.setTrack);
   const setHighlight = useStore((s) => s.setHighlight);
   const setShowIce = useStore((s) => s.setShowIce);
+  const setHiddenKinds = useStore((s) => s.setHiddenKinds);
   const pushRecent = useStore((s) => s.pushRecent);
 
   /**
@@ -232,11 +320,34 @@ export function CommandBar() {
    * putting it in the store would invite something else to render a stale copy.
    */
   const [clarify, setClarify] = useState<Clarify | null>(null);
+  /**
+   * Is the whole exchange shown, or only the latest one?
+   *
+   * 🔑 EXPANDED BY DEFAULT, because the transcript is how the two tiers are seen working.
+   * Collapsing is for the moment the map matters more than the conversation, which on a
+   * display this size is most of the time once a few commands have run.
+   */
+  const [expanded, setExpanded] = useState(true);
 
   /** Which transcript line has its reasoning expanded. One at a time, collapsed by default. */
   const [open, setOpen] = useState<number | null>(null);
 
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // 🔑 THE TRANSCRIPT FOLLOWS THE NEWEST LINE. It is capped and scrolls, so without this an
+  // answer arriving below the fold looks exactly like no answer arriving: the operator is
+  // reading the top of a list while the reply lands out of sight. Keyed on the pending line
+  // as well as the log, because that appears and disappears without the log changing.
+  //
+  // ⚠️ `expanded` IS IN THE LIST FOR A REASON THAT IS NOT OBVIOUS. Opening the transcript
+  // restores lines ABOVE the ones already showing, so the scroll position that was at the
+  // bottom of a short list is now partway up a long one, and the newest answer, the only
+  // one the operator was actually reading, is pushed out of sight by the history they just
+  // asked to see. Expanding has to land at the bottom.
+  useEffect(() => {
+    const el = activityRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [log, waiting, expanded]);
   const recorder = useRef<MediaRecorder | null>(null);
 
   // Focus the field on load. This is the primary interface, so landing with the cursor
@@ -248,13 +359,31 @@ export function CommandBar() {
   async function run(
     utterance: string,
     source: "typed" | "voice" | "ui_button",
-    opts: { parentCommandId?: string; plan?: unknown[] } = {},
+    opts: { parentCommandId?: string; plan?: unknown[]; heard?: string } = {},
   ) {
     if ((!utterance.trim() && !opts.plan) || busy) return;
     setBusy(true);
+    const slow = window.setTimeout(() => setWaiting(true), THINKING_AFTER_MS);
+    // 🔴 THE OPERATOR'S LINE IS WHAT THE OPERATOR SAID. For a spoken command the words that
+    // get RUN may differ from the words that were HEARD, because names are matched to what
+    // is on the map, and showing the corrected sentence as though it were theirs is the
+    // worst of both: they cannot tell a microphone problem from a decision the system made,
+    // and they have no way to correct something they were never shown.
+    //
+    // ⚠️ IT IS NOT HYPOTHETICAL. "hide everything except for unknowns" came back on screen
+    // as "hide everything except UNKNOWN 01, UNKNOWN 02, UNKNOWN 03", three names nobody
+    // said, because the vocabulary hint is a list of live asset names.
+    const said = opts.heard ?? utterance;
     // A chip press is the operator answering, not a new utterance, so it is logged as
     // their line. Without it the transcript reads as though the system talked to itself.
-    append({ role: "user", text: utterance, source: source === "voice" ? "voice" : "typed" });
+    append({ role: "user", text: said, source: source === "voice" ? "voice" : "typed" });
+    // 🔑 AN ASSUMPTION IS STATED, NEVER SILENT. When the words that will run differ from
+    // the words that were heard, the console says which names it matched before the answer
+    // arrives, so the correction is visible at the moment it is made rather than inferred
+    // afterwards from an answer that looks wrong.
+    if (opts.heard && meaningfullyDifferent(opts.heard, utterance)) {
+      append({ role: "system", text: `Assuming you meant: ${utterance}`, ok: true });
+    }
     // The question is answered the moment it is acted on, so the chips go now rather than
     // lingering under the reply to themselves.
     setClarify(null);
@@ -268,6 +397,11 @@ export function CommandBar() {
           ...(opts.plan ? { plan: opts.plan } : { utterance }),
           source,
           ...(opts.parentCommandId ? { parent_command_id: opts.parentCommandId } : {}),
+          // 🔑 THE ORIGINAL WORDS TRAVEL WITH THE CORRECTED ONES. The transcriber matched a
+          // spoken name against the map using sound alone; tier 2 can see the whole world
+          // and the request, so it is better placed to judge that guess than the component
+          // that made it. Sent only when there is a difference to judge.
+          ...(opts.heard && opts.heard !== utterance ? { heard: opts.heard } : {}),
           // The deixis carrier. Without it "what is in the current window" and
           // "focus this" are both unanswerable, and people say those constantly.
           // ⚠️ `selected_id` is now LOAD-BEARING: the executor resolves "this asset" from
@@ -278,7 +412,24 @@ export function CommandBar() {
           context: { bbox, selected_id: selectedId, recent },
         }),
       });
-      if (!res.ok) throw new Error(`command failed: ${res.status}`);
+      // 🔴 A TRANSPORT FAILURE IS STILL A LINE THE OPERATOR READS. This used to throw and
+      // let the catch below print `String(e)`, so a bad response put "Error: command
+      // failed: 503" in the history: a status code, the word Error, and the shape of a
+      // stack trace, in the one place on screen reserved for answers.
+      //
+      // 🔑 THE SERVER'S OWN SENTENCE FIRST. The API answers a database outage with a
+      // written explanation, so when there is one it is better than anything this side can
+      // invent. `detail` is only trusted when it is a string: a 422 from request
+      // validation carries a list of objects, which is a developer's artifact and must
+      // never be rendered.
+      if (!res.ok) {
+        const said = await res
+          .json()
+          .then((b) => (typeof b?.detail === "string" ? b.detail : ""))
+          .catch(() => "");
+        append({ role: "system", text: said || UNREACHABLE, ok: false });
+        return;
+      }
       const body = (await res.json()) as CommandResponse;
 
       const fx = body.ui_effects ?? {};
@@ -318,6 +469,23 @@ export function CommandBar() {
       if (fx.highlight !== undefined) setHighlight(fx.highlight);
       if (fx.overlay) setShowIce(fx.overlay.visible);
 
+      // 🔑 RESOLVED AGAINST THE CURRENT SET HERE, because this side is the only one that
+      // has it. `only` and `all` replace the set outright, which is what makes them mean
+      // the same thing regardless of what was already switched off; `hide` and `show`
+      // are the two that fold into what is there.
+      if (fx.kinds) {
+        const named = fx.kinds.kinds;
+        setHiddenKinds(
+          fx.kinds.mode === "all"
+            ? []
+            : fx.kinds.mode === "only"
+              ? ALL_KINDS.filter((k) => !named.includes(k))
+              : fx.kinds.mode === "hide"
+                ? [...new Set([...useStore.getState().hiddenKinds, ...named])]
+                : useStore.getState().hiddenKinds.filter((k: AssetKind) => !named.includes(k)),
+        );
+      }
+
       // Anything may have changed the world, so the world is refetched rather than
       // patched locally. Patching would mean the client owning a second model of state
       // that can disagree with the database, which is the bug this avoids by construction.
@@ -327,8 +495,15 @@ export function CommandBar() {
         fetchMesh().then(setMesh).catch(() => {});
       }
     } catch (e) {
-      append({ role: "system", text: String(e), ok: false });
+      // ⚠️ WHAT REACHES HERE IS A BROKEN CONNECTION, NOT A REFUSAL: the fetch never
+      // completed, or the body was not JSON. `String(e)` on that is "TypeError: Failed to
+      // fetch", which tells an operator nothing and reads like the page is broken. The
+      // real error goes to the browser console, where the person who wants it is looking.
+      console.error(e);
+      append({ role: "system", text: UNREACHABLE, ok: false });
     } finally {
+      window.clearTimeout(slow);
+      setWaiting(false);
       setBusy(false);
     }
   }
@@ -437,6 +612,24 @@ export function CommandBar() {
         setMicError("nothing recorded");
         return;
       }
+      // 🔴 SILENCE IS NEVER SENT, BECAUSE A MODEL ASKED TO FIND WORDS IN IT WILL FIND SOME.
+      // Pressing record, waiting a second and pressing stop produced "hide everything except
+      // FLS Yellowknife": a real asset, a real command shape, and nothing anybody said. The
+      // transcription prompt carries the live asset names to make real names transcribe
+      // correctly, and that same list is what makes an invented command plausible rather than
+      // gibberish, which is far worse. Gibberish gets laughed at; a plausible order gets run.
+      //
+      // 🔑 IT REUSES THE DETECTOR THAT IS ALREADY RUNNING. `spoke` turns true only after
+      // MIN_SPEECH_MS above SILENCE_RMS, which is the same judgement the automatic stop is
+      // built on, so there is one definition of speech here rather than two that can drift.
+      // The byte-count guard above cannot do this job: a second of near-silence is plenty of
+      // bytes.
+      //
+      // ⚠️ IT SAYS NOTHING, DELIBERATELY. Somebody who did not speak does not need to be
+      // told they did not speak, and the level meter beside the button is already showing
+      // them whether the microphone is hearing anything, which is the only case where the
+      // silence is a surprise. A notice here would be the console remarking on a non-event.
+      if (!spoke) return;
       setBusy(true);
       try {
         const res = await fetch("/api/transcribe", {
@@ -446,7 +639,14 @@ export function CommandBar() {
         });
         const body = await res.json();
         if (!res.ok || !body.text) {
-          setMicError(body.detail || body.summary || "transcription unavailable");
+          // ⚠️ SILENCE IS NOT AN ERROR AND IS NOT REPORTED. The server flags the case where
+          // there was simply nothing to transcribe, which is the one outcome the operator
+          // already knows about. Everything else, a missing key, a format the model will not
+          // take, a provider refusing, is worth saying out loud, because the microphone
+          // looks identical from the outside in all of them.
+          if (!body.silent) {
+            setMicError(body.detail || body.summary || "transcription unavailable");
+          }
           return;
         }
         setText(body.text);
@@ -456,7 +656,10 @@ export function CommandBar() {
         // audio became these words" and, separately, "this command ran". The first question
         // anyone asks of a voice interface after it does something surprising is what the
         // person actually said, and that has to be answerable from the log.
-        await run(body.text, "voice", { parentCommandId: body.command_id });
+        await run(body.text, "voice", {
+          parentCommandId: body.command_id,
+          heard: typeof body.heard === "string" ? body.heard : undefined,
+        });
         setText("");
         return;
       } catch (e) {
@@ -470,23 +673,69 @@ export function CommandBar() {
     tick();
   }
 
+  // ---- let the map send commands through this bar ------------------------
+  //
+  // 🔑 SO A PLACEMENT MADE BY HAND ENDS UP EXACTLY WHERE A SPOKEN ONE DOES: in the
+  // transcript, behind the same `busy` flag, and in the audit log. The map has the position
+  // and nothing else; this has the sending and nothing else.
+  //
+  // ⚠️ THROUGH A REF, BECAUSE `run` IS A NEW FUNCTION EVERY RENDER. Registering `run`
+  // itself would either re-register on each render or capture the first one forever, and
+  // the first one closes over stale state. The wrapper is stable, what it calls is current.
+  const runRef = useRef(run);
+  // Refreshed in an effect rather than during render, which is the rule: a render may be
+  // discarded, and a ref written by one that was would point at a function from a tree
+  // that never existed.
+  useEffect(() => {
+    runRef.current = run;
+  });
+  useEffect(() => {
+    setCommandRunner((utterance, source, opts) => {
+      void runRef.current(utterance, source, opts);
+    });
+    return () => setCommandRunner(null);
+  }, []);
+
   return (
     <div className="cmdwrap">
-      {log.length > 0 && (
-        <div className="activity">
-          {log.map((e, i) => (
+      {/* 🔑 THE ARROW POINTS THE WAY THE PANEL WILL MOVE, not at the state it is in. Down
+          means "this comes down to one line", up means "this opens back up". The other
+          convention, pointing at the current state, reads as a label rather than a control
+          and leaves you working out which way it will go before you press it.
+
+          ⚠️ ONLY WHEN THERE IS SOMETHING TO COLLAPSE. A toggle over a single line is a
+          control that does nothing, and one over an empty transcript is worse. */}
+      {log.length > 1 && (
+        <button
+          className="acollapse"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          aria-label={expanded ? "collapse command history" : "expand command history"}
+          title={expanded ? "show only the latest command" : "show the whole exchange"}
+        >
+          {expanded ? "▾" : "▴"}
+        </button>
+      )}
+      {(log.length > 0 || waiting) && (
+        <div
+          className={`activity${expanded ? "" : " collapsed"}`}
+          ref={activityRef}
+        >
+          {(expanded ? log : log.slice(-LATEST_EXCHANGE)).map((e, i) => (
             <div key={i} className={`entry ${e.role}${e.ok === false ? " bad" : ""}`}>
               <span className="marker">{e.role === "user" ? (e.source === "voice" ? "🎤" : "›") : "·"}</span>
               <span className="etext">
                 {e.text}
-                {/* 🔑 "I did not recognise that, so I asked the model." The clearest thing on
-                    screen showing the two tiers are real and that the expensive one runs
-                    only when it earns it. ⛔ NOT an error state: these responses succeeded. */}
-                {e.escalatedFrom && (
-                  <span className="escalated">
-                    the {e.escalatedFrom} could not resolve that, so the model was asked
-                  </span>
-                )}
+                {/* 🔴 THE ESCALATION NOTE IS GONE FROM THE ANSWER LINE, DELIBERATELY. It read
+                    "the parser could not resolve that, so the model was asked", which is the
+                    machinery narrating its own internals directly above the answer, and it
+                    arrived attached to replies that had SUCCEEDED. The operator asked what a
+                    survey was; being told a component failed is not part of the answer.
+
+                    ⚠️ NOT DELETED, MOVED. Which tier answered is still on screen, in the tier
+                    chip beside the line, and the full escalation story with its reasons is in
+                    the audit log where a story belongs. Nothing about the two tiers being real
+                    and separately observable is lost; it just stops interrupting. */}
                 {/* Collapsed by default and dimmer than the answer, so it never competes
                     with it. ⚠️ It is an EXPLANATION, never the answer: the summary above is
                     the executor's account of what ran, this is an account of what was
@@ -507,6 +756,15 @@ export function CommandBar() {
               )}
             </div>
           ))}
+
+          {/* Where the answer will appear. Shown only once a command has run long enough to
+              be worth explaining, so the fast path never sees it. */}
+          {waiting && (
+            <div className="entry system pending" aria-live="polite">
+              <span className="marker">·</span>
+              <span className="etext">Thinking…</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -588,6 +846,13 @@ export function CommandBar() {
           ref={inputRef}
           className="cmdinput"
           value={text}
+          /* 🔑 THE SAME CEILING THE SERVER ENFORCES, SO NOBODY MEETS IT AS AN ERROR. The
+             request model refuses anything longer, which is the guard that matters because
+             the endpoint is public. Repeating it here means a long paste is simply cut at
+             the box instead of coming back as a validation failure the operator has to
+             interpret. ⚠️ Not a substitute for the server's cap: this one is advice to a
+             browser, and the browser is not the only caller. */
+          maxLength={1000}
           disabled={busy}
           placeholder={busy ? "working…" : `try: ${EXAMPLES[log.length % EXAMPLES.length]}`}
           onChange={(e) => setText(e.target.value)}

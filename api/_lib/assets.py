@@ -553,8 +553,8 @@ _SOUTHERN_ROUTE = [
 # the array and the contacts move with it.
 _DARK_CONTACTS: list[tuple[str, str, int, float, float]] = [
     # id, name, array unit holding it (1-based), km south of the line, speed in knots
-    ("vsl-unk-01", "UNKNOWN 01", 3, 12.0, 16.5),
-    ("vsl-unk-02", "UNKNOWN 02", 8, 11.0, 15.0),
+    ("vsl-unk-01", "UNKNOWN VESSEL 01", 3, 12.0, 16.5),
+    ("vsl-unk-02", "UNKNOWN VESSEL 02", 8, 11.0, 15.0),
 ]
 _DETECTING_UNITS: frozenset[int] = frozenset(u for _, _, u, _, _ in _DARK_CONTACTS)
 
@@ -621,7 +621,7 @@ def _dark_contacts() -> list[Asset]:
         Asset(
             id="vsl-unk-03",
             kind="vessel",
-            name="UNKNOWN 03",
+            name="UNKNOWN VESSEL 03",
             lat=round(b_lat - 10.0 / _KM_PER_DEG_LAT, 4),
             lon=b_lon,
             status="nominal",

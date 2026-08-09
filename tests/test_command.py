@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 # next to the thing that needs it rather than in a config file nothing else requires.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from api._lib import db, executor, freshness, llm, parser, tools, transcribe  # noqa: E402
+from api._lib import db, executor, freshness, llm, parser, terrain, tools, transcribe  # noqa: E402
 
 NOW = datetime.now(UTC)
 
@@ -214,7 +214,7 @@ def test_history_degrades_honestly_when_nothing_records_positions(world, log, mo
     monkeypatch.setattr(tools, "_history_module", lambda: None)
     with pytest.raises(tools.ToolError) as caught:
         tools.entity_history(target="daymark 03")
-    assert "no position history" in str(caught.value)
+    assert "no past positions are recorded" in str(caught.value)
     # And it says what IS available, rather than stopping at the refusal.
     assert "mesh" in str(caught.value)
 
@@ -270,7 +270,10 @@ def test_a_missing_required_parameter_is_a_refusal_not_a_crash():
     is broken, not the request."""
     reasons = executor.validate([{"tool": "place_asset", "params": {"kind": "node"}}])
     assert reasons
-    assert "missing required parameters lat, lon" in reasons[0]
+    # ⚠️ ASSERTED ON THE NAMES, NOT THE SENTENCE. These reasons are shown to an operator
+    # now, so their wording is expected to change; what must not change is that the refusal
+    # says which details are still needed.
+    assert "a latitude and a longitude" in reasons[0]
 
 
 def test_optional_parameters_are_not_required():
@@ -283,13 +286,17 @@ def test_validation_collects_every_reason_not_the_first():
         [{"tool": "task_uas", "params": {"target": "x", "lat": 900, "lon": -95, "colour": "red"}}]
     )
     assert len(reasons) == 2
-    assert any("unknown parameters colour" in r for r in reasons)
+    assert any("colour" in r for r in reasons)
     assert any("is not a latitude" in r for r in reasons)
 
 
 def test_an_invented_tool_is_refused_by_the_registry():
     reasons = executor.validate([{"tool": "delete_everything", "params": {}}])
-    assert "is not a tool" in reasons[0]
+    # ⚠️ THE NAME COMES BACK AS WORDS. The reason is read by an operator, so an invented
+    # tool is echoed as "delete everything" rather than as the identifier it arrived as.
+    assert "delete everything" in reasons[0]
+    # It names what DOES exist rather than stopping at the refusal.
+    assert "list entities" in reasons[0]
 
 
 def test_a_rejected_plan_runs_nothing(world, log, writes):
@@ -497,6 +504,22 @@ def test_every_kind_the_database_accepts_can_be_placed(world, log, writes):
     assert in_db == set(tools.PLACEABLE_KINDS)
 
 
+def test_every_placeable_kind_has_a_medium_classified():
+    """The two lists are maintained in different files, and only one of them was pinned.
+
+    `terrain.check_placement` refuses a kind nobody classified by raising a ValueError that
+    tells the reader to go and edit `terrain.py`. That is the correct thing to say to
+    whoever adds a kind and the worst possible thing to show an operator, and it would
+    reach one: an unclassified kind escapes as a generic exception and lands in the
+    executor's error path. The two sets are equal today, so this pins them together rather
+    than waiting for the day a kind is added to one list and not the other.
+    """
+    unclassified = set(tools.PLACEABLE_KINDS) - set(terrain.CLASSIFIED_KINDS)
+    assert not unclassified, (
+        f"placeable but unclassified in terrain.py: {sorted(unclassified)}"
+    )
+
+
 def test_placing_a_moving_kind_is_allowed_and_left_free_to_move(world, log, writes):
     """A map an operator can only add masts to is read-only for most of what is on it."""
     tools.place_asset(kind="vessel", lat=74.2, lon=-95.0)
@@ -691,7 +714,7 @@ def test_an_unknown_tool_survives_to_the_validator_instead_of_being_dropped(worl
 
     assert plan == [{"tool": "delete_everything", "params": {}}]
     reasons = executor.validate(plan)
-    assert any("delete_everything" in r and "not a tool" in r for r in reasons)
+    assert any("delete everything" in r and "there is no" in r for r in reasons)
 
 
 def test_every_enumerated_tool_exists_in_the_registry():
@@ -1164,6 +1187,45 @@ def test_the_transcription_prompt_carries_what_is_on_the_map(world, log):
     assert "Do NOT force a match" in prompt
     # Coordinates are the other thing said aloud that a general model writes as words.
     assert "73.2 -95.9" in prompt
+    # 🔒 THE HINT LIST IS SCOPED TO ONE FIELD. It is what makes names transcribe correctly
+    # and it is also what put three asset names on screen that nobody said, so the prompt
+    # has to say which half of the answer it applies to.
+    assert '"heard"' in prompt and '"command"' in prompt
+    assert "never expand a plural" in prompt.lower() or "never expand a plural" in prompt
+
+
+def test_what_was_heard_is_kept_apart_from_what_will_run():
+    """🔴 The operator reads their OWN sentence, always.
+
+    A spoken command is corrected against the live asset names, which is why "day mark oh
+    three" resolves at all. The same mechanism turned "hide everything except for unknowns"
+    into three asset names nobody said, and the display showed the rewritten version as
+    though it were the utterance. Two fields from one call is what makes the correction
+    visible instead of silent."""
+    heard, command = transcribe._two_fields(
+        '{"heard": "hide everything except for unknowns",'
+        ' "command": "hide everything except UNKNOWN 01, UNKNOWN 02"}'
+    )
+    assert heard == "hide everything except for unknowns"
+    assert command == "hide everything except UNKNOWN 01, UNKNOWN 02"
+    assert heard != command  # the client states the assumption when these differ
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mesh status",  # a bare sentence, which is what the model used to return
+        '```json\n{"heard": "mesh status", "command": "mesh status"}\n```',  # fenced
+        '{"command": "mesh status"}',  # one field missing
+    ],
+)
+def test_a_reply_that_is_not_the_expected_json_still_produces_a_command(raw):
+    """🔒 Fails soft. The reply is ASKED for as JSON and a model can still return prose, a
+    code fence, or half the fields. None of that is worth losing a spoken command over, so
+    an unparseable reply is treated as the transcription itself and used for both."""
+    heard, command = transcribe._two_fields(raw)
+    assert command == "mesh status"
+    assert heard == "mesh status"  # nothing was assumed, so nothing is claimed
 
 
 def test_the_vocabulary_survives_the_world_being_unreadable(monkeypatch):
@@ -1458,7 +1520,10 @@ def test_a_misspelled_target_reaches_tier_2_and_the_chain_is_recorded(world, log
 
     # 🔗 Every row of the escalation hangs off the first command.
     chained = [r for r in log if r.get("parent_command_id") == first["command_id"]]
-    assert [r["tool"] for r in chained] == ["llm_select", "plan", "describe_entity"]
+    # ⚠️ `tier2_reason`, renamed from `llm_select`. The row now narrates what the tier did
+    # rather than naming the function that wrote it, so the log reads as a story: what was
+    # checked, what was chosen, and why.
+    assert [r["tool"] for r in chained] == ["tier2_reason", "plan", "describe_entity"]
 
 
 def test_an_escalation_that_cannot_run_keeps_the_honest_refusal(world, log, monkeypatch):
@@ -1495,6 +1560,44 @@ def test_an_escalation_never_escalates_and_a_model_plan_never_bounces_back(world
     )
     # The flag is still reported; the API's condition is what refuses to act on it.
     assert from_llm["unresolved"] is True
+
+
+def test_a_spoken_command_may_still_escalate(world, log, monkeypatch):
+    """🔴 THE GUARD THAT SILENTLY TURNED TIER 2 OFF FOR VOICE, AND ONLY FOR VOICE.
+
+    The escalation used to require an absent `parent_command_id`, meaning to stop an
+    escalation escalating. Nothing that reaches it has ever been one: an escalation runs in
+    process and never re-enters the endpoint, and a clarification chip posts a plan, which
+    skips the parser branch entirely. The single kind of request carrying both an utterance
+    and a parent is a spoken one, because voice hangs the command off the transcription row
+    on purpose. So the condition matched voice and nothing else, and the same sentence was
+    answered by two different systems depending on whether it was typed or said."""
+    monkeypatch.setattr(
+        llm,
+        "default_provider",
+        lambda: llm.ReplayProvider(
+            {"show detected": {"steps": [{"tool": "show_unknown"}], "view_tool": "none",
+                               "reasoning": "Showing the contacts being held."}}
+        ),
+    )
+    from api import index
+
+    # The spend guard is a separate concern and would refuse tier 2 here for its own
+    # reasons, which would pass this test for the wrong one.
+    monkeypatch.setattr(index.ratelimit, "origin_allowed", lambda origin: True)
+    monkeypatch.setattr(index.ratelimit, "check", lambda ip: type("V", (), {"allowed": True})())
+
+    client = TestClient(index.app)
+    said = client.post(
+        "/api/command",
+        json={
+            "utterance": "show detected",
+            "source": "voice",
+            "parent_command_id": "11111111-2222-3333-4444-555555555555",
+        },
+    ).json()
+
+    assert said["tier"] == "llm", "a spoken command must reach tier 2 like a typed one"
 
 
 # --------------------------------------------------------------------------
@@ -1786,7 +1889,12 @@ def test_show_unknown_degrades_rather_than_crashing_without_the_detection_layer(
     monkeypatch.setattr(tools, "_detect_module", lambda: None)
     with pytest.raises(tools.ToolError) as caught:
         tools.show_unknown()
-    assert "what is available" in str(caught.value).lower()
+    # It names what the display CAN do rather than stopping at the refusal. Asserted on
+    # that promise rather than on an exact phrase, so rewording the sentence for an
+    # operator does not read as a behaviour change.
+    said = str(caught.value).lower()
+    assert "what it can show" in said
+    assert "mesh connectivity" in said
 
 
 @pytest.mark.parametrize(
@@ -1869,11 +1977,19 @@ def test_an_unbound_subject_is_refused_rather_than_widening(world, log):
     assert outcome["results"][0]["data"]["ids"] == [], "matches nothing, rather than everything"
 
 
-def test_isolating_a_kind_still_filters_and_frames(world, log):
-    """A kind has no single asset to select or open, so that branch stays two steps. The
-    four-action shape is about a named asset."""
+def test_isolating_a_kind_hides_the_others_rather_than_only_framing(world, log):
+    """🔴 IT USED TO LIST AND FRAME, WHICH IS NOT ISOLATING.
+
+    A kind has no single asset to select or open, so this branch cannot be the four-action
+    shape a named asset gets. It still has to honour the word: nothing was hidden, so
+    "isolate the drones" left every other kind on the map and differed from "show me the
+    drones" by a camera move. The trace could not catch it either, because "isolate" sat in
+    the blanket filler list and counted as used whatever the plan did."""
     plan = parser.parse("isolate the drones")
-    assert [s["tool"] for s in plan] == ["list_entities", "frame_entities"]
+    assert [s["tool"] for s in plan] == ["set_visible_kinds", "list_entities", "frame_entities"]
+    assert plan[0]["params"] == {"mode": "only", "kinds": ["uas"]}
+    # And the word is now accounted for, so this stays on tier 1 instead of escalating.
+    assert parser.trace("isolate the drones", plan)["ignored"] == []
 
 
 def test_the_trace_reports_the_parameters_it_inferred():
@@ -1936,3 +2052,306 @@ def test_the_parser_trace_survives_an_escalation_to_tier_2(world, log, monkeypat
     assert handed, "the trace that explains WHY the model was called must survive"
     assert handed["ignored"] == ["lancaster", "sound", "01"]
     assert handed["extracted"] == {"overdue": True, "kind": "hydrophone"}
+
+
+# --------------------------------------------------------------------------
+# What is drawn: hiding and showing whole kinds
+# --------------------------------------------------------------------------
+
+
+def test_hiding_a_kind_is_a_display_intent_not_a_computed_set(world, log):
+    """🔒 THE SERVER DOES NOT KNOW WHAT IS ALREADY HIDDEN, and must not pretend to.
+
+    Which kinds are switched off is one browser's preference. So the tool names what it was
+    asked to do and the client resolves it, which is also what keeps `only` and `all`
+    absolute: "show only the vessels" has to mean the same thing whatever was hidden first.
+    """
+    plan = parser.parse("hide all radars")
+    assert plan == [{"tool": "set_visible_kinds", "params": {"mode": "hide", "kinds": ["radar"]}}]
+
+    out = executor.execute(plan, source="typed", tier="parser", utterance="hide all radars")
+    assert out["ui_effects"]["kinds"] == {"mode": "hide", "kinds": ["radar"]}
+
+
+def test_only_and_except_mean_the_same_thing(world, log):
+    """Two phrasings of one intent, and both have to beat the plain hide and show branches
+    that their own words contain."""
+    for utterance in (
+        "show only the vessels",
+        "only show vessels",
+        "hide everything except the vessels",
+    ):
+        plan = parser.parse(utterance)
+        assert plan == [
+            {"tool": "set_visible_kinds", "params": {"mode": "only", "kinds": ["vessel"]}}
+        ], utterance
+
+
+def test_showing_everything_clears_the_filter(world, log):
+    for utterance in ("show all assets", "unhide everything", "show everything"):
+        plan = parser.parse(utterance)
+        assert plan == [{"tool": "set_visible_kinds", "params": {"mode": "all"}}], utterance
+
+
+def test_asking_for_a_kind_unhides_it_as_well_as_highlighting_it(world, log):
+    """🔑 "Show me the drones" MUST PRODUCE DRONES.
+
+    If the operator switched that kind off earlier, the honest reading of the request is
+    that they want it back, not that they want an empty highlight over a layer they cannot
+    see. The list keeps its highlight; the unhide rides along with it.
+    """
+    plan = parser.parse("show me the drones")
+    out = executor.execute(plan, source="typed", tier="parser", utterance="show me the drones")
+
+    assert out["ui_effects"]["highlight"], "the highlight is unchanged"
+    assert out["ui_effects"]["kinds"] == {"mode": "show", "kinds": ["uas"]}
+
+
+def test_an_answer_reveals_the_kinds_it_names(world, log):
+    """🔑 AIMING AT SOMETHING AND REVEALING IT ARE ONE ACTION, decided 2026-08-09.
+
+    ⚠️ THIS REVERSED AN EARLIER RULE, and the earlier one was not silly: it said a question
+    about the whole world is not a request to undo a filter somebody set on purpose. What
+    changed the call is that the camera has always been aimed at the answer, so hiding a kind
+    an hour ago meant a later question about it flew the view to a blank patch of map and
+    described an asset that was not on screen. Half of "show me" was being honoured.
+
+    🔑 THE REASONING FOR THE REVERSAL, WHICH IS THE PART WORTH KEEPING: a filter is not a
+    permanent thing and is cheap to reapply, so it is the weaker of the two claims on the
+    view. Staying current with what the operator is looking at now is the stronger one. Do
+    not reinstate the old rule on the strength of its argument alone; it was heard and
+    outweighed.
+
+    The cost is real and accepted: a sweeping question reveals every kind it names, so a kind
+    filter does not survive one. An explicit visibility command still wins, which is the case
+    the old rule most wanted to protect."""
+    plan = parser.parse("which assets are overdue")
+    out = executor.execute(plan, source="typed", tier="parser", utterance="which assets are overdue")
+
+    assert out["ui_effects"]["kinds"]["mode"] == "show"
+    assert out["ui_effects"]["kinds"]["kinds"]
+
+
+def test_an_explicit_visibility_command_is_not_undone_by_the_reveal(world, log):
+    """⛔ "Hide the radars" is a plan whose whole purpose is a visibility choice. Revealing
+    whatever it reported would undo the command in the same breath as running it."""
+    plan = parser.parse("hide the radars")
+    out = executor.execute(plan, source="typed", tier="parser", utterance="hide the radars")
+
+    assert out["ui_effects"]["kinds"] == {"mode": "hide", "kinds": ["radar"]}
+
+
+def test_hide_does_not_swallow_a_delete(world, log, deletes):
+    """🔴 THE REGRESSION THIS BRANCH WAS NARROWED TO AVOID.
+
+    The view branches sit above the write tools, so accepting "remove" or "turn off" as
+    hide verbs would have converted a destructive command into a display filter. That is the
+    worst possible way to be wrong about a delete: it appears to succeed and the asset is
+    still there.
+    """
+    plan = parser.parse("remove the marker")
+    assert plan is not None
+    assert plan[0]["tool"] != "set_visible_kinds"
+
+
+def test_a_kind_nobody_has_is_refused_by_name(world, log):
+    with pytest.raises(tools.ToolError) as caught:
+        tools.REGISTRY["set_visible_kinds"].fn(mode="hide", kinds=["submarine"])
+    assert "submarine" in str(caught.value)
+
+
+def test_an_unknown_view_mode_is_refused(world, log):
+    with pytest.raises(tools.ToolError) as caught:
+        tools.REGISTRY["set_visible_kinds"].fn(mode="dim", kinds=["radar"])
+    assert "dim" in str(caught.value)
+
+
+def test_every_view_verb_can_be_hinted_to_the_transcriber(world, log):
+    """🔑 THE GAP A TEST CANNOT FIND ON ITS OWN, written down as a test anyway.
+
+    The vocabulary check pins the static half to the code's enums, so a new fault, overlay
+    or kind is caught automatically. A new VERB belongs to no enum, so nothing would have
+    noticed that the display had learned "hide" while the transcriber had not. A misheard
+    verb loses the whole command even when every asset name in it was heard perfectly.
+    """
+    spoken = " ".join(transcribe._live_vocabulary()).lower()
+    for word in ("hide", "unhide", "only", "except"):
+        assert word in spoken, f"the view verb '{word}' cannot be hinted to the transcriber"
+
+
+# --------------------------------------------------------------------------
+# The backhaul question, which has two honest readings
+# --------------------------------------------------------------------------
+
+
+def test_a_backhaul_question_answers_both_readings(world, log):
+    """🔑 "How many assets have a backhaul" IS GENUINELY AMBIGUOUS.
+
+    It can mean carrying the terminal, a fact about the kit, or having a way out through
+    one, a fact about the network. Picking either silently answers a different question from
+    the one asked about half the time, and both numbers fit in a sentence.
+    """
+    plan = parser.parse("how many assets have a backhaul")
+    assert plan == [{"tool": "backhaul_status", "params": {}}]
+
+    out = executor.execute(
+        plan, source="typed", tier="parser", utterance="how many assets have a backhaul"
+    )
+    summary = out["results"][0]["message"]
+    assert "carry a backhaul terminal" in summary
+    assert "can currently reach one" in summary
+
+
+def test_every_way_of_saying_it_reaches_the_same_answer(world, log):
+    """A synonym known to one branch and not to the shared word list is the drift that sends
+    a question tier 1 answers perfectly off to the model as a partial match."""
+    for utterance in (
+        "how many assets have a backhaul",
+        "which assets have a gateway",
+        "how many assets have a satellite terminal",
+        "how many uplinks do we have",
+    ):
+        plan = parser.parse(utterance)
+        assert plan == [{"tool": "backhaul_status", "params": {}}], utterance
+        assert parser.trace(utterance, plan)["ignored"] == [], utterance
+
+
+def test_backhaul_does_not_steal_the_mesh_status_question(world, log):
+    """The two sit next to each other and answer different things: one is about satellite
+    terminals, the other about radio links."""
+    assert parser.parse("mesh status") == [{"tool": "mesh_status", "params": {}}]
+
+
+def test_every_tool_is_reachable_by_tier_two_unless_deliberately_withheld():
+    """🔴 THE OMISSION THIS EXISTS TO CATCH, MADE TWICE IN ONE SESSION.
+
+    A tool added to the registry and wired into the parser works for the phrasings tier 1
+    recognises and is INVISIBLE to the model, so a request one word away from a matched
+    phrasing gets "there is no command for that" from a system that has exactly that
+    command. Nothing failed: the tests passed, the tool worked, and only the half of the
+    surface nobody typed was dead.
+
+    The exclusions are deliberate and each carries its reason, so withholding a tool stays a
+    decision somebody made rather than a step somebody forgot.
+    """
+    # The camera is oriented automatically from whatever the data commands return, and the
+    # prompt tells the model so. Offering it camera tools would invite it to fight that.
+    withheld = {"focus_entity", "frame_entities"}
+
+    exposed = set(llm.DATA_TOOLS) | (set(llm.VIEW_TOOLS) - {"none"})
+    unreachable = set(tools.REGISTRY) - exposed - withheld
+
+    assert not unreachable, (
+        f"{sorted(unreachable)} exist in the registry and cannot be chosen by tier 2. "
+        "Add them to DATA_TOOLS, or to the withheld set above with a reason."
+    )
+
+
+def test_a_question_about_a_word_is_not_a_request_for_a_count(world, log):
+    """🔴 "What is a backhaul" ANSWERED WITH ELEVEN ASSET NAMES.
+
+    The branch matched the keyword and answered a different question confidently, which is
+    the failure this tier exists to avoid. A definition is exactly the language tier 2 is
+    for, so tier 1 declines rather than matching on a word it recognises.
+    """
+    for utterance in (
+        "what is a backhaul",
+        "what's a backhaul",
+        "what does backhaul mean",
+        "explain the gateway",
+        "why do we have uplinks",
+    ):
+        plan = parser.parse(utterance)
+        assert plan != [{"tool": "backhaul_status", "params": {}}], utterance
+
+
+def test_a_name_filter_counts_a_family_rather_than_reporting_zero(world, log):
+    """🔴 "How many Daymark are there" ANSWERED 0 ABOUT A FLEET OF FIVE.
+
+    No tool could express a filter by name, so tier 2 asked for something that matched
+    nothing and the console reported a confident zero. A refusal names a limit; a zero names
+    a fact about the world, and only one of those was true.
+    """
+    assert "name" in tools.REGISTRY["list_entities"].params, (
+        "declaring it is what lets it survive _params_for and reach the tool at all"
+    )
+
+    rows = [
+        {"id": "uas-a", "name": "Daymark 01", "kind": "uas", "status": "nominal"},
+        {"id": "uas-b", "name": "Daymark 02", "kind": "uas", "status": "nominal"},
+        {"id": "v-1", "name": "Kiviuq", "kind": "vessel", "status": "nominal"},
+    ]
+    matched = [r for r in rows if "daymark" in r["name"].lower()]
+    assert len(matched) == 2, "the match is a case-insensitive substring, so a family counts"
+
+
+def test_any_tier_one_refusal_reaches_the_model_not_the_operator(world, log, monkeypatch):
+    """🔴 "What is this map about" WAS ANSWERED WITH "nothing here matches this map about".
+
+    Escalation used to fire only when a referent resolved to nothing. Every other way tier 1
+    can be unsure ended at the operator, which is the same theft the parser's own contract
+    forbids: it half-matched, and the tier allowed to be uncertain never saw the utterance.
+
+    Asserted through the endpoint rather than on the condition, because what matters is that
+    the operator gets the model's answer and not the parser's refusal.
+    """
+    from api import index
+
+    monkeypatch.setattr(index.ratelimit, "origin_allowed", lambda origin: True)
+    monkeypatch.setattr(
+        index.ratelimit, "check", lambda ip: type("V", (), {"allowed": True})()
+    )
+    monkeypatch.setattr(
+        llm,
+        "default_provider",
+        lambda: llm.ReplayProvider(
+            {
+                "what is this map about": {
+                    "reasoning": "This display shows Arctic sensor assets.",
+                    "steps": [],
+                    "view_tool": "none",
+                }
+            }
+        ),
+    )
+
+    client = TestClient(index.app)
+    body = client.post(
+        "/api/command", json={"utterance": "what is this map about", "source": "typed"}
+    ).json()
+
+    assert body["tier"] == "llm", "a parser refusal must not be the last word"
+    assert body["escalated_from"] == "parser"
+    assert body["summary"] == "This display shows Arctic sensor assets."
+
+
+def test_a_refusal_that_already_wrote_something_is_not_retried(world, log, writes, monkeypatch):
+    """🔒 THE GUARD ON THE RULE ABOVE, and the reason it is not simply "escalate on failure".
+
+    The executor is fail-fast and not transactional. A plan that placed an asset and then
+    failed has already committed that write, so re-running the utterance through the model
+    would place a second one. Escalation is for a refusal that changed nothing.
+    """
+    from api import index
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        index, "_escalate_to_tier_two",
+        lambda *a, **k: calls.append("escalated") or None,
+    )
+
+    client = TestClient(index.app)
+    client.post(
+        "/api/command",
+        json={
+            "utterance": "place a node at 74, -95 and task daymark 99 to nowhere",
+            "source": "typed",
+            "plan": [
+                {"tool": "place_asset", "params": {"kind": "node", "lat": 74.0, "lon": -95.0}},
+                {"tool": "describe_entity", "params": {"target": "daymark 99"}},
+            ],
+        },
+    )
+
+    assert writes, "the first step must actually have written something"
+    assert not calls, "a plan that already committed a write must not be re-run"

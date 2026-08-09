@@ -23,12 +23,13 @@ grep finds it.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from ._lib import db
 
@@ -40,7 +41,7 @@ try:
 except Exception:  # noqa: BLE001
     detect = None  # type: ignore[assignment]
 
-from ._lib import executor, lifecycle, parser, ratelimit, transcribe
+from ._lib import executor, lifecycle, parser, plaintext, ratelimit, transcribe
 from ._lib import llm as llmlib
 from ._lib import mesh as meshlib
 from ._lib import tools as toollib
@@ -117,7 +118,7 @@ def entities(
     except RuntimeError as exc:
         # A missing connection string is a configuration failure, not an empty
         # world, and it must not render as one.
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, _DB_UNAVAILABLE) from exc
 
     _add_connectivity(rows)
     _add_tracking(rows)
@@ -193,6 +194,26 @@ def _add_tracking(rows: list[dict]) -> None:
         found = held.get(row["id"])
         if found is None:
             continue
+        # 🔴 AN ASSET THE OPERATOR PLACED IS KNOWN BECAUSE THE OPERATOR PLACED IT, and not
+        # saying so made a placed vessel VANISH. Nothing was detecting it and it carried no
+        # AIS, so it came back `tracked: false` with nothing holding it, which the display
+        # correctly reads as an undetected unknown and correctly hides behind a checkbox
+        # that is ticked by default. Every step of that was right and the outcome was
+        # absurd: you put a ship on the map and the map denies it is there.
+        #
+        # The console cannot legitimately know about a contact nobody detected. It can
+        # always legitimately know about one it was told to create. Leaving the fields OFF
+        # rather than setting them true is the same move this function already makes for a
+        # mesh node: tracking is not a fact about this row, so neither value is honest.
+        #
+        # ⚠️ A HOSTILE PLACEMENT IS EXEMPT, AND THAT IS THE WHOLE POINT OF IT. Dropping an
+        # adversary somewhere nothing can see it is the question this sensor network exists
+        # to answer, so those keep the honest `tracked: false` and stay behind the checkbox.
+        # The difference is intent: one is scenery the operator added, the other is a test.
+        if (row.get("props") or {}).get("placed_by") == "operator" and not (
+            (row.get("props") or {}).get("hostile")
+        ):
+            continue
         reported = [d for d in found if d.get("reported")]
         announcing = bool(self_reporting(row)) if self_reporting else False
         row["held"] = len(found)
@@ -221,7 +242,7 @@ def mesh() -> JSONResponse:
     try:
         rows = db.fetch_entities()
     except RuntimeError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, _DB_UNAVAILABLE) from exc
 
     payload = meshlib.mesh_status(rows)
     payload["model"] = _mesh_model()
@@ -259,7 +280,12 @@ def _mesh_model() -> dict:
     }
 
 
-def _model_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
+def _model_context(
+    context: dict[str, Any] | None,
+    *,
+    heard: str | None = None,
+    running: str | None = None,
+) -> dict[str, Any] | None:
     """The context, bounded, before it is serialised into a prompt.
 
     🔑 A FOLLOW-UP NEEDS THE THREAD. "Now just the ones on foot" is meaningless without the
@@ -272,9 +298,24 @@ def _model_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
     turns and fifty ids is deixis, which is all this is for. Anything longer would be
     memory, and memory is not what "them" means.
     """
-    if not context:
-        return context
-    trimmed = dict(context)
+    trimmed = dict(context or {})
+    # 🔑 ATTACHED HERE RATHER THAN AT EACH CALL SITE, so both ways into tier 2 carry it. The
+    # direct path and the escalation path have drifted apart before, and a capability that
+    # exists on one of them is a capability that works depending on how you phrased the
+    # question.
+    trimmed["world"] = _world_digest()
+    # 🔑 THE WORDS BEFORE THE GUESS, WHEN A GUESS WAS MADE. The transcriber matches spoken
+    # names against the live map, which is what makes "day mark oh three" resolve at all
+    # and is also how "Resolute Bay Patrol" can arrive as "FLS Resolute Bay". That
+    # substitution is the transcriber's opinion, formed with no knowledge of what the
+    # sentence was asking for. This tier has the whole world and the request in front of it
+    # and can tell that a patrol was meant, so it gets to see both and decide.
+    #
+    # ⚠️ ONLY WHEN THEY DIFFER. Attaching an identical string to every spoken command would
+    # spend tokens to say nothing and teach the model to expect a correction that is not
+    # there.
+    if heard and running and heard.strip() != running.strip():
+        trimmed["heard_before_correction"] = heard.strip()
     recent = trimmed.get("recent")
     if isinstance(recent, list):
         turns = []
@@ -294,8 +335,249 @@ def _model_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
     return trimmed
 
 
+def _world_digest() -> list[dict[str, Any]]:
+    """Every asset, compactly, for the model to reason over directly.
+
+    🔑 THE ANSWER TO "SHOW ME THE NORTHERNMOST ASSET", AND TO A WHOLE CLASS LIKE IT. That
+    question is not a filter, it is a comparison across the set, and no enumerated tool
+    parameter will ever express every comparison somebody might ask for. Handing the model
+    the actual rows lets it do the reasoning and answer with `ids`, which is a tool that
+    already exists. The alternative is a new parameter per question, forever.
+
+    ⚠️ IT IS THE MODEL'S WORKING SET, NEVER THE ANSWER. The model returns ids and the tools
+    re-read those rows from the database, so what reaches the operator has been through the
+    same path as every other answer. Nothing here is trusted: an id that does not exist
+    resolves to nothing, exactly as a hallucinated name already did.
+
+    🔒 SEVEN FIELDS, NOT THE ROW. Positions, kind, name, status and freshness are what
+    comparisons are asked about. `props` is where the bulky per-kind detail lives and it is
+    left out deliberately: it would multiply the token cost of every call for questions
+    nobody asks, and `describe_entity` already exists for the one asset somebody cares about.
+    """
+    try:
+        rows = db.fetch_entities()
+    except Exception:  # noqa: BLE001 - the model can still route without the world
+        return []
+    digest = []
+    for r in rows:
+        digest.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "kind": r["kind"],
+                "lat": round(r["lat"], 3) if r.get("lat") is not None else None,
+                "lon": round(r["lon"], 3) if r.get("lon") is not None else None,
+                "status": r.get("status"),
+                "flag": r.get("flag"),
+            }
+        )
+    return digest
+
+
+
+
+# ---------------------------------------------------------------------------
+# What the operator is told when the system itself could not act
+# ---------------------------------------------------------------------------
+
+#: What this console is, in one line, for a reply that has to explain itself.
+_WHAT_THIS_IS = (
+    "This console tracks Arctic sensor assets, the radio mesh between them, satellite "
+    "backhaul, measured sea ice and unidentified contacts."
+)
+#: Three commands that always work, including when the metered layer does not.
+_TRY_THESE = '"mesh status", "which assets are overdue", or "show me the drones"'
+
+#: What a caller is told when the database cannot be reached.
+#:
+#: ⚠️ THE UNDERLYING MESSAGE IS A CONFIGURATION NOTE, not an answer. It names environment
+#: variables and how to populate them locally, which is the right thing to say to whoever
+#: is running this and the wrong thing to hand to anyone else. It stays in the server log,
+#: where the person who needs it is looking, and the response says what happened instead.
+_DB_UNAVAILABLE = "the world is not reachable right now, so this console cannot answer. Try again shortly."
+
+
+#: How much model prose may occupy the answer line. Two plain sentences is what the prompt
+#: asks for and roughly what the good answers measure; past this it is not an answer to a
+#: question about the Arctic, it is something else wearing the console's voice.
+_ANSWER_LIMIT = 500
+
+# 🔴 THE VALIDATOR TALKING TO A PROGRAMMER. These are the shapes `executor.validate`
+# produces, and every one of them is a sentence about this program's internals rather than
+# about the world: step numbers, parameter names, the word "tool" used as a type. They are
+# perfect in the audit log and wrong on the screen, which is the same distinction `_dressed`
+# already draws between the system's failures and the world's refusals.
+_MACHINE_TALK = re.compile(
+    r"^step \d|is not a tool|unknown parameters|params must be|missing required parameters"
+    r"|names no tool|is not an object|the plan is empty|the plan has \d+ steps",
+    re.IGNORECASE,
+)
+
+
+def _showable(said: str) -> str | None:
+    """Model prose, if it is the shape of an answer. None means show a refusal instead.
+
+    🔴 THE SCHEMA CONSTRAINS `steps` AND HAS NEVER CONSTRAINED `reasoning`. Everything the
+    model can be talked into saying arrives through this one field and is printed as the
+    console's own voice, so the prompt is the only thing standing between a visitor and a
+    poem on the answer line. A prompt is a request, not a boundary, which this codebase
+    says out loud about the model everywhere except here.
+
+    🔑 THE TEST IS SHAPE, NOT SUBJECT, because shape is what this layer can actually judge.
+    A real answer here is one or two plain sentences. A poem, a list, a character sketch or
+    a recitation of the instructions all arrive long or with line breaks in them, and none
+    of the genuine answers ever has either. Judging the subject would need a classifier;
+    judging the form needs two conditions and cannot be argued with.
+
+    ⚠️ NOTHING IS LOST WHEN THIS SAYS NO. The full text is already in the audit row, written
+    before this runs, so the record still holds exactly what the model said.
+    """
+    said = plaintext.plain(said)
+    if not said:
+        return None
+    if "\n" in said or len(said) > _ANSWER_LIMIT:
+        return None
+    return said
+
+
+def _lead_in(outcome: dict[str, Any], reasoning: str, *, even_when_refused: bool = False) -> None:
+    """Put tier 2's own sentence in front of the result it went and fetched.
+
+    🔴 A TIER-2 ANSWER IS NOT AN ORDINARY TOOL CALL AND SHOULD NOT READ LIKE ONE. Reaching
+    this tier means the deterministic parser could not place the sentence, so something had
+    to interpret the request before anything could run. Showing only the tool's line threw
+    that interpretation away: asked what a survey was, the console answered "2 assets
+    match: Survey 03 and Survey Team Alpha", which is a correct answer to a question nobody
+    could see being asked.
+
+    🔑 IT COSTS NOTHING, WHICH IS WHY IT IS THIS AND NOT A SECOND MODEL CALL. The obvious
+    way to have the model narrate a result is to send the result back to it, which doubles
+    the price and the latency of every escalated command. This text already exists: the
+    model writes it while planning, before the data is fetched, and it was already being
+    logged and thrown away. So the lead says what is about to happen rather than what came
+    back, and the tool still reports the facts.
+
+    ⚠️ SUCCESSES ONLY, WITH ONE EXCEPTION. A refusal from a tool already carries its own
+    full explanation, and introducing one with "Searching for assets matching survey" would
+    put a promise in front of an apology. The exception is a plan tier 2 proposed and the
+    validator refused: there the lead is the only thing on screen saying what was attempted,
+    and "Setting that drone's altitude. 99000 m is outside the altitude an asset here can be
+    given" is a complete account of what happened, in order.
+    """
+    if not outcome.get("ok") and not even_when_refused:
+        return
+    lead = _showable(reasoning)
+    summary = str(outcome.get("summary", "")).strip()
+    if not lead or not summary or summary.startswith(lead):
+        return
+    if not lead.endswith((".", "!", "?", ":")):
+        lead += "."
+    # ⚠️ THE SECOND SENTENCE HAS TO START LIKE ONE. These messages are written to stand
+    # alone, so they begin in lower case, which is right on their own and wrong directly
+    # after a full stop: "Tasking Daymark 03. to task uas I still need a latitude" reads as
+    # a string join rather than as a person talking.
+    summary = summary[0].upper() + summary[1:]
+    outcome["summary"] = f"{lead} {summary}"
+
+
+def _dressed(cause: str = "") -> str:
+    """A refusal an operator can read, for the failures that are the SYSTEM's rather than
+    the world's.
+
+    🔑 THE DISTINCTION IS WHERE THE REFUSAL CAME FROM, NOT HOW IT IS WORDED. A tool that
+    declines because a hydrophone cannot go 2 km inland, or because a name matched five
+    assets, is the product working: those sentences are specific, actionable and worth
+    reading, and they are left exactly as they are. What gets dressed is the other kind:
+    a parse that failed, a plan that would not validate, a provider that was unavailable, a
+    referent that resolved to nothing. Those tell the operator about the machinery rather
+    than about the Arctic, and "I could not turn that into a command" is a system talking
+    to itself in front of a visitor.
+
+    ⚠️ IT STILL SAYS SOMETHING TRUE. Dressing a refusal is not hiding it: the underlying
+    reason is written to the audit log verbatim on the way past, so nothing is lost, it is
+    just not the sentence a stranger reads first.
+
+    🔴 A VALIDATOR REASON IS NOT A LEAD SENTENCE. Dressing used to pass the cause through
+    whatever it said, so `step 1 (task_uas): altitude 99000.0 is out of range` reached the
+    operator with a friendly paragraph stapled to it, which reads worse than either half
+    alone: internal vocabulary given a polite voice. Those causes are replaced rather than
+    prefixed, and they stay verbatim in the log.
+
+    ⚠️ ONE SUGGESTION PER REFUSAL. Several causes already end with a specific "try ...",
+    which is the better sentence because it was written for that exact request. Appending
+    the generic list after it produced two suggestions in one breath and buried the good
+    one, so a cause that already suggests something keeps its own.
+    """
+    lead = plaintext.plain(cause)
+    if _MACHINE_TALK.search(lead):
+        lead = "I could not turn that into a command I can run"
+    lead = lead or "I could not act on that one"
+    if not lead.endswith((".", "!", "?")):
+        lead += "."
+    if "try " in lead.lower():
+        return f"{lead} {_WHAT_THIS_IS}"
+    return f"{lead} {_WHAT_THIS_IS} Try {_TRY_THESE}."
+
+def _log_tier1(
+    req: CommandRequest,
+    plan: list[dict] | None,
+    trace: dict[str, Any],
+    *,
+    command_id: str | None = None,
+) -> None:
+    """Narrate tier 1's decision into the audit log, in the terms it actually decided in.
+
+    ⚠️ PROSE, NOT A DUMP. The row an evaluator reads should say what happened, not require
+    them to reconstruct it from a parameter bag. Every fact in the sentence is also in the
+    params beside it, so the narrative is readable and the underlying values are checkable.
+    """
+    matched = trace.get("matched")
+    ignored = trace.get("ignored") or []
+    tools_n = len(toollib.REGISTRY)
+
+    if matched and not ignored:
+        story = f"searched {tools_n} available tools, selected {matched}"
+        result = "ok"
+    elif matched and ignored:
+        story = (
+            f"searched {tools_n} available tools, matched {matched} but could not account "
+            f"for {', '.join(ignored)}; a partial match is not an answer, so escalating"
+        )
+        result = "escalated"
+    else:
+        story = (
+            f"searched {tools_n} available tools, no deterministic match for this phrasing; "
+            "escalating to the reasoning layer"
+        )
+        result = "escalated"
+
+    try:
+        db.log_event(
+            tool="tier1_parse",
+            source=req.source,
+            tier="parser",
+            result=result,
+            command_id=command_id,
+            parent_command_id=req.parent_command_id,
+            params={
+                "utterance": req.utterance,
+                "matched": matched,
+                "ignored": ignored,
+                "extracted": trace.get("extracted") or {},
+            },
+            detail=story,
+        )
+    except Exception:  # noqa: BLE001 - a log row must never take a command down
+        return
+
 def _tier_two_blocked(
-    *, client_ip: str | None, origin: str | None, utterance: str | None, source: str
+    *,
+    client_ip: str | None,
+    origin: str | None,
+    utterance: str | None,
+    source: str,
+    command_id: str | None = None,
+    parent_command_id: str | None = None,
 ) -> str | None:
     """Why the model must not be called right now, or None if it may be.
 
@@ -306,11 +588,16 @@ def _tier_two_blocked(
     out twice.
     """
     if not ratelimit.origin_allowed(origin):
-        return "the reasoning layer is not available from this origin"
+        # ⚠️ WORDED FOR A PERSON, because it reaches one. The check is a filter against a
+        # page on somebody else's domain driving up a bill, and "not available from this
+        # origin" is the machine describing its own configuration to a visitor who has no
+        # idea what an origin is.
+        return "The reasoning layer is not available from this page"
     verdict = ratelimit.check(client_ip)
     if not verdict.allowed:
         db.log_event(
             tool="rate_limited", source=source, result="rejected",
+            command_id=command_id, parent_command_id=parent_command_id,
             params={"utterance": utterance, "scope": verdict.scope,
                     "used": verdict.used, "limit": verdict.limit},
             detail=verdict.reason,
@@ -327,7 +614,36 @@ class CommandRequest(BaseModel):
     are unanswerable, and both are things people say constantly.
     """
 
-    utterance: str | None = None
+    # 🔒 BOUNDED BECAUSE IT ARRIVES FROM ANYONE AND IS SPENT ON A PAID CALL. Without a cap
+    # a single request can carry a novel: it is pasted whole into the model call, stored
+    # whole in the audit row, and rendered whole in the panel that is meant to be read.
+    # A thousand characters is far past anything a person says to a console and far short
+    # of anything worth sending. Pydantic refuses the rest with a 422 before any of it is
+    # logged or paid for.
+    utterance: str | None = Field(default=None, max_length=1000)
+    # 🔑 WHAT THE MICROPHONE ACTUALLY CAUGHT, when it differs from what is being run. The
+    # transcriber matches spoken names against the live map, so "Resolute Bay Patrol" can
+    # arrive as "FLS Resolute Bay", and that substitution is a guess. Carrying the original
+    # words means tier 2 can see the guess and disagree with it, which is exactly the sort
+    # of judgement the expensive tier is there for. Absent on typed commands, where there
+    # is nothing to disagree with.
+    heard: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("utterance", "heard")
+    @classmethod
+    def _strip_invisibles(cls, value: str | None) -> str | None:
+        """Remove characters that would misrepresent this text once it is rendered.
+
+        🔴 THE AUDIT PANEL IS THE REASON. A right-to-left override inside a command makes
+        the row display in a different order from the one it was stored in, so the record
+        of what somebody asked would show something else. A log that can be made to lie
+        about its own contents is worse than no log.
+
+        ⚠️ ONLY THE INVISIBLE ONES. Every character an operator can actually see survives,
+        including their punctuation and spelling, because the history is supposed to hold
+        what they said rather than a cleaned-up version of it.
+        """
+        return None if value is None else plaintext.visible(value)
     # A button sends its plan directly rather than a sentence describing itself. Same
     # endpoint, same validator, same log, different `source`.
     plan: list[dict] | None = None
@@ -355,6 +671,13 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
     client_ip = forwarded.split(",")[0].strip() or (request.client.host if request.client else None)
     origin = request.headers.get("origin")
 
+    # 🔑 ONE ID FOR THE WHOLE COMMAND, MINTED BEFORE ANYTHING IS LOGGED. Everything this
+    # handler writes about this request, what tier 1 matched, what tier 2 was asked and what
+    # it cost, the plan, every step, now carries it, so the audit log can show one command as
+    # one story instead of as a scatter of rows that only a clock relates. The executor used
+    # to mint its own, which meant the rows written before it ran could never join them.
+    command_id = str(uuid.uuid4())
+
     tier: str | None = None
     plan = req.plan
     # A button posts a plan directly and no tier reasoned about it, so there is nothing
@@ -374,11 +697,13 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                 tool="unsupported",
                 source=req.source,
                 result="rejected",
+                command_id=command_id,
+                parent_command_id=req.parent_command_id,
                 params={"utterance": req.utterance},
                 detail=refusal,
             )
             return JSONResponse(
-                {"ok": False, "summary": refusal, "tier": "parser", "results": []},
+                {"ok": False, "summary": _dressed(refusal), "tier": "parser", "results": []},
                 status_code=200,
                 headers={"cache-control": "no-store"},
             )
@@ -386,6 +711,14 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
         plan = parser.parse(req.utterance)
         tier = "parser"
         thinking = parser.trace(req.utterance, plan)
+
+        # 🔑 TIER 1 SAYS WHAT IT DID, IN THE LOG, ON EVERY COMMAND. What each tier decided
+        # used to exist only as a field on the response, so it was visible for one turn in
+        # one browser and then gone. The log is the record, and "which tier answered and
+        # why" is the single most interesting thing about a two-tier design: without it,
+        # the claim that the model runs only when it earns its latency is a sentence in a
+        # README rather than something anyone can check afterwards.
+        _log_tier1(req, plan, thinking, command_id=command_id)
 
         # 🔴 A PARTIAL MATCH IS NOT AN ANSWER, and this is where it stops being presented as
         # one. Every tier-1 branch matches on part of an utterance and returns on the first
@@ -418,11 +751,13 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
             # someone trying the example commands can never be throttled part-way
             # through a first look.
             blocked = _tier_two_blocked(
-                client_ip=client_ip, origin=origin, utterance=req.utterance, source=req.source
+                client_ip=client_ip, origin=origin, utterance=req.utterance,
+                source=req.source, command_id=command_id,
+                parent_command_id=req.parent_command_id,
             )
             if blocked and fallback is None:
                 return JSONResponse(
-                    {"ok": False, "summary": blocked, "tier": "parser", "results": []},
+                    {"ok": False, "summary": _dressed(blocked), "tier": "parser", "results": []},
                     status_code=200, headers={"cache-control": "no-store"},
                 )
 
@@ -433,12 +768,17 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                 # one path is what stops the fallback below existing in two versions.
                 if blocked:
                     raise llmlib.LLMUnavailable(blocked)
-                selection = llmlib.default_provider().select(req.utterance, _model_context(req.context))
+                selection = llmlib.default_provider().select(
+                    req.utterance,
+                    _model_context(req.context, heard=req.heard, running=req.utterance),
+                )
             except llmlib.LLMUnavailable as exc:
                 db.log_event(
                     tool="unparsed",
                     source=req.source,
                     result="rejected",
+                    command_id=command_id,
+                    parent_command_id=req.parent_command_id,
                     params={"utterance": req.utterance},
                     detail=f"no deterministic parse; tier 2 unavailable: {exc}",
                 )
@@ -446,10 +786,9 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                     return JSONResponse(
                         {
                             "ok": False,
-                            "summary": (
-                                "I could not parse that, and the reasoning layer is unavailable "
-                                f"({exc}). Try: \"mesh status\", \"show me the drones\", "
-                                "\"what is not broadcasting\", or \"send Daymark 05 to 73.0 -95.9\""
+                            "summary": _dressed(
+                                "The reasoning layer is not answering right now, so I only have "
+                                "the deterministic commands"
                             ),
                             "tier": "parser",
                             "results": [],
@@ -498,24 +837,43 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                 # audit log that only records successful calls cannot tell you what tier 2
                 # spent.
                 db.log_event(
-                    tool="llm_select",
+                    tool="tier2_reason",
                     source=req.source,
                     tier="llm",
                     result="ok",
+                    command_id=command_id,
+                    parent_command_id=req.parent_command_id,
                     params={"utterance": req.utterance, "selection": plan, **selection.usage},
-                    detail=selection.reasoning,
+                    # 🔑 THE SAME VOICE AS TIER 1'S ROW. What it checked, what it found, and
+                    # what it decided to do about it, so the two rows read as one story
+                    # rather than as two different systems keeping separate books.
+                    detail=(
+                        f"checked {len(toollib.REGISTRY)} available tools, "
+                        + (
+                            f"selected {', '.join(str(st.get('tool')) for st in plan)}"
+                            if plan
+                            else "no tool fits this request, answering directly"
+                        )
+                        + f". {selection.reasoning}"
+                    ),
                     latency_ms=selection.usage.get("latency_ms"),
                 )
 
             if not plan:
+                # 🔑 NO STEPS IS NOT THE SAME AS NO ANSWER, and conflating them made the
+                # console reply to "what does overdue mean" with "I understood that as no
+                # action" followed by the answer, marked as a failure. A question about what
+                # something on the display MEANS has nothing to run and is still answered;
+                # only a genuinely empty reply is a failure.
+                #
+                # ⚠️ SHOWABLE, NOT MERELY PRESENT. An answer has to be the shape of an
+                # answer before it is printed as one; see `_showable`. What fails that
+                # test is still in the audit row above, logged before this line runs.
+                said = _showable(selection.reasoning) if selection is not None else None
                 return JSONResponse(
                     {
-                        "ok": False,
-                        "summary": (
-                            f"I understood that as no action. {selection.reasoning}"
-                            if selection is not None
-                            else "I could not turn that into a command."
-                        ),
+                        "ok": bool(said),
+                        "summary": said or _dressed("that one is outside what this display covers"),
                         "tier": tier,
                         "results": [],
                         "thinking": thinking,
@@ -529,6 +887,7 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
             plan,
             source=req.source,
             tier=tier,
+            command_id=command_id,
             utterance=req.utterance,
             parent_command_id=req.parent_command_id,
             # The deixis carrier finally reaches the executor. It was collected by the
@@ -538,13 +897,40 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
             context=req.context,
         )
     except executor.PlanRejected as exc:
+        # 🔴 A REJECTED TIER-1 PLAN IS STILL TIER 1 BEING UNSURE, so it goes to the model
+        # rather than to the operator. Nothing ran, so there is nothing to undo, and the
+        # component allowed to be uncertain has not seen the utterance yet.
+        if tier == "parser" and req.utterance:
+            # 🔑 THE REJECTION'S OWN ID IS THE PARENT. This used to pass None, so the
+            # model's retry was logged as an orphan: the audit showed a refused plan and,
+            # separately, an answer with nothing connecting the two. The executor logs the
+            # rejection under this id and re-raises carrying it.
+            escalated = _escalate_to_tier_two(
+                req,
+                {"command_id": exc.command_id or command_id},
+                client_ip=client_ip,
+                origin=origin,
+            )
+            if escalated is not None:
+                return escalated
+        # The direct tier-2 path rejects here rather than in the escalation helper, and it
+        # owes the operator the same account: what the model was about to do, then why it
+        # was refused. Tier 1 gets no lead, as everywhere else.
+        rejected: dict[str, Any] = {
+            "ok": False,
+            "summary": _dressed("; ".join(exc.reasons)),
+            "tier": tier,
+            "results": [],
+        }
+        if tier == "llm" and selection is not None:
+            _lead_in(rejected, selection.reasoning, even_when_refused=True)
         return JSONResponse(
-            {"ok": False, "summary": "; ".join(exc.reasons), "tier": tier, "results": []},
+            rejected,
             status_code=200,
             headers={"cache-control": "no-store"},
         )
     except RuntimeError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, _DB_UNAVAILABLE) from exc
 
     # 🔴 A TIER-1 GUESS THAT RESOLVED TO NOTHING GOES TO THE MODEL, NOT TO THE OPERATOR.
     #
@@ -561,16 +947,86 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
     # weaker: "the parser was unsure" becomes a recorded, costed reason for a model call
     # instead of an invisible wrong answer.
     #
-    # 🔒 ONCE, AND ONLY FROM THE PARSER. `tier == "parser"` stops a model plan bouncing
-    # back to the model, and the absent `parent_command_id` stops an escalation escalating.
-    # Those two conditions are the loop guard.
-    if outcome.get("unresolved") and tier == "parser" and req.utterance and not req.parent_command_id:
+    # 🔒 ONCE, AND ONLY FROM THE PARSER. `tier == "parser"` is the loop guard: a plan the
+    # model produced can never come back here to be sent to the model again.
+    #
+    # 🔴 IT USED TO ALSO REQUIRE AN ABSENT `parent_command_id`, AND THAT SILENTLY DISABLED
+    # TIER 2 FOR EVERY SPOKEN COMMAND. The intent was to stop an escalation escalating, but
+    # nothing that reaches this line has ever been one: an escalation runs inside this
+    # process and never re-enters the endpoint, and a clarification chip posts a PLAN, which
+    # skips the whole parser branch. The only request that arrives carrying both an
+    # utterance and a parent is a transcription's command, because voice deliberately hangs
+    # the spoken command off the row that turned audio into words.
+    #
+    # So the condition matched voice and nothing else. Spoken "show detected" was refused by
+    # the parser and never offered to the tier that could answer it, while the identical
+    # typed sentence worked. Two behaviours for one utterance, decided by how it was said.
+    # 🔑 ANY TIER-1 REFUSAL, NOT JUST AN UNRESOLVED NAME. This used to fire only when a
+    # referent matched nothing, so "what is this map about" parsed as a describe, failed, and
+    # showed the operator "nothing here matches this map about" from a system that could have
+    # answered the question. Every way tier 1 can be unsure is the same situation: it
+    # half-matched, and the tier allowed to be uncertain has not been asked yet.
+    #
+    # 🔒 UNLESS SOMETHING ALREADY HAPPENED. The executor is fail-fast and not transactional,
+    # so a plan that placed an asset and then failed has already committed that write.
+    # Re-running the utterance through the model would place a second one. Escalation is for
+    # a refusal that changed nothing, which is what every read-only failure is.
+    nothing_ran = not any(r.get("ok") for r in outcome.get("results", []))
+    def _is_write(step: dict) -> bool:
+        spec = toollib.REGISTRY.get(str(step.get("tool")))
+        return bool(spec and spec.writes)
+
+    wrote = any(_is_write(r) for r in outcome.get("results", []))
+    # 🔴 A CLARIFICATION IS NOT UNCERTAINTY, IT IS A PRECISE QUESTION, and treating it as
+    # the former quietly deleted the feature. A clarify comes back with every step marked not
+    # ok and nothing run, which is exactly the shape of "tier 1 was unsure", so it escalated:
+    # the model then answered the ambiguous phrase with a LIST, the ready-to-run chips were
+    # thrown away, and a model call was spent replacing a better answer with a vaguer one.
+    #
+    # Asked to tell it about "daymark", the console should ask which of the five, with a
+    # button per candidate. Measured across the whole probe set, it never once did: every
+    # ambiguous phrasing came back as a list.
+    #
+    # 🔑 THE TEST IS WHETHER A QUESTION WAS ASKED, not whether the steps succeeded. Tier 1
+    # resolved the phrase to several real assets and is asking which one was meant, which is
+    # the opposite of not understanding.
+    asked_a_question = "clarify" in (outcome.get("ui_effects") or {})
+    tier_one_unsure = not asked_a_question and (
+        outcome.get("unresolved")
+        or (
+            not all(r.get("ok") for r in outcome.get("results", []))
+            and nothing_ran
+            and not wrote
+        )
+    )
+    if tier_one_unsure and tier == "parser" and req.utterance:
         escalated = _escalate_to_tier_two(req, outcome, client_ip=client_ip, origin=origin)
         if escalated is not None:
             return escalated
 
     outcome["ok"] = all(r["ok"] for r in outcome["results"])
     outcome["tier"] = tier
+
+    # 🔴 REACHING HERE UNRESOLVED MEANS THE ESCALATION ABOVE COULD NOT RUN, so the operator
+    # is about to be shown tier 1's "nothing here matches that name" after all. That is the
+    # sentence this whole escalation path exists to keep off the screen: it describes the
+    # parser's disappointment rather than anything about the Arctic. The reason is already
+    # in the audit log, written verbatim by the tool that raised it.
+    #
+    # ⚠️ ONLY THE UNRESOLVED CASE. A tool that declined because a hydrophone cannot go
+    # inland, or because a name matched five assets, said something specific and useful, and
+    # dressing those up would replace the best messages this system produces with a
+    # generic one.
+    if outcome.get("unresolved") and not outcome["ok"]:
+        outcome["summary"] = _dressed("I could not find what that referred to")
+
+    # The direct tier-2 path: the parser had nothing, the model planned, the plan ran. Its
+    # own sentence introduces the result. Tier 1 gets no lead, deliberately: it answers
+    # instantly and confidently, and narrating a command that needed no interpretation
+    # would be ceremony.
+    if tier == "llm" and selection is not None:
+        _lead_in(outcome, selection.reasoning)
+
     # 🔑 WHAT THE SYSTEM WAS THINKING, FOR WHICHEVER TIER DID IT. Tier 2 hands back the
     # reasoning it was already required to produce; tier 1 hands back what it matched and,
     # more usefully, which of the operator's words it did not use. Giving a person
@@ -606,7 +1062,8 @@ def _escalate_to_tier_two(
     parent = first.get("command_id")
 
     if _tier_two_blocked(
-        client_ip=client_ip, origin=origin, utterance=req.utterance, source=req.source
+        client_ip=client_ip, origin=origin, utterance=req.utterance,
+        source=req.source, command_id=parent,
     ):
         return None
 
@@ -625,7 +1082,9 @@ def _escalate_to_tier_two(
         context["known_asset_names"] = ref.get("available", [])
 
     try:
-        selection = llmlib.default_provider().select(req.utterance, _model_context(context))
+        selection = llmlib.default_provider().select(
+            req.utterance, _model_context(context, heard=req.heard, running=req.utterance)
+        )
     except llmlib.LLMUnavailable as exc:
         db.log_event(
             tool="unparsed", source=req.source, result="rejected",
@@ -637,30 +1096,97 @@ def _escalate_to_tier_two(
 
     plan = selection.to_plan()
     db.log_event(
-        tool="llm_select", source=req.source, tier="llm", result="ok",
+        tool="tier2_reason", source=req.source, tier="llm", result="ok",
+        command_id=parent,
         parent_command_id=parent,
         # `escalated_from` is what makes this call answerable in the log: it separates
         # "the parser had no idea" from "the parser guessed and was wrong", which are
         # different stories about the same money.
         params={"utterance": req.utterance, "selection": plan,
                 "escalated_from": "parser", **selection.usage},
-        detail=selection.reasoning,
+        detail=(
+            f"tier 1 escalated. Checked {len(toollib.REGISTRY)} available tools, "
+            + (
+                f"selected {', '.join(str(st.get('tool')) for st in plan)}"
+                if plan
+                else "no tool fits this request, answering directly"
+            )
+            + f". {selection.reasoning}"
+        ),
         latency_ms=selection.usage.get("latency_ms"),
     )
     if not plan:
-        return None
+        # 🔴 A MODEL ANSWER WITH NO STEPS USED TO BE THROWN AWAY, and the operator was shown
+        # the parser's refusal instead. Asked "what is a backhaul", the console replied
+        # "nothing here matches a backhaul", which reads as though it had misheard the
+        # question rather than understood it and had nothing to run. The model had in fact
+        # answered; this path discarded it because it was looking for a plan.
+        #
+        # ⚠️ ONLY WHEN THERE IS SOMETHING TO SAY. An empty reasoning is not an answer, and
+        # falling through to the original refusal is still right for that case: "the thing
+        # you named does not exist" beats a blank reply.
+        #
+        # ⚠️ AND ONLY WHEN IT IS THE SHAPE OF AN ANSWER. Returning None here falls through
+        # to tier 1's refusal, which is the wrong sentence for a coaxed reply: the operator
+        # asked something this display does not cover and should be told that, not told
+        # their words matched nothing. So the unshowable case answers with the boundary.
+        said = _showable(selection.reasoning)
+        if not selection.reasoning.strip():
+            return None
+        answered: dict[str, Any] = {
+            "ok": True,
+            "command_id": parent,
+            "summary": said or _dressed("that one is outside what this display covers"),
+            "results": [],
+            "ui_effects": {},
+            "tier": "llm",
+            "escalated_from": "parser",
+            "thinking": {
+                "tier": "llm",
+                "reasoning": selection.reasoning,
+                "steps": 0,
+                **{k: v for k, v in selection.usage.items() if k in ("model", "latency_ms", "cost_usd")},
+            },
+        }
+        return JSONResponse(answered, headers={"cache-control": "no-store"})
 
     try:
         outcome = executor.execute(
             plan, source=req.source, tier="llm", utterance=req.utterance,
             parent_command_id=parent, context=req.context,
         )
-    except (executor.PlanRejected, RuntimeError):
+    except executor.PlanRejected as exc:
+        # 🔴 TIER 2's OWN REJECTION USED TO FALL BACK TO TIER 1's REFUSAL, and that is the
+        # wrong sentence from the wrong component. Returning None hands the operator the
+        # parser's message about words it could not place, when what actually happened is
+        # that the model understood the request, proposed an action, and the action was
+        # refused for a stated reason. Showing the parser instead hides both the
+        # interpretation and the real reason.
+        #
+        # 🔑 SO IT ANSWERS AS TIER 2 DID: its own line saying what it was about to do,
+        # then the reason the attempt was refused. The reasons are written for an operator
+        # now, so this is worth showing rather than hiding.
+        refused: dict[str, Any] = {
+            "ok": False,
+            "command_id": parent,
+            "summary": _dressed("; ".join(exc.reasons)),
+            "results": [],
+            "tier": "llm",
+            "escalated_from": "parser",
+            "thinking": {"tier": "llm", "reasoning": selection.reasoning, "steps": len(plan)},
+        }
+        _lead_in(refused, selection.reasoning, even_when_refused=True)
+        return JSONResponse(refused, headers={"cache-control": "no-store"})
+    except RuntimeError:
         return None
 
     outcome["ok"] = all(r["ok"] for r in outcome["results"])
     outcome["tier"] = "llm"
     outcome["escalated_from"] = "parser"
+    # The escalated path needs the lead more than the direct one does: this is exactly the
+    # case where tier 1 had already given up, so without it the answer arrives with no sign
+    # that anything understood the question.
+    _lead_in(outcome, selection.reasoning)
     return JSONResponse(outcome, headers={"cache-control": "no-store"})
 
 
@@ -706,8 +1232,10 @@ async def transcribe_audio(request: Request) -> JSONResponse:
             tool="transcribe", source="voice", result="rejected",
             params={"audio_bytes": len(audio)}, detail=str(exc)[:400],
         )
+        # `silent` separates "you said nothing" from "voice is broken". The display shows
+        # the second and says nothing at all about the first; see `transcribe.NoSpeech`.
         return JSONResponse(
-            {"ok": False, "detail": str(exc)},
+            {"ok": False, "detail": str(exc), "silent": isinstance(exc, transcribe.NoSpeech)},
             status_code=200, headers={"cache-control": "no-store"},
         )
 
@@ -730,8 +1258,18 @@ async def transcribe_audio(request: Request) -> JSONResponse:
         detail=out["text"],
         latency_ms=out["latency_ms"],
     )
+    # 🔑 BOTH STRINGS TRAVEL, AND THE DISPLAY DECIDES WHICH IS WHICH. `heard` is what the
+    # microphone actually caught and is what the operator reads back; `text` is the version
+    # with names matched to the map and is what gets run. They are usually identical. When
+    # they are not, the client says so out loud rather than quietly showing the corrected
+    # sentence as though it were what was said.
     return JSONResponse(
-        {"ok": True, "text": out["text"], "command_id": command_id},
+        {
+            "ok": True,
+            "text": out["text"],
+            "heard": out.get("heard") or out["text"],
+            "command_id": command_id,
+        },
         headers={"cache-control": "no-store"},
     )
 
@@ -765,7 +1303,7 @@ def events(
             since_id=since_id, limit=limit, entity_id=entity_id, command_id=command_id
         )
     except RuntimeError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        raise HTTPException(503, _DB_UNAVAILABLE) from exc
     max_id = rows[-1]["id"] if rows else since_id
     return JSONResponse(
         {"events": rows, "count": len(rows), "max_id": max_id},

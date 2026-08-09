@@ -42,6 +42,51 @@ body {
   top: auto; bottom: 0; height: var(--footer-h);
   border-bottom: 0; border-top: 1px solid var(--line);
 }
+/* 🔴 ONE LINE, ALWAYS, BECAUSE THE HEIGHT IS FIXED ABOVE AND A FIXED HEIGHT CLIPS RATHER
+   THAN GROWS. The flex items never wrapped; the TEXT INSIDE them did, as soon as the strip
+   was tight enough to shrink a span below its content. At 1440, which is the width the
+   browser suite runs at, that silently cut the bottom off every reading in the strip, and
+   no test saw it because `toContainText` reads text whether or not it is visible. */
+.strip.bottom > * { flex: 0 0 auto; white-space: nowrap; }
+/* 🔑 THREE READINGS, NOT FIVE LOOSE NUMBERS: the world, the network, the kit. The gap
+   inside a group is tighter than the gap between groups, and that difference is the only
+   thing telling a reader which numbers belong together. Without it the strip is a row of
+   equally spaced words and the pairing has to be inferred from the labels. */
+.strip.bottom .grp {
+  display: inline-flex; align-items: center; gap: 10px; white-space: nowrap;
+}
+/* The same no-wrap guard the direct children get above. A group is a flex container, so
+   its children shrink below their content exactly as the strip's own children did, and the
+   fixed footer height clips rather than grows.
+
+   ⚠️ EXCLUDING .sep IS LOAD BEARING, NOT TIDINESS. That rule is `flex: 0 0 1px` and its
+   width comes entirely from the basis, so a blanket `flex: 0 0 auto` here resolved it to
+   auto on an empty element and collapsed every divider to nothing. The rules rendered, at
+   zero pixels wide, which looks exactly like never having added them. */
+.strip.bottom .grp > *:not(.sep) { flex: 0 0 auto; white-space: nowrap; }
+.strip.bottom .grp + .grp { margin-left: 16px; }
+/* The group's name, dimmed so it reads as a heading for the numbers after it rather than
+   as another reading in the row. Without it the strip is seven numbers and the viewer has
+   to work out which three answer the same question. */
+.strip.bottom .glabel { color: var(--dim); }
+/* Pushed to the far end and set in the same weight as the numbers, because it is the one
+   reading here that is NOT part of the totals. Sitting inline at normal weight it read as
+   a fourth group somebody would try to reconcile with `our assets`. */
+.strip.bottom .unkcount { margin-left: auto; font-weight: 600; }
+/* 🔑 CENTRED ON THE STRIP ITSELF, NOT ON WHAT IS LEFT OVER. Auto margins would centre it
+   in the gap between the counts and the controls, which moves as either side changes width,
+   so it would sit near the middle at one window size and visibly off at another. Taking it
+   out of the flow is what makes "the centre" mean the centre of the footer. */
+.strip.bottom .centred {
+  position: absolute; left: 50%; transform: translateX(-50%);
+}
+/* Below this the strip is not wide enough for a centred item to clear the disclosure on its
+   right, and an out-of-flow element does not push, it overlaps. Measured: 39px of clearance
+   at 1280 and 51px of overlap at 1100. So it rejoins the row rather than sitting on top of
+   something, which is the one outcome worse than not being centred. */
+@media (max-width: 1250px) {
+  .strip.bottom .centred { position: static; transform: none; }
+}
 .brand { color: var(--accent); letter-spacing: 0.14em; font-weight: 600; }
 .sep { flex: 0 0 1px; height: 14px; background: var(--line); }
 .dim { color: var(--dim); margin-left: auto; }
@@ -103,18 +148,25 @@ b.alert { color: var(--err); }
 }
 .timebar .icepick:hover { border-color: var(--accent); }
 .timebar .icepick:focus { outline: none; border-color: var(--accent); }
-.timebar .icecount { margin-left: 0; }
-.timebar .icedate {
-  letter-spacing: 0.08em;
-  margin-left: 0;
-  min-width: 13em;       /* fixed so the bar does not twitch as the index changes */
-}
-.timebar .caveat { margin-left: auto; flex: 0 0 auto; }
-.timebar .play, .timebar .stepbtn, .timebar .icego { padding: 3px 9px; }
+/* Sits BEFORE the picker now, so it must not push itself to the far end: `margin-left:
+   auto` on the first flex item shoves the whole row right. */
+.timebar .caveat { flex: 0 0 auto; margin-left: 0; }
+.timebar .icego { padding: 3px 9px; }
 /* Enabled means there is a choice waiting to be drawn, so it takes the accent to say so.
    Disabled it is just quiet, which is the resting state most of the time. */
 .timebar .icego:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.timebar .play { min-width: 3em; }
+/* The right end of the ice row: the shared-world disclosure and the world controls. They
+   moved up out of the status strip so that strip carries counts and nothing else. */
+.timebar-right {
+  margin-left: auto;
+  display: flex; align-items: center; gap: 12px;
+  min-width: 0;
+}
+/* ⚠️ The loading placeholder is a bare `.dim`, which carries `margin-left: auto`. With a
+   second auto-margin item now in the row the free space was split between them, leaving
+   "loading ice measurements…" floating in the middle of the bar for the first second of
+   every visit. It belongs at the left with the label it stands in for. */
+.timebar > .dim { margin-left: 0; }
 
 /* ---- the command surface -----------------------------------------------------
    Bottom left, above the timebar, and deliberately the widest thing on screen that
@@ -126,6 +178,30 @@ b.alert { color: var(--err); }
   display: flex; flex-direction: column; gap: 6px;
   z-index: 6;
 }
+
+/* The collapse control for the transcript.
+ *
+ * 🔑 IT SITS ABOVE THE PANEL AND IS THE WIDTH OF THE PANEL, so pressing it is easy without
+ * a hunt and it reads as a lid rather than as a button that happens to be nearby. Same
+ * surface and hairline as the transcript underneath, so the two are visibly one object.
+ */
+.acollapse {
+  align-self: stretch;
+  padding: 1px 0 2px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--dim);
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  cursor: pointer;
+}
+.acollapse:hover { color: var(--text); }
+
+/* ⚠️ COLLAPSED IS A HEIGHT, NOT A DIFFERENT COMPONENT. The same list renders with fewer
+ * entries, so nothing about how a line looks can drift between the two states. */
+.activity.collapsed { max-height: none; overflow-y: hidden; }
 
 .activity {
   display: flex; flex-direction: column; gap: 3px;
@@ -396,7 +472,10 @@ b.alert { color: var(--err); }
    gathered under one command, and a shallow strip can only ever show one of them. */
 .audit {
   position: absolute; right: 12px; top: 46px; bottom: 70px;
-  width: 332px;
+  /* Wide enough to read a parameter bag without wrapping every line. The log is the one
+     panel here whose content is structured rather than prose, and at half this it spent
+     more height on wrapping than on rows. */
+  width: min(664px, calc(100% - 24px));
   display: flex; flex-direction: column;
   padding: 9px 11px 11px;
   background: var(--panel);
@@ -411,27 +490,96 @@ b.alert { color: var(--err); }
 
 /* When both are open the banner steps aside. Two overlapping panels on the same edge is
    the one arrangement that reads as a bug rather than a layout. */
-.app.auditopen .banner { right: 356px; }
+.app.auditopen .banner { right: 688px; }
 
 .agroups, .arows { list-style: none; margin: 0; padding: 0; }
 .agroups { overflow-y: auto; display: flex; flex-direction: column; gap: 9px; }
-.agroup { border-left: 1px solid var(--line); padding-left: 8px; }
+/* 🔑 ONE COMMAND, ONE CARD. The list used to separate commands with nothing but a gap
+   and a faint left rule, so seven commands read as one long column and the reader had
+   to find each seam by eye. Now the command is the bounded thing on the page, which is
+   the unit the whole panel argues in: a story per command, not a stream of rows. Its
+   border sits a step brighter than the step cards' inside it, so the two levels of
+   nesting rank themselves: the strong line is a command, the faint line is one step. */
+.agroup {
+  background: #0c141de6;
+  border: 1px solid #26394a;
+  padding: 6px 9px 8px;
+}
 .ahead { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .atime { color: var(--text); }
 .aid { color: var(--dim); }
-.acount { color: var(--accent); font-size: 10px; letter-spacing: 0.08em; }
-.arows { margin-top: 3px; display: flex; flex-direction: column; gap: 2px; }
-.arow { display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; color: var(--dim); }
-.arow.bad .atool { color: var(--err); }
-.atool { color: var(--text); }
-.aent { color: var(--accent); }
-.ares { color: var(--err); }
-.adetail { flex: 1 1 100%; color: var(--dim); overflow-wrap: anywhere; }
+.acount { color: var(--dim); font-size: 10px; letter-spacing: 0.08em; }
+/* The tier chips, same shape as the transcript's, because they are the same claim: which
+   half of the system answered. An escalated command wears both with an arrow between,
+   which is the two-tier argument compressed into a header. */
+.audit .tier {
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 1px 5px; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--dim);
+}
+.audit .tier.llm { color: var(--warn); border-color: #4a3f22; }
+.tierpath { display: inline-flex; align-items: center; gap: 7px; }
+.tarrow { color: var(--dim); }
+
+/* What was said, quoted, before anything that happened to it. Accent for the operator's
+   own words, the same colour the transcript gives them, so the two surfaces agree about
+   whose voice is whose. The badge answers typed-or-spoken before the quote is read. */
+.asaid { display: flex; gap: 7px; align-items: baseline; margin: 3px 0 1px; }
+.ahow {
+  flex: 0 0 auto;
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 1px 5px; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--dim);
+}
+/* Spoken commands stand out: a transcription is a model's guess at the words, so every
+   step downstream inherits that uncertainty, and amber is this palette's word for it. */
+.ahow.spoken { color: var(--warn); border-color: #4a3f22; }
+.aquote { color: var(--accent); overflow-wrap: anywhere; }
+
+.arows { margin-top: 5px; display: flex; flex-direction: column; gap: 5px; }
+/* 🔑 EACH STEP IS ITS OWN BOUNDED CARD. As bare stacked lines the steps ran together:
+   a six-step command read as one tall paragraph and the eye could not find where the
+   parser ended and the model began. A whisper of surface and a hairline box give every
+   step an edge to scan by, while the header and the quote stay unboxed, so the two
+   levels of nesting read apart: plain text is the command, a card is one step of it.
+   The left edge is 2px and carries the step's tone, which makes an escalation or a
+   refusal findable at arm's length before a single word is read. Padding is tight on
+   purpose: this panel floats over the map, so the cards buy separation, not size. */
+.arow {
+  color: var(--dim);
+  background: #0f1a2455;
+  border: 1px solid #1d2d3a99;
+  border-left: 2px solid #2a3c4c;
+  padding: 3px 8px 4px;
+}
+/* The badges' amber and red families, one step brighter: a 1px outline only has to
+   frame a word, but a 2px edge has to carry the tone across the panel from the corner
+   of the eye, and at the badge values it sank into the hairline. Same hue, more duty. */
+.arow.warn { border-left-color: #6b5a2e; }
+.arow.bad { border-left-color: #6b3030; }
+.aline { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.awho { color: var(--text); flex: 0 0 auto; }
+.arow.bad .awho { color: var(--err); }
+.arow.warn .awho { color: var(--warn); }
+/* The outcome word appears only when it is not "ok", so the three words that matter,
+   rejected, clarify and error, are never buried under fifty routine ones. */
+.ares {
+  flex: 0 0 auto;
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 1px 5px; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--dim);
+}
+.ares.bad { color: var(--err); border-color: #4a2626; }
+.ares.warn { color: var(--warn); border-color: #4a3f22; }
+.asent { flex: 1 1 auto; color: var(--dim); overflow-wrap: anywhere; }
 
 /* ---- the shared world: disclosure, countdown, reset ---------------------------
    All three live in the footer beside the counts, because they are facts about the
    state of the world rather than controls over what is drawn. */
-.worldline { color: var(--dim); }
+/* Pushed to the far right so the counts and the disclosure read as two separate things
+   with space between them. The gap used to fall out of the ice and viewport readouts that
+   sat between them; with those gone it has to be asked for. */
+.worldline { color: var(--dim); margin-left: auto; }
 .worldline.due { color: var(--warn); }
 .worldline .act { color: var(--text); }
 .footbtns { display: flex; gap: 8px; margin-left: 12px; }
@@ -476,3 +624,82 @@ b.alert { color: var(--err); }
 .modalcard .shared { color: var(--text); }
 .modalactions { display: flex; justify-content: flex-end; gap: 8px; }
 .modalactions .danger { border-color: var(--warn); color: var(--warn); }
+
+/* ---- the VIEW menu ------------------------------------------------------------
+   A dropdown rather than ten more checkboxes in the strip: the header is already
+   carrying a projection toggle and a control that makes an argument, and a row of ten
+   would bury both. */
+.viewmenu { position: relative; display: flex; align-items: center; }
+.viewmenu > button { padding: 2px 9px; }
+.viewpanel {
+  position: absolute; top: calc(100% + 7px); left: 0;
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 10px 12px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  /* Above the banner and the map, below the reset modal, which is the only thing that
+     should ever cover it. */
+  z-index: 7;
+  white-space: nowrap;
+}
+.viewpanel .toggle { letter-spacing: 0.08em; }
+
+/* ---- the PLACE menu ----------------------------------------------------------
+   Shares the VIEW menu's shell, because they are the same sort of control and looking
+   different would imply a difference that is not there. What it adds is a state: armed,
+   meaning the next map click puts something down. */
+.placemenu > button.armed {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* Ruled off from the kind list above it, because it is a different question. The list asks
+   what to place; this asks something about the thing being placed. */
+.placeattr {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  margin-top: 2px;
+}
+/* 🔑 THE INSTRUCTION FOR THE HALF OF THE ACTION THAT IS NOT IN THIS MENU. Choosing a kind
+   arms the map, and nothing on screen would otherwise say that a click is what finishes the
+   job. A control whose second step is invisible is a control people press and then wonder
+   about. */
+.placehint {
+  color: var(--dim);
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  letter-spacing: 0.06em;
+}
+.placeattr .toggle input:disabled + *,
+.placeattr .toggle:has(input:disabled) { color: var(--dim); cursor: not-allowed; }
+
+/* The pending line. Dimmer than an answer and gently animated, because the one thing it
+   must not look like is a reply that has already arrived. */
+.activity .entry.pending .etext { color: var(--dim); animation: breathe 1.4s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) {
+  .activity .entry.pending .etext { animation: none; }
+}
+
+/* ---- the audit log's full disclosure ------------------------------------------
+   Every column and every params key the row actually has, as labelled lines under the
+   sentence rather than as a JSON bag beside it. This is the artifact an evaluator
+   inspects, and a log that shows a summary of itself is a log you have to take on
+   trust; a log that shows serialised objects is one you have to decode. Both lose.
+   The receipts are indented under the sentence they belong to, decision facts first,
+   then the plan, then the cost, then the bookkeeping. */
+.afacts { display: flex; gap: 2px 12px; flex-wrap: wrap; margin: 1px 0 0 14px; }
+.akv { color: var(--dim); overflow-wrap: anywhere; }
+.akv .k { color: #4d637a; }
+/* A plan, one numbered line per step. The left rule marks it as quoted material: this
+   is the exact sequence that was validated and run, not a paraphrase of it. */
+.aplan {
+  margin: 1px 0 0 14px; padding-left: 7px;
+  border-left: 2px solid var(--line);
+  color: var(--dim); overflow-wrap: anywhere;
+}
+/* The cost of the call, quiet because it is a receipt rather than a decision, and
+   present because the spend claim is only checkable with the receipts on the table. */
+.acct { margin: 1px 0 0 14px; color: #4d637a; overflow-wrap: anywhere; }
+.ameta { display: flex; gap: 2px 10px; flex-wrap: wrap; margin: 1px 0 0 14px; font-size: 10px; color: var(--dim); }
+.ameta .k { color: #4d637a; }

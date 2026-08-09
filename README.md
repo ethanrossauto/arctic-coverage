@@ -1,10 +1,10 @@
 # Arctic Coverage
 
 An Arctic situational-awareness console with a natural-language interface. You type or speak a
-command, and one validated path turns it into a tool call against the asset picture, with an audit
-row written before anything on screen changes.
+command, and one validated path turns it into a tool call against the asset picture. An audit row is
+written before anything on screen changes.
 
-The world is a deployable sensor network across the Northwest Passage chokepoints: 76 assets across
+The world is a deployable sensor network across the Northwest Passage chokepoints: 76 assets of
 nine kinds, a mesh reachability model, sensors that compute what they can actually detect, position
 history you can query, and five years of measured sea ice drawn as context.
 
@@ -14,20 +14,26 @@ Live: **[coverage.skryer.ca](https://coverage.skryer.ca)**
 
 ## What it does today
 
-- **Typed and spoken commands** answered through one registry of 15 validated tools. "Show me what is
+- **Typed and spoken commands** answered through one registry of 17 validated tools. "Show me what is
   not broadcasting", "fly Daymark 05 to Barrow Strait", "where has the Resolute patrol been",
   "what are we not seeing".
 - **A two-tier command path.** A deterministic parser answers roughly thirty phrasings with no model
   call at all. Anything it does not recognise goes to a language model, which proposes a plan as JSON and
   never touches state directly.
+- **A question instead of a guess.** "Tell me about Daymark" names five drones, so the console asks
+  which one and offers each as a button carrying the command with it. Answering costs a click rather
+  than a retyped sentence, and the question comes from the deterministic tier, so it is immediate and
+  free.
+- **One sentence, several actions.** "Isolate Daymark 05" expands into three steps: put the camera on
+  the asset and select it, filter the picture down to it, and open its detail. The steps refer back to
+  what earlier steps resolved, so a plan is a sequence rather than a batch.
 - **An audit log** carrying every command: what was said, which tier answered, the plan, each step and
   its outcome. Written before any effect is visible, and readable on screen, where the steps of one
-  request stay gathered under the request that caused them. The panel is deliberate about what it is:
-  the transcript in the command bar is one browser's memory and dies with the tab, while the log is
-  what the server committed. If the two ever disagree, the log is right.
+  request stay gathered under it. The transcript in the command bar is one browser's memory and dies
+  with the tab; the log is what the server committed. If the two ever disagree, the log is right.
 - **A mesh graph** computed from live positions, answering two different questions: who can talk to
   whom, and whose messages can still reach this display.
-- **A detection model**, so a sensor's payload decides what it can actually see and the display can
+- **A detection model.** A sensor's payload decides what it can actually see, so the display can
   distinguish a quiet ocean from an ocean it cannot hear.
 - **Measured sea ice**, 55 dates over five years, drawn as visual context.
 
@@ -84,6 +90,12 @@ Every capability is a named, validated function. A button calls it, the parser c
 model calls it. Nothing is implemented twice, and because the executor writes an audit row before any
 effect is visible, the log is complete by construction rather than by discipline.
 
+A plan can hold several steps, and a later step can refer to what an earlier one resolved instead of
+repeating a name the operator typed. "Isolate Daymark 05" resolves the asset once, then filters and
+describes whatever that first step found. Sharing a referent is what makes it one sequence rather
+than three commands in a row, and it is also why validation is atomic: a plan whose steps depend on
+each other cannot sensibly half-run.
+
 ### 3. The client store holds domain objects, never map-library shapes
 
 Entities with latitude and longitude, links as endpoint pairs, tracks as arrays of points. No GeoJSON
@@ -93,7 +105,7 @@ and no style config in application state. That is what keeps the renderer replac
 
 ## Data model
 
-Two tables. The shape is a position, not a default.
+Two tables. The shape is a choice, not a default.
 
 **One `entities` table for every kind, not a table per kind.** The kinds differ a lot, but the shared
 core (id, kind, name, position, status) is what almost every query filters on and what the map draws.
@@ -142,8 +154,8 @@ grammar is deliberate and narrow.
   position.
 - **One thing on screen is allowed to be red**: a contact that is not broadcasting. Everything else
   lives in a green-to-blue family, so the eye goes to the anomaly without being told to. Role markings
-  are muted for the same reason: the backhaul badge was measured putting six times as much ink on the
-  default view as the one contact nobody can identify, which is the wrong thing to be loudest.
+  are muted for the same reason: measured on the default view, the backhaul badge put six times as much
+  ink on screen as the one contact nobody can identify, and the badge is the wrong thing to be loudest.
 - **Existing radar sites are desaturated** and sit behind the deployable layer. They are infrastructure
   to work alongside, not owned assets, and they should read as background.
 - **A track drawn dashed was inferred, not reported.** A contact held only by a sensor gets a dashed
@@ -168,7 +180,7 @@ from someone who knows the region.
 them is inside the range for their pair of states: 25 km ground to ground, 50 km ground to air, 100 km
 air to air. Everything is on the ground except a drone in flight. That is the whole rule.
 
-It could have been a radio horizon formula, and it was one. A formula invites a conversation about
+It could have been a radio horizon formula, and an earlier version was. A formula invites a conversation about
 Fresnel clearance, fade margin, antenna patterns, terrain masking and auroral absorption, and this
 project carries the terrain data for none of them. A number you can defend in one sentence beats a
 formula you cannot defend at all. **So the graph is an optimistic upper bound on connectivity, not a
@@ -180,10 +192,17 @@ satellite gateway and every hop along the way is one we are currently hearing fr
 quiet takes its neighbours with it. That is the honest answer: if the only route home runs through a
 node that stopped reporting, nothing behind it is reaching us either.
 
-**Three sensor types that fail differently.** RF reaches 45 km and is defeated entirely by switching a
-transmitter off. Electro-optical and infrared reaches 15 km and is the one that identifies. Magnetic
-anomaly reaches 4 km and does not care how quiet the target is being. The acoustic barrier reaches
-18 km and only hears things in the water. Mixing them along one shoreline is only worth explaining if
+**Freshness follows the same path.** This console's information about an asset is only as current as
+the stalest hop on its best route home, so a unit sitting behind a relay that died two days ago was
+last heard two days ago, however well its own radio is working. That number is computed from the
+graph rather than stamped per asset, and computing it is what stopped the display reporting an asset
+as cut off and heard from eight minutes ago in the same frame.
+
+**Three sensor payloads that fail differently.** A node carries one of them. RF reaches 45 km and is
+defeated entirely by switching a transmitter off. Electro-optical and infrared reaches 15 km and is
+the one that identifies. Magnetic anomaly reaches 4 km and does not care how quiet the target is
+being. Separately, the hydrophone barrier across Lancaster Sound reaches 18 km and only hears things
+in the water. Mixing them along one shoreline is only worth explaining if
 they disagree, and this is where they disagree.
 
 **Sea ice: one claim.** Each date is the sea ice concentration a satellite measured that day, from the
@@ -195,7 +214,7 @@ independently, which is a stronger correctness argument than any test written ag
 > hundred metres under a vehicle.
 
 The grid is resampled to about the source cell size and no finer, because below 25 km there is no
-measurement to draw. Smoothing between cells happens at render time and is a visual treatment, not
+measurement to draw. Smoothing between cells happens at render time and adds no
 data.
 
 ---
@@ -214,13 +233,13 @@ Worth its own section, because the failures this project most wanted to avoid ar
   exist**, so they sit behind a control that hides them by default, and the default view asserts only
   what the sensor network actually delivered. The line is whether the detection reached this console,
   not whether some sensor holds the contact: a sensor holding something it cannot report leaves the
-  console exactly where nothing holding it would, so both sit on the same side of it. What the status
+  console exactly where it would be if nothing held it, so both cases sit on the same side of the line. What the status
   strip counts is the other case, **detected unknown**: contacts we do hold, that will not say what
   they are.
 - **The world is shared, and it resets.** One database, one world, so every visitor is looking at the
   same thing and anyone can move or delete an asset. It returns to the seeded scenario after thirty
-  minutes with nobody using it, or when someone presses the reset control, and a reset applies to
-  everyone currently viewing rather than only to whoever triggered it. The display says so on the
+  minutes with nobody using it, or when someone presses the reset control. A reset applies to everyone
+  currently viewing, not only to whoever triggered it. The display says so on the
   status strip, counts down before it happens, and says afterwards that it did. **This is disclosed
   rather than prevented**, because giving each visitor a private world would mean threading a session
   through every entity and every audit row, which is a different application from this one.
@@ -239,10 +258,11 @@ Worth its own section, because the failures this project most wanted to avoid ar
   read everything goes through, so the map, the status strip and the mesh cannot disagree by a second
   across a threshold inside one response. Answered per caller instead, they drifted apart twice in one
   day.
-- **The world resets itself after five minutes with no command.** `last_heard` is stored absolute, so a
-  seeded world ages until every asset is overdue and "what has gone quiet" has no useful answer.
-  Activity means a command, not a request, because a browser polling the map would otherwise hold the
-  world open forever.
+- **The world resets itself after thirty minutes with nobody using it.** `last_heard` is stored
+  absolute, so a seeded world ages until every asset is overdue and "what has gone quiet" has no
+  useful answer. Using it means a command or a deliberate act on the display, a pan, a zoom, a
+  selection, a layer toggle. A browser polling the map does not count, because one forgotten tab
+  would otherwise hold the world open forever.
 - **Each ice date is a separate image, fetched when shown.** The alternative was one bundle of every
   date, which cost 1.4 MB before the first frame. A visitor now downloads about 14 KB.
 - **Static assets come off a CDN, not through a function.** The basemap is the largest thing this app
@@ -252,9 +272,9 @@ Worth its own section, because the failures this project most wanted to avoid ar
 
 ## Testing
 
-`bash tests/run.sh` runs everything, and CI runs exactly that script so a red build is reproducible
-locally with one command: the Python suite, type checking on both languages, linting on both, and two
-project-specific checks. The browser suite is opt-in because it needs a database, and it says so
+`bash tests/run.sh` runs everything: the Python suite, type checking on both languages, linting on
+both, and two project-specific checks. CI runs exactly that script, so a red build is reproducible
+locally with one command. The browser suite is opt-in because it needs a database, and it says so
 rather than skipping quietly.
 
 - **The ice tests check against the outside world, not against themselves.** Seasonal extent figures
@@ -269,7 +289,7 @@ rather than skipping quietly.
   quiet greys its whole cluster while those assets stay linked to each other, and that a drone bridges
   a patrol to its base only while airborne.
 
-Two project-specific checks run on every save: one comparing the two dependency manifests, after a
+Two project-specific checks run with the suite, so CI runs them too: one comparing the two dependency manifests, after a
 mismatch between them took every route down in production, and one sweeping tracked files for content
 that should not be published.
 
@@ -297,16 +317,47 @@ that should not be published.
   every real one. When the parser cannot place enough of the sentence to try, the model gets the
   sentence alone. So an identical misspelling succeeds or fails depending on whether the parser
   guessed first, which is arbitrary from where the operator is sitting. Passing the parser's trace and
-  the known names on every call would fix it, and is not done here for a reason worth stating: the
+  the known names on every call would fix it. It is not done here for a reason worth stating: the
   transcription prompt is built the same way, from live asset names, and on weak audio it inserted
   names nobody had said. A hint list that dominates is a failure mode this project has already
   measured once, and doing it to the tier that answers commands deserves the same measurement first.
+- **Next: editing a placed asset beyond the two flags that change behaviour.** Placing sets the kind,
+  the position, whether it is unknown, and whether it carries its own satellite terminal. Nothing else
+  is editable, before or after. Those two came first because they are the ones that change what the
+  console does rather than what it prints: an unknown contact stops announcing itself, so whether it
+  appears at all becomes a question about sensor coverage, and an asset without a terminal is
+  reachable only through a neighbour that already is. The rest, a name, a speed, a sensor payload,
+  whether it is hostile, are facts the display repeats back, and they want an edit panel on the asset
+  banner rather than more controls on the place menu.
+- **Next: filtering and searching on those same attributes.** The view menu filters by kind, which is
+  the only axis it has, and anything narrower is a typed question today. These two want to arrive
+  together, because a field you can set and cannot search for is half a feature.
+- **Known limit: the model tier sets one placement flag at a time.** Both are reachable by voice, and
+  the deterministic tier sets them together for the kinds it recognises. The model tier cannot,
+  because they ride on an existing single-valued enum rather than on two booleans of their own. That
+  was not a matter of taste. Adding two plain booleans to the plan schema is the obvious shape, and
+  the API answered `400 Schema is too complex` and stopped serving the model tier entirely, while the
+  whole suite stayed green, because the provider used in tests never sends a schema at all. Compressing
+  them onto the enum costs nothing there and costs exactly this: "place an unknown vessel with a
+  backhaul" needs either two commands or the deterministic path.
+- **Considered and not built: a tier that writes its own tools at runtime.** When a question needs
+  something no tool exposes, the tempting move is to let the model generate the query, or the tool,
+  and run it. I decided against it on the principle the rest of the command path is built on: model
+  output is untrusted input from an unauthenticated source, and nothing it produces reaches state
+  until a validator has resolved every value against live data. Generated code cannot be checked
+  that way, because checking it is running it. It would also be solving a problem I did not have.
+  Every case that pushed me toward it turned out to be a missing parameter rather than a missing
+  tool. "The northernmost asset" is the example: that is a comparison across the whole set rather
+  than a filter, and no enumerated parameter will ever express every comparison somebody might ask
+  for. It is answered instead by handing the model the world as seven fields per asset and letting
+  it reply with ids, which the tools re-read from the database like any other answer. That covers
+  the whole class of question and leaves the trust boundary exactly where it was.
 
 ---
 
 ## How AI was used in this project
 
-Two separate roles, and they should not be conflated.
+AI played two roles here, and they are worth keeping separate.
 
 **As a development assistant.** A large amount of the implementation here was written by an AI
 assistant working to my direction. The architecture, the three rules above, the data model, the
@@ -316,22 +367,25 @@ something I disagreed with, it was rewritten or thrown away.
 Worth naming a case rather than claiming a clean record. The model concluded from a single build-log
 line that this platform reads its dependency list from `pyproject.toml`. It does not, it installs from
 `requirements.txt`, and that assumption reached production and took every route down until a missing
-driver was traced. The fix was not just the dependency. It was a check comparing the two files on every
-save, and moving the driver import so a database problem can no longer break routes that never touch
-the database.
+driver was traced. The fix was not just the dependency. It was adding a check that compares the two files on every
+suite run, and moving the driver import so a database problem can no longer break routes that never
+touch the database.
 
 **As a runtime component.** The second tier of the command path is `claude-opus-5`. It proposes a plan
 as JSON and never touches state: a validator resolves every referenced entity against live data and
 rejects anything that does not resolve, on the principle that a hallucinated value must never reach
 real state on the model's word alone. The first tier is a deterministic parser that answers common
-phrasings with no model call, which is faster and cheaper and also means the app still works when the
-model is unavailable.
+phrasings with no model call, which is faster and cheaper, and means the app still works when the
+model is unavailable. Measured locally across 88 phrasings, tier 1 answers in a median 1.3 seconds
+against 7.2 for tier 2, and answered 23 of the 88 with no model call at all. That set was written to
+be awkward, so the share is a floor rather than a typical session.
 
-**Voice transcription is `gemini-3.5-flash-lite`, and audio leaves the browser to reach it.** That is
-worth stating plainly, because nothing else in this application makes a runtime network call. The
-basemap, the ice and the terrain polygons are all vendored, so a demo cannot fail because a third party
-rate-limited it. Speech is the exception, and pretending otherwise would be the kind of claim this
-project keeps deleting.
+**Voice transcription is `gemini-3.5-flash-lite`, and audio leaves the browser to reach it.** The two
+model components, Gemini for voice and Claude for text, are the only runtime network calls carrying
+your data to a third party. That is worth stating plainly. Everything else is vendored: the basemap,
+the ice and the terrain polygons all ship with the app, so a demo cannot fail because somebody else
+rate-limited it. The two that do leave are the exception, and pretending otherwise would be the kind
+of claim this project keeps deleting.
 
 Model calls are metered per address and in total, and the limits fail closed. Every command, whichever
 tier answered it, lands in the audit log.

@@ -116,7 +116,11 @@ class Ambiguous(ToolError):
     """
 
     def __init__(self, query: str, candidates: list[dict[str, Any]], total: int) -> None:
-        names = ", ".join(f'{c["name"]} ({c["id"]})' for c in candidates)
+        # ⚠️ NAMES ONLY. The sentence used to read "Daymark 03 (uas-daymark-03)", which put
+        # an internal identifier in a question addressed to a person, and did it directly
+        # above a row of buttons offering the same choice properly. The ids still travel on
+        # `candidates`, which is where the client needs them and where nobody reads them.
+        names = ", ".join(str(c["name"]) for c in candidates)
         more = "" if total <= len(candidates) else f" and {total - len(candidates)} more"
         super().__init__(f'"{query}" matches {total} assets: {names}{more}. Which one?')
         self.query = query
@@ -198,6 +202,83 @@ MAX_CANDIDATES = 6
 # a kind allowed here and refused there dies inside the insert as an unhandled error rather
 # than as a clean refusal, so the audit log would call it a broken tool instead of a bad
 # request.
+#: A cruising height for the two kinds that fly, in metres.
+#:
+#: 🔑 PLACED ASSETS USED TO ARRIVE AT ZERO, WHICH IS A CLAIM RATHER THAN A BLANK. An
+#: aircraft at 0 m is not an aircraft with unknown altitude, it is an aircraft on the
+#: ground, and the display drew it that way. These match the band the seeded fleet already
+#: flies in (9100 and 3200) so a placed aircraft looks like the ones beside it.
+#: ⚠️ A HYDROPHONE'S "ALTITUDE" IS NEGATIVE, which is the same error as the aircraft in the
+#: other direction: a listening array sitting at 0 m is one floating on the surface. The
+#: seeded arrays sit around 200 m down.
+_PLACED_ALTITUDE_M: dict[str, float] = {"aircraft": 9000.0, "uas": 3000.0, "hydrophone": -200.0}
+
+
+def _placed_props(kind: str) -> dict[str, Any]:
+    """The movement facts a placed asset needs in order to describe itself.
+
+    🔴 THE MOTION MODEL ALREADY KNEW THE SPEED AND THE ENTITY DID NOT SAY SO. A routeless
+    asset drifts at `motion._DRIFT_SPEED_KMH[kind]`, so a placed aircraft crosses the map at
+    400 km/h while its own record carried no speed field at all and the panel showed none.
+    The map and the data disagreed about the same asset, which is the shape of bug this
+    codebase keeps deleting elsewhere.
+
+    🔑 SO THE NUMBER IS READ FROM THE MOTION TABLE RATHER THAN RETYPED HERE. One source, so
+    changing how fast a placed vessel drifts changes what it reports about itself in the
+    same edit. Retyping it would be two numbers that agree until somebody tunes one.
+
+    🔴 AND THE TWO THAT ARE NOT COSMETIC AT ALL. A placed asset was arriving unable to do
+    the job its kind exists for, which only shows up when the operator tries to use it:
+
+      * A NODE WITH NO `payload` CARRIES NO SENSOR. `detect._sensor_for` requires one and
+        correctly refuses to guess, so a node placed to cover a gap detected nothing, and
+        the coverage answer for it was an honest zero about a mast that should have been
+        working. It gets `eo_ir`, the shortest-ranged of the three, because a placement is
+        a request for a sensor rather than a request for the best one.
+      * A DRONE WITH NO `endurance_min_remaining` CANNOT BE TASKED ANYWHERE. `task_uas`
+        reads it as 0 and computes a fuel radius of 0 km, so every task was refused with
+        "cannot reach that station ... on 0 minutes of fuel" for a drone that had just been
+        placed. It arrives fuelled, at the endurance the seeded fleet carries.
+
+    ⚠️ NOTHING BEYOND THAT IS INVENTED. A stationary kind gets no speed because it has
+    none, and nothing gets a classification, a flag of registry or a hull number: those are
+    facts about a real asset that nobody supplied, and filling them with plausible values
+    would be the display making things up.
+    """
+    from . import motion  # local: motion imports terrain, and this is called per placement
+
+    props: dict[str, Any] = {}
+    if kind == "node":
+        props["payload"] = "eo_ir"
+        props["power_source"] = "battery"
+        props["battery_pct"] = 100
+    if kind == "hydrophone":
+        # Quoted on screen beside the array, so it has to agree with where the thing is.
+        props["depth_m"] = 200
+    if kind == "uas":
+        props["endurance_min_full"] = 310.0
+        props["endurance_min_remaining"] = 310.0
+        props["battery_pct"] = 100
+        props["state"] = "loitering"
+        props["payload"] = "eo_ir"
+    drift_kmh = motion._DRIFT_SPEED_KMH.get(kind)
+    if drift_kmh:
+        # Each kind is reported in the unit its own seeded rows use, so one asset does not
+        # describe itself in knots beside another describing itself in km/h.
+        if kind in ("vessel",):
+            props["speed_kn"] = round(drift_kmh / 1.852)
+        elif kind == "uas":
+            props["cruise_kmh"] = round(drift_kmh)
+        elif kind == "aircraft":
+            props["speed_kn"] = round(drift_kmh / 1.852)
+        else:
+            props["speed_kmh"] = round(drift_kmh)
+    altitude = _PLACED_ALTITUDE_M.get(kind)
+    if altitude:
+        props["altitude_m"] = altitude
+    return props
+
+
 PLACEABLE_KINDS: frozenset[str] = frozenset(
     {
         "node",
@@ -272,6 +353,53 @@ def _require_one(text: str, entities: list[dict[str, Any]]) -> dict[str, Any]:
             total=len(matches),
         )
     return matches[0]
+
+
+#: How many assets a result sentence names before it starts counting instead.
+_NAMED_IN_ANSWER = 4
+
+#: Kinds whose plural is not the word plus an s. Kept as a table rather than a rule,
+#: because the list of kinds is short, closed, and known: guessing with a general
+#: pluralisation rule would be more code and more ways to be wrong.
+_PLURALS: dict[str, str] = {"aircraft": "aircraft", "uas": "uas", "ground party": "ground parties"}
+
+
+def _plural(word: str) -> str:
+    return _PLURALS.get(word, f"{word}s")
+
+
+def named_list(names: list[str], limit: int = _NAMED_IN_ANSWER) -> str:
+    """Names, joined the way a person would say them out loud.
+
+    ⚠️ A LIST THAT NAMES EVERYTHING IS NOT MORE HELPFUL. Seventy-six names is a wall of
+    text where a count and four examples is an answer, and the map is already showing the
+    full set. Four is what fits in one spoken breath.
+    """
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) <= limit:
+        return f"{', '.join(names[:-1])} and {names[-1]}"
+    return f"{', '.join(names[:limit])} and {len(names) - limit} more"
+
+
+def _matched(count: int, names: list[str]) -> str:
+    """What a listing says when it is read aloud rather than parsed.
+
+    🔴 IT USED TO SAY "2 matching", AND THAT IS A COUNTER, NOT AN ANSWER. Asked what a
+    survey was, the console replied "2 matching", which is the shape of a log line: it
+    reports the size of a result set and says nothing about the Arctic. Every other message
+    in this module is a sentence, and this was the one an operator sees most often.
+
+    ⚠️ NAMING THEM IS THE POINT, not the grammar. The count alone forces the operator to go
+    hunting on the map for what was counted, which is work the answer should have done.
+    """
+    if count == 0:
+        return "nothing here matches that"
+    if count == 1:
+        return f"one asset matches: {names[0]}"
+    return f"{count} assets match: {named_list(names)}"
 
 
 # --------------------------------------------------------------------------
@@ -373,7 +501,7 @@ def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
 
 @tool(
     "list_entities",
-    "List assets, optionally filtered by kind, status, overdue or AIS state.",
+    "List or count assets, optionally filtered by name, kind, status, overdue or AIS state.",
     {
         "kind": "one asset kind, e.g. node, patrol, uas, hydrophone, vessel, radar, launch_site",
         "status": "nominal or maintenance. For assets that have gone quiet use overdue, not status",
@@ -382,6 +510,7 @@ def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
         "overdue": "true to return only assets that have not reported inside their kind's interval",
         "bbox": "restrict to what is on screen right now, for 'in the current zoom window'",
         "ids": "restrict to these exact assets, for 'list them' after a previous answer",
+        "name": "match assets whose name contains this text, for 'how many Daymark are there'",
     },
 )
 def list_entities(
@@ -392,6 +521,7 @@ def list_entities(
     overdue: bool | None = None,
     bbox: dict[str, Any] | None = None,
     ids: list[str] | None = None,
+    name: str | None = None,
 ) -> ToolResult:
     """Assets, filtered.
 
@@ -417,6 +547,19 @@ def list_entities(
         # after an answer that found nothing should find nothing, not everything.
         wanted = set(ids)
         rows = [r for r in rows if r["id"] in wanted]
+    if name:
+        # 🔴 THE FILTER THAT DID NOT EXIST, AND ITS ABSENCE PRODUCED A CONFIDENT LIE.
+        # "How many Daymark are there" went to tier 2, which had no way to express a filter
+        # by name, so it asked for something that matched nothing and the console answered
+        # "0 matching" about a fleet of five. An unanswerable question reported as a
+        # confident zero is the worst outcome available: a refusal names a limit, a zero
+        # names a fact about the world, and only one of those was true.
+        #
+        # ⚠️ SUBSTRING AND CASE-INSENSITIVE, because a family of assets is a shared prefix
+        # here: "daymark" is Daymark 01 through 05, and exact matching would answer the
+        # question about the family with the answer about a unit that does not exist.
+        needle = name.strip().lower()
+        rows = [r for r in rows if needle in r["name"].lower()]
     if kind:
         rows = [r for r in rows if r["kind"] == kind]
     if status:
@@ -448,7 +591,7 @@ def list_entities(
 
     return ToolResult(
         ok=True,
-        message=f"{len(rows)} matching",
+        message=_matched(len(rows), [r["name"] for r in rows]),
         # 🔑 POSITIONS TRAVEL WITH THE ANSWER so that framing it needs no second read of
         # the world. The executor used to re-fetch every entity purely to look up where
         # the results were, which doubled the database cost of the commonest command in
@@ -468,7 +611,19 @@ def list_entities(
         # in the file after `executor._frame_results` made it false. Handing an operator a
         # list of four assets and no idea where they are is the behaviour that changed,
         # and the comment describing it should have gone with it.
-        ui_effects={"highlight": [r["id"] for r in rows]},
+        # 🔑 ASKING FOR A KIND UNHIDES IT. "Show me the drones" must produce drones, and if
+        # the operator switched that kind off ten minutes ago the honest reading of the
+        # request is that they want it back, not that they want an empty highlight over a
+        # layer they cannot see. Harmless when nothing is hidden: the client removes a kind
+        # from a set it is not in.
+        #
+        # ⚠️ ONLY WHEN A KIND WAS NAMED. An unfiltered list is not a request to undo the
+        # operator's whole view, and treating it as one would make "what is overdue" quietly
+        # reset a filter they set on purpose.
+        ui_effects={
+            "highlight": [r["id"] for r in rows],
+            **({"kinds": {"mode": "show", "kinds": [kind]}} if kind else {}),
+        },
     )
 
 
@@ -487,6 +642,62 @@ def mesh_status() -> ToolResult:
             f'{st["counts"]["isolated"]} assets on no mesh. Main groups: {groups}'
         ),
         data=st,
+    )
+
+
+@tool(
+    "backhaul_status",
+    "How many assets carry a satellite backhaul terminal, and how many can currently reach "
+    "one through the mesh.",
+    {},
+)
+def backhaul_status() -> ToolResult:
+    """Answer "how many assets have a backhaul" both ways, because it has two readings.
+
+    🔑 THE QUESTION IS GENUINELY AMBIGUOUS AND BOTH READINGS ARE USEFUL. "Have a backhaul"
+    can mean carrying the terminal, which is a fact about the kit, or having a way out
+    through one, which is a fact about the network and the one an operator acts on. Picking
+    either silently would answer a different question from the one asked about half the
+    time, and asking which they meant would be pedantry when both numbers fit in a sentence.
+
+    ⚠️ THE SECOND FIGURE IS REACHABILITY, NOT GROUP MEMBERSHIP, and they differ in a way
+    worth stating. Sitting in a group that contains a gateway is topology; reaching one
+    means every hop on the path is an asset we are currently hearing from. An asset one dead
+    relay away from a gateway is in the group and cannot get a message home, and the whole
+    point of this display is not to call that connected.
+    """
+    rows = _entities()
+    st = meshlib.mesh_status(rows)
+
+    carriers = [a for a in rows if meshlib.is_gateway(a)]
+    reachable = st["server_reachable"]
+    # Only assets with a position are in the graph at all, so that is the honest denominator
+    # rather than every row in the table.
+    placed = [a for a in rows if a.get("lat") is not None and a.get("lon") is not None]
+
+    # ⚠️ NAMED, BUT NOT ALL OF THEM. Eleven names in a transcript line is a wall nobody
+    # reads, and the answer to "how many" is the number. A few names make the count
+    # checkable at a glance; the rest are on the map, highlighted, which is the better
+    # place to look at eleven things.
+    shown = [a["name"] for a in carriers[:4]]
+    rest = len(carriers) - len(shown)
+    named = ", ".join(shown) + (f", and {rest} more" if rest > 0 else "") if shown else "none"
+
+    return ToolResult(
+        ok=True,
+        message=(
+            f"{len(carriers)} assets carry a backhaul terminal ({named}); "
+            f"{len(reachable)} of {len(placed)} can currently reach one through the mesh"
+        ),
+        data={
+            "carrying": [a["id"] for a in carriers],
+            "can_reach": reachable,
+            "placed": len(placed),
+        },
+        # The terminals themselves are what "which ones have a backhaul" points at. The
+        # reachable set is a count rather than a highlight: lighting up two thirds of the
+        # map says nothing an operator can use.
+        ui_effects={"highlight": [a["id"] for a in carriers]},
     )
 
 
@@ -520,7 +731,7 @@ def _connection_stats(entity_id: str) -> dict[str, Any]:
     hist = _history_module()
     fn = getattr(hist, "connection_stats", None) if hist else None
     if fn is None:
-        return {"available": False, "reason": "connection history is not recorded in this build"}
+        return {"available": False, "reason": "connection history is not recorded here"}
     try:
         stats = fn(entity_id) or {}
     except Exception as exc:  # noqa: BLE001 - reported, never raised
@@ -558,11 +769,26 @@ def describe_entity(target: str) -> ToolResult:
     held = stats.get("avg_gateway_minutes")
     tail = f", gateway held {held:.0f} min on average" if isinstance(held, (int, float)) else ""
 
+    # 🔴 IT KNEW WHICH SENSORS WERE HOLDING THE CONTACT AND DID NOT SAY SO. `held_by` has
+    # been in this result's data all along, and the sentence never mentioned it, so asked
+    # WHICH hydrophone was holding a contact the console answered "UNKNOWN VESSEL 01: vessel,
+    # nominal, 0 mesh neighbours". The information was computed, carried, and withheld from
+    # the one line anybody reads.
+    #
+    # ⚠️ ONLY WHEN SOMETHING HOLDS IT. An empty list here is meaningful for a contact and
+    # meaningless for a mesh node, and "held by nothing" on a node nobody is watching would
+    # be an answer to a question that was not asked.
+    held_by = ""
+    if holders:
+        by = named_list([str(h.get("sensor_name") or h.get("name") or h.get("id")) for h in holders])
+        held_by = f", held by {by}"
+
     return ToolResult(
         ok=True,
         message=(
             f'{asset["name"]}: {asset["kind"]}, {asset["status"]}, '
-            f"{len(peers)} mesh neighbours{tail}"
+            f"{len(peers)} mesh {_plural('neighbour') if len(peers) != 1 else 'neighbour'}"
+            f"{held_by}{tail}"
         ),
         data={
             "asset": asset,
@@ -612,8 +838,8 @@ def entity_history(target: str, days: float = 1.0) -> ToolResult:
     fn = getattr(hist, "positions", None) if hist else None
     if fn is None:
         raise ToolError(
-            f'no position history is recorded for {asset["name"]} in this build. What is '
-            "available: its current position, status, and who it can reach on the mesh"
+            f'no past positions are recorded for {asset["name"]}. What this display can show '
+            "is its current position, status, and who it can reach on the mesh"
         )
 
     window_days = max(0.0, min(float(days), 30.0))
@@ -673,10 +899,22 @@ def focus_entity(target: str) -> ToolResult:
     asset = _require_one(target, rows)
     if asset["lat"] is None:
         raise ToolError(f'{asset["name"]} has no fixed position to focus on')
+    # 🔴 THE CAMERA WENT TO SOMETHING THE OPERATOR COULD NOT SEE. Kind visibility is a
+    # sticky preference: hide the drones, ask for Daymark 01 five commands later, and the
+    # view flew to a blank patch of map while the console reported "focused Daymark 01". It
+    # had, and that was the whole problem.
+    #
+    # 🔑 ONLY THIS ASSET'S KIND, NEVER EVERYTHING. Unhiding the lot would undo a filter the
+    # operator set on purpose, which is the opposite error. Mode "show" adds one kind back
+    # and leaves every other choice they made alone.
     return ToolResult(
         ok=True,
         message=f'focused {asset["name"]}',
-        ui_effects={"select": asset["id"], "camera": frame_for([(asset["lat"], asset["lon"])])},
+        ui_effects={
+            "select": asset["id"],
+            "camera": frame_for([(asset["lat"], asset["lon"])]),
+            "kinds": {"mode": "show", "kinds": [asset["kind"]]},
+        },
         entity_id=asset["id"],
     )
 
@@ -696,9 +934,21 @@ def frame_entities(targets: list[str] | None = None, kind: str | None = None) ->
     if not points:
         raise ToolError("none of those assets have a position to frame")
     camera = frame_for(points)
+    # ⚠️ THE SPREAD IS REPORTED ONLY WHEN IT IS KNOWN AND MEANS SOMETHING. It used to say
+    # "framing 1 assets across 0.0 km", which is wrong twice: the plural on one, and a
+    # distance across a single point, which has no extent to measure. Worse, `frame_for`
+    # returns no `spread_km` at all when the points share no common centre, and the old
+    # `.get(..., 0)` turned that absence into a confident "across 0 km" for assets spread
+    # around the globe. A number nobody computed must not be printed as a measurement.
+    spread = camera.get("spread_km")
+    noun = "asset" if len(points) == 1 else "assets"
+    if len(points) > 1 and spread:
+        message = f"framing {len(points)} {noun} across {spread} km"
+    else:
+        message = f"framing {len(points)} {noun}"
     return ToolResult(
         ok=True,
-        message=f'framing {len(points)} assets across {camera.get("spread_km", 0)} km',
+        message=message,
         ui_effects={"camera": camera, "highlight": [r["id"] for r in chosen]},
     )
 
@@ -731,7 +981,7 @@ def show_overlay(layer: str = "ice") -> ToolResult:
     key = (layer or "ice").strip().lower()
     if key not in OVERLAYS:
         raise ToolError(
-            f'there is no "{key}" overlay in this build. What exists: '
+            f'there is no "{key}" overlay on this display. What exists: '
             + ", ".join(f"{n} ({d})" for n, d in OVERLAYS.items())
             + ". Nothing here fetches live weather at runtime, deliberately"
         )
@@ -740,6 +990,85 @@ def show_overlay(layer: str = "ice") -> ToolResult:
         message=f"showing {OVERLAYS[key]}",
         data={"layer": key},
         ui_effects={"overlay": {"layer": key, "visible": True}},
+    )
+
+
+#: What `set_visible_kinds` will accept, and the whole vocabulary of that control.
+VIEW_MODES = ("hide", "show", "only", "all")
+
+
+@tool(
+    "set_visible_kinds",
+    "Hide or show whole kinds of asset on the map. Use mode 'only' to show one kind and "
+    "hide the rest, or mode 'all' to bring everything back.",
+    {
+        "mode": "one of hide, show, only, all",
+        "kinds": "list of kinds to act on, such as radar or vessel. Not needed for 'all'",
+    },
+)
+def set_visible_kinds(mode: str = "show", kinds: list[str] | None = None) -> ToolResult:
+    """Turn whole kinds off and on, for reading a crowded map.
+
+    🔑 A DISPLAY PREFERENCE, AND IT SAYS SO. Nothing here touches the world, the counts or
+    what any other question answers: twelve radar sites do not stop existing because
+    somebody is trying to read a cluster underneath them. It is the same control as the VIEW
+    menu in the header, reachable by saying it instead of clicking it.
+
+    🔒 THE SERVER DOES NOT KNOW WHAT IS CURRENTLY HIDDEN, AND DELIBERATELY DOES NOT ASK.
+    Which kinds are switched off is one browser's preference, held in that browser. So this
+    returns an INTENT rather than a computed set, and the client resolves it against its own
+    state. The alternative, shipping the current filter up with every command so the server
+    can diff it, would make a display preference part of the request contract and give two
+    places an opinion about one piece of state.
+
+    ⚠️ `only` AND `all` ARE NOT SUGAR FOR REPEATED HIDES. "Show only the vessels" has to
+    mean the same thing whatever was already hidden, and a plan built out of hides would
+    depend on where the operator happened to start.
+    """
+    key = (mode or "show").strip().lower()
+    if key not in VIEW_MODES:
+        raise ToolError(
+            f'"{key}" is not something I can do to the view. What I can do: '
+            + ", ".join(VIEW_MODES)
+        )
+
+    if key == "all":
+        return ToolResult(
+            ok=True,
+            message="showing every kind",
+            data={"mode": key},
+            ui_effects={"kinds": {"mode": key, "kinds": []}},
+        )
+
+    names = [k.strip().lower().replace(" ", "_") for k in (kinds or []) if k and k.strip()]
+    if not names:
+        raise ToolError(
+            f'"{key}" needs at least one kind of asset named, such as radar or vessel'
+        )
+
+    unknown = [n for n in names if n not in terrain.CLASSIFIED_KINDS]
+    if unknown:
+        raise ToolError(
+            f"there is no {', '.join(unknown)} on this display. What exists: "
+            + ", ".join(sorted(terrain.CLASSIFIED_KINDS))
+        )
+
+    # ⚠️ SAID AS A GROUP, BECAUSE THAT IS WHAT IS BEING SHOWN. The kinds are stored in the
+    # singular ("vessel", "ground_party") since each row is one of them, and reading that
+    # back as "showing only vessel" describes one boat rather than a category. The plural
+    # is formed here, at the point where the word stops being a value and becomes a
+    # sentence.
+    spoken = ", ".join(_plural(n.replace("_", " ")) for n in names)
+    message = (
+        f"showing only {spoken}" if key == "only"
+        else f"hiding {spoken}" if key == "hide"
+        else f"showing {spoken}"
+    )
+    return ToolResult(
+        ok=True,
+        message=message,
+        data={"mode": key, "kinds": names},
+        ui_effects={"kinds": {"mode": key, "kinds": names}},
     )
 
 
@@ -761,16 +1090,36 @@ def reset_view() -> ToolResult:
     "place_asset",
     "Place a new asset at a position. Refuses positions the asset could not physically occupy.",
     {
-        "kind": "node, hydrophone, marker or launch_site",
+        # 🔴 BUILT FROM THE CONSTANT, BECAUSE THE HAND-TYPED VERSION WENT STALE AND LIED TO
+        # THE MODEL. It read "node, hydrophone, marker or launch_site" long after the set
+        # grew to ten, so tier 2 was told six placeable kinds did not exist and would refuse
+        # to place a vessel it was perfectly able to place. A description of a constant
+        # belongs to that constant.
+        "kind": f"one of: {', '.join(sorted(PLACEABLE_KINDS))}",
         "lat": "latitude in degrees",
         "lon": "longitude in degrees",
         "name": "optional display name",
         "hostile": "true to place it as an adversary rather than one of ours",
+        "unknown": (
+            "true to place it as an unidentified contact: classified unknown, and not "
+            "announcing itself, so it is only on the map if a sensor actually holds it"
+        ),
+        "backhaul": (
+            "true to give it its own satellite terminal, so it reaches the outside world "
+            "on its own. Without one it is only reachable through the mesh, by way of a "
+            "neighbour that can already get home"
+        ),
     },
     writes=True,
 )
 def place_asset(
-    kind: str, lat: float, lon: float, name: str | None = None, hostile: bool | None = None
+    kind: str,
+    lat: float,
+    lon: float,
+    name: str | None = None,
+    hostile: bool | None = None,
+    unknown: bool | None = None,
+    backhaul: bool | None = None,
 ) -> ToolResult:
     if kind not in PLACEABLE_KINDS:
         raise ToolError(
@@ -798,7 +1147,9 @@ def place_asset(
             "name": name or f"{kind.replace('_', ' ').title()} {n:02d}",
             "lat": lat,
             "lon": lon,
-            "alt_m": 0.0,
+            # An aircraft at 0 m is not "altitude unknown", it is an aircraft on the
+            # ground. See _PLACED_ALTITUDE_M.
+            "alt_m": _PLACED_ALTITUDE_M.get(kind, 0.0),
             "status": "nominal",
             # ⚠️ NO ROUTE, AND THAT IS WHAT KEEPS IT WHERE IT WAS PUT. Every placeable
             # kind is a fixed installation: a node on a guyed mast, a hydrophone moored to
@@ -820,9 +1171,54 @@ def place_asset(
             # ranges. Making it its own kind would have meant teaching terrain, motion,
             # detection and the mesh about a thing that behaves identically to one they
             # already know, and every one of those would have needed the same entry.
-            "props": {"placed_by": "operator", **({"hostile": True} if hostile else {})},
-            "last_heard": None,
-            "ais_reporting": None,
+            # 🔑 UNKNOWN IS AN IDENTITY, NOT AN ALLEGIANCE, AND IT IS KEPT SEPARATE FROM
+            # `hostile` FOR THAT REASON. The seeded world happens to mark its unknown
+            # contacts hostile as well, but they are two different claims: one says we
+            # cannot say what this is, the other says we can and it is not ours. An
+            # operator dropping a contact they cannot identify is making the first claim
+            # only, and folding them together would put an assertion in their mouth.
+            #
+            # ⚠️ AND IT HAS TO SILENCE THE THING TOO, or the word is decorative. "Unknown"
+            # is only true of something that is not announcing itself: a vessel with AIS up
+            # is telling us its name, so classifying it unknown and leaving it broadcasting
+            # would produce a contact the console can identify and has labelled otherwise.
+            # `detected_unknown` is derived from exactly that, so this is what makes a
+            # placed unknown behave like a seeded one.
+            "props": {
+                "placed_by": "operator",
+                **_placed_props(kind),
+                **({"hostile": True} if hostile else {}),
+                **(
+                    {"classification": "unknown", "emitting": False, "transponder": False}
+                    if unknown
+                    else {}
+                ),
+                # 🔑 A ROLE, AND THE VALUE SAYS HOW RATHER THAN JUST YES. `is_gateway` reads
+                # this field's truthiness and nothing else, so any kind may carry one, and
+                # "satellite" is written rather than `True` because a fibre-fed site and a
+                # satellite one behave completely differently in an outage and a bare
+                # boolean could never grow into that. The seeded terminals are written the
+                # same way, so a placed gateway is indistinguishable from a laid-down one.
+                #
+                # ⚠️ WITHOUT IT, REACHABILITY IS A QUESTION ABOUT NEIGHBOURS. An asset with
+                # no terminal reaches this console only through the mesh, by a chain of
+                # assets we are hearing from that ends at something which does have one. So
+                # dropping a node in an empty stretch of coast and finding it unreachable is
+                # the model working rather than a fault.
+                **({"backhaul": "satellite"} if backhaul else {}),
+            },
+            # 🔴 IT REPORTS THE MOMENT IT IS PUT DOWN, AND `None` HERE WAS A REAL BUG. An
+            # asset with no `last_heard` has never been heard from, so freshness could not
+            # place it on the timeline at all: it was excluded from the mesh sweep, never
+            # stamped, and sat outside the model permanently. A node dropped next to a live
+            # gateway stayed cut off forever, which is not what the operator just did.
+            #
+            # 🔑 NOW IT ENTERS THE WORLD REPORTING, AND THE MODEL TAKES OVER FROM THERE. A
+            # placed asset that can get a message home keeps a current heartbeat; one that
+            # cannot ages out of contact on its own, exactly as a seeded asset does. That is
+            # what makes the BACKHAUL flag mean something you can watch happen.
+            "last_heard": datetime.now(UTC),
+            "ais_reporting": False if unknown else None,
             "created_by": "user",
         }
     )
@@ -963,34 +1359,60 @@ def coverage() -> ToolResult:
     summary = getattr(detect, "coverage_summary", None) if detect else None
     if summary is None:
         raise ToolError(
-            "this build does not compute sensor coverage. What is available: asset status, "
+            "this display does not compute sensor coverage. What it can show: asset status, "
             "mesh connectivity, and which contacts are not broadcasting"
         )
 
-    out = summary(_entities())
-    counts = out.get("counts", {})
+    # Read once and kept, because the answer now names the contacts as well as counting
+    # them and a second read would be a second version of the world in one sentence.
+    rows = _entities()
+    out = summary(rows)
 
     # 🔑 THE ID LISTS ARE ALREADY IN THE ANSWER, so this names the contacts rather than
     # recomputing them. A count nobody can act on is a worse answer than a short list
     # somebody can go and look at, and the two cannot disagree if only one of them exists.
     missing = list(out.get("detected_not_reported", [])) + list(out.get("untracked", []))
 
-    parts = [f'{counts.get("self_reporting", 0)} reporting their own position']
-    if counts.get("tracked"):
-        parts.append(f'{counts["tracked"]} held by a sensor')
-    if counts.get("detected_not_reported"):
-        parts.append(
-            f'{counts["detected_not_reported"]} seen by a sensor that cannot report it'
+    # 🔴 A COUNT NOBODY CAN ACT ON IS HALF AN ANSWER. This reported four numbers and no
+    # names, so "1 held by nothing at all" could not be followed by "which one" without
+    # running the whole thing again, and running it again returned the identical sentence.
+    # Three model calls, one answer, and it read as though the question had been ignored
+    # twice.
+    #
+    # ⚠️ TWO NAMES THEN A COUNT, because this is one line in a transcript rather than a
+    # report. The full set travels in `data` and is one command away: the ids go out with
+    # the answer, so "list them" resolves against them instead of starting over.
+    named = {r["id"]: r["name"] for r in rows}
+
+    def bucket(key: str, phrase: str) -> str | None:
+        ids = list(out.get(key, []))
+        if not ids:
+            return None
+        return f"{len(ids)} {phrase} ({named_list([named.get(i, i) for i in ids], limit=2)})"
+
+    parts = [
+        p
+        for p in (
+            bucket("self_reporting", "reporting their own position"),
+            bucket("tracked", "held by a sensor"),
+            bucket("detected_not_reported", "seen by a sensor that cannot report it"),
+            bucket("untracked", "held by nothing at all"),
         )
-    if counts.get("untracked"):
-        parts.append(f'{counts["untracked"]} held by nothing at all')
+        if p
+    ]
+    if not parts:
+        parts = ["no contacts on the picture at all"]
     if not missing:
         parts.append("nothing is unaccounted for")
 
     return ToolResult(
         ok=True,
         message="; ".join(parts),
-        data={**out, "not_on_the_picture": missing},
+        # 🔑 `ids` IS WHAT "THEM" BINDS TO, and its absence is why the follow-up questions
+        # could not be answered at all. The gap is what this tool is about, so the gap is
+        # what the next command points at; the per-bucket lists are still here beside it for
+        # anything narrower.
+        data={**out, "not_on_the_picture": missing, "ids": missing},
         ui_effects={"highlight": missing},
     )
 
@@ -1214,7 +1636,7 @@ def show_unknown() -> ToolResult:
     summary = getattr(detect, "coverage_summary", None) if detect else None
     if summary is None:
         raise ToolError(
-            "this build does not compute which contacts are identified. What is available: "
+            "this display does not identify contacts. What it can show: "
             "asset status, mesh connectivity, and which contacts are not broadcasting"
         )
 

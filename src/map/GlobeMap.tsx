@@ -60,7 +60,15 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // broken build ship.
 maplibreConfig.WORKER_URL = "/maplibre/maplibre-gl-worker.mjs";
 
-import { isGateway, isUnreachable, ringState, unknownState, weakAssetIds } from "../assets";
+import {
+  isGateway,
+  isUnreachable,
+  KIND_LABEL,
+  ringState,
+  unknownState,
+  weakAssetIds,
+} from "../assets";
+import { runCommand } from "../commandRunner";
 import { useStore } from "../store";
 import { viewportBbox } from "./bounds";
 import { buildIcons, iconImageExpression, ICON_PIXEL_RATIO } from "./icons";
@@ -134,11 +142,17 @@ export function GlobeMap() {
 
   // 🔑 ONE SELECTOR PER LAYER. Each of these drives its own effect below, so a change
   // to one never re-uploads the others. See the note above the effects.
-  const assets = useStore((s) => s.assets);
+  // ⚠️ THE DRAWN POSITIONS, NOT THE REPORTED ONES. `displayAssets` is the same set carried
+  // forward between five second fixes so movement is continuous rather than a jump per
+  // poll; see `useDeadReckoning`. Everything that COUNTS or ANSWERS still reads `assets`,
+  // because an estimate must never become a number anybody quotes.
+  const assets = useStore((s) => s.displayAssets);
   const mesh = useStore((s) => s.mesh);
+  const placing = useStore((s) => s.placing);
   const ice = useStore((s) => s.ice);
   const showIce = useStore((s) => s.showIce);
   const hideUndetected = useStore((s) => s.hideUndetected);
+  const hiddenKinds = useStore((s) => s.hiddenKinds);
   const track = useStore((s) => s.track);
 
   // ---- create the map once -------------------------------------------------
@@ -640,22 +654,20 @@ export function GlobeMap() {
     // is recomputed whenever the camera settles rather than on every frame.
     m.on("moveend", () => setBbox(viewportBbox(m)));
 
-    // ---- lift the loading curtain ----------------------------------------
+    // ---- the loading curtain is NOT lifted here ---------------------------
     //
-    // 🔑 ON THE FIRST REAL FRAME, NOT ON MOUNT. The curtain in index.html exists to cover
-    // the gap before anything is on screen, and React mounting is well before that: the
-    // style has to load, the worker has to parse the basemap and the GPU has to draw it.
-    // Lifting at mount would move the blank frame rather than remove it.
+    // 🔴 IT USED TO BE, ON `m.once("idle")`, AND THAT SIGNAL WAS WRONG IN A WAY THAT LOOKED
+    // RIGHT. `idle` means MapLibre has drawn everything it currently can, and at this point
+    // in the boot it currently can draw the basemap and nothing else: the assets have not
+    // been fetched, so they are not a source yet and there is nothing outstanding for the
+    // map to be busy with. Measured, that fires around 0.9 s while the icons do not paint
+    // until about 4.3 s, so the curtain came up on an empty globe and the console looked
+    // broken for three and a half seconds on every cold load.
     //
-    // `idle` is MapLibre saying it has finished drawing everything it currently can, which
-    // is the closest thing it offers to "there is a picture now". `once`, because the curtain
-    // is lifted exactly one time and every later idle is just the map settling after a pan.
-    //
-    // 🔒 The curtain's own 15 second watchdog stays the backstop. A signal that is never
-    // sent must not be able to hang the page, so this only ever makes it lift EARLIER.
-    m.once("idle", () => {
-      (window as { consoleReady?: () => void }).consoleReady?.();
-    });
+    // 🔑 IT IS LIFTED WHERE "loading" CLEARS, on the effect below that asks the map whether
+    // the asset icons are literally on screen. That is the same question the curtain is
+    // asking, so the two must not answer it separately: this file already carried two
+    // different signals for one moment, and only one of them was correct.
 
     // ---- click to select, and ask when the click is ambiguous ------------
     //
@@ -673,6 +685,54 @@ export function GlobeMap() {
     const SLOP = 8;
 
     m.on("click", (e) => {
+      // 🔑 PLACING TAKES THE CLICK ENTIRELY, BEFORE ANY HIT TEST. With the PLACE control
+      // armed, the operator has already said what this click is for, and running the
+      // selection logic first would mean a click that happened to land on an existing icon
+      // selected it instead of placing, which is the one thing they did not ask for.
+      //
+      // ⚠️ DISARMS ITSELF. Placing is a single act, not a mode you stay in: the alternative
+      // is an operator who clicks twice and gets two nodes, and finds out from the map.
+      const { placing, setPlacing } = useStore.getState();
+      const { kind, unknown, backhaul } = placing;
+      if (kind) {
+        // Disarms the kind and keeps the flags, so placing three unknown contacts in a row
+        // costs three clicks on the map and one trip back to the menu per kind change.
+        setPlacing({ ...placing, kind: null });
+        const lat = e.lngLat.lat;
+        const lon = e.lngLat.lng;
+        // ⚠️ THE SENTENCE IS FOR THE TRANSCRIPT AND IS NOT WHAT RUNS. The plan below is the
+        // command; this is the line an operator reads back afterwards, so it has to say
+        // what was actually done. `ui_button` is what tells the audit log a control did it
+        // rather than someone speaking, which is a distinction worth keeping.
+        const what = `${unknown ? "unknown " : ""}${KIND_LABEL[kind]}`;
+        const article = /^[aeiou]/i.test(what) ? "an" : "a";
+        const carrying = backhaul ? " with backhaul" : "";
+        runCommand(
+          `place ${article} ${what}${carrying} at ${lat.toFixed(3)}, ${lon.toFixed(3)}`,
+          "ui_button",
+          {
+            // ⚠️ `params`, NOT `args`. The executor validates `step["params"]` against the
+            // tool's declared parameters and treats a missing key as an empty dict, so the
+            // wrong name does not error: the plan is accepted with no arguments, falls
+            // through to the parser, and comes back asking for the kind and position that
+            // were sitting right here. Silent, and it looked like a parser bug.
+            plan: [
+              {
+                tool: "place_asset",
+                params: {
+                  kind,
+                  lat,
+                  lon,
+                  ...(unknown ? { unknown: true } : {}),
+                  ...(backhaul ? { backhaul: true } : {}),
+                },
+              },
+            ],
+          },
+        );
+        return;
+      }
+
       const box: [[number, number], [number, number]] = [
         [e.point.x - SLOP, e.point.y - SLOP],
         [e.point.x + SLOP, e.point.y + SLOP],
@@ -775,7 +835,16 @@ export function GlobeMap() {
   useEffect(() => {
     const m = map.current;
     if (!m || !ready) return;
-    const dark = (a: (typeof assets)[number]) => a.aisReporting === false;
+    // 🔴 WHAT EARNS RED IS BEING HELD AND UNIDENTIFIED, not being a vessel with its AIS
+    // off. Those overlapped on the seeded world, so the rule read as "a dark vessel" for a
+    // long time while an unidentified AIRCRAFT sat in the neutral grey every friendly asset
+    // uses. `detectedUnknown` is computed on the server, where `tracked` and `ais_reporting`
+    // are both in hand, precisely so the browser does not derive it a second way.
+    //
+    // ⚠️ DETECTED ONLY. An UNDETECTED unknown is deliberately untouched: the console cannot
+    // legitimately claim to hold it, so it keeps the faded treatment that says exactly that.
+    const dark = (a: (typeof assets)[number]) =>
+      a.detectedUnknown === true || a.aisReporting === false;
     // Computed once per redraw rather than per asset: it walks the whole link list.
     const weak = weakAssetIds(mesh);
     const now = Date.now();
@@ -806,6 +875,11 @@ export function GlobeMap() {
         // other is held by a sensor that cannot deliver, which leaves us in the same place.
         // Revealing them is a deliberate act, which is what the checkbox makes it.
         .filter((a) => !hideUndetected || unknownState(a) === null)
+        // A display preference, applied last and kept apart from the honesty filter
+        // above: that one decides what may be claimed, this one decides what one
+        // operator wants to look at. Same effect on the map, different reasons, and
+        // conflating them would make the VIEW menu look like it edits the truth.
+        .filter((a) => !hiddenKinds.includes(a.kind))
         .map((a) =>
           point([a.lon as number, a.lat as number], {
             id: a.id,
@@ -824,7 +898,74 @@ export function GlobeMap() {
           }),
         ),
     );
-  }, [assets, mesh, ready, hideUndetected]);
+
+  }, [assets, mesh, ready, hideUndetected, hiddenKinds]);
+
+  // 🔴 "LOADING" USED TO CLEAR WHEN THE DATA ARRIVED, NOT WHEN IT WAS DRAWN. The store
+  // cleared it inside `setAssets`, which fires the moment the fetch resolves, while MapLibre
+  // still has to parse the features, rasterise the labels and paint a frame. Measured, the
+  // canvas is up at about 0.9 s, so the notice vanished and left an empty globe looking
+  // broken. `idle` is the map's own statement that it has nothing left to draw, which is the
+  // only signal here that means what "loading" means to a person.
+  //
+  // ⚠️ ARMED ONCE, AND THE FIRST VERSION OF THIS WAS NOT. Sitting inside the data effect it
+  // re-ran on every tick of the position interpolation, and each run cleared its own backstop
+  // and re-armed it, so the timeout could never fire and the map was never idle either. The
+  // notice then stayed up for ten seconds, which is worse than the bug it replaced. Keyed on
+  // the COUNT rather than the array, and latched with a ref, so nothing after the first paint
+  // can re-enter it.
+  //
+  // 🔒 THE BACKSTOP IS THE POINT. A notice that never clears is worse than one that clears
+  // early, so a driver fault or a backgrounded tab gives up after a second and a half rather
+  // than leaving the word on screen forever.
+  const clearedLoading = useRef(false);
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready || clearedLoading.current || !assets.length) return;
+    clearedLoading.current = true;
+    const done = () => {
+      m.off("render", check);
+      window.clearTimeout(backstop);
+      useStore.getState().setLoading(false);
+      // 🔑 THE CURTAIN COMES UP ON THE SAME SIGNAL, AND THAT IS THE WHOLE POINT OF PUTTING
+      // IT HERE. "the operator can see the assets" is one moment, so it gets one answer.
+      // Lifting the curtain on the map's first `idle` instead had it up at 0.9 s against
+      // icons at 4.3 s, which is a blank globe with no explanation on screen.
+      (window as { consoleReady?: () => void }).consoleReady?.();
+    };
+    // 🔑 ASK THE MAP WHETHER THE ICONS ARE ACTUALLY ON SCREEN. `idle` was the first attempt
+    // and it is the wrong signal here: this map is a globe with a sea ice texture, so it
+    // keeps rendering and does not go idle promptly, which turned the backstop into a fixed
+    // delay and cleared the notice a second and a half LATE. Rendered features are the
+    // literal question being asked, "can the operator see the assets yet".
+    const check = () => {
+      if (m.queryRenderedFeatures({ layers: ["asset-icons-static", "asset-icons-moving"] }).length) {
+        done();
+      }
+    };
+    m.on("render", check);
+    // ⚠️ FAR BEYOND THE NORMAL PATH, DELIBERATELY. Measured on this machine the icons paint
+    // about 1.9 s after the data lands, and an earlier 2.5 s here only beat that by half a
+    // second: on a slower machine or a cold database the timer would win the race and clear
+    // the notice early, which is the bug this effect exists to fix. A backstop that competes
+    // with the thing it is backing up is not a backstop. Ten seconds catches a genuinely
+    // stuck map and can never be the reason the word disappears on a working one.
+    const backstop = window.setTimeout(done, 10_000);
+    return () => {
+      m.off("render", check);
+      window.clearTimeout(backstop);
+    };
+  }, [assets.length, ready]);
+
+  // 🔑 THE ARMED MAP HAS TO LOOK ARMED. A click behaves completely differently while PLACE
+  // is armed, and a map that gives no sign of that turns the operator's next click into a
+  // surprise. The crosshair is the conventional "you are about to put something here", and
+  // it costs one line rather than an overlay.
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready) return;
+    m.getCanvas().style.cursor = placing.kind ? "crosshair" : "";
+  }, [placing, ready]);
 
   // The position history a command asked for, and nothing else. Null clears it, which is
   // what makes a trail belong to the question that produced it rather than accumulating.
@@ -871,7 +1012,12 @@ export function GlobeMap() {
     const m = map.current;
     if (!m || !ready || !mesh) return;
     const at = new globalThis.Map(
-      assets.filter((a) => a.lat !== null).map((a) => [a.id, a] as const),
+      // 🔑 HIDDEN KINDS ARE ABSENT FROM THIS LOOKUP, WHICH IS WHAT DROPS THEIR LINKS.
+      // A link whose endpoint is not drawn would otherwise run to empty water, which
+      // reads as a fault in the mesh rather than as a filter the operator applied.
+      assets
+        .filter((a) => a.lat !== null && !hiddenKinds.includes(a.kind))
+        .map((a) => [a.id, a] as const),
     );
     const now = Date.now();
     setData(
@@ -898,7 +1044,7 @@ export function GlobeMap() {
         ];
       }),
     );
-  }, [mesh, assets, ready]);
+  }, [mesh, assets, ready, hiddenKinds]);
 
   // Selection, pushed to the GPU as feature state rather than into the data.
   //

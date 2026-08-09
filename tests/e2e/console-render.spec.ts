@@ -155,38 +155,91 @@ test("server data reaches the UI", async ({ page }) => {
   await page.goto("/");
   await waitForAppLoaded(page);
 
+  // Every count an operator reads at a glance, all of them server data that had to survive
+  // the fetch, the store and the render to appear here at all.
   const footer = page.locator(".strip.bottom");
-  // The mesh is computed per request rather than stored, so its arrival in the UI
-  // proves the derivation ran, not that a column was read back.
-  await expect(footer).toContainText(/mesh \d+ links/);
+  await expect(footer).toContainText(/our assets\s+\d+/);
+  // ⚠️ A LOOKBEHIND, NOT A WORD BOUNDARY. `innerText` joins the flex children with no
+  // separator, so the strip reads "current statusreachable 36" and there is no boundary
+  // in front of the word at all. Excluding a preceding "un" is what actually separates
+  // this reading from "unreachable/overdue" beside it.
+  await expect(footer).toContainText(/(?<!un)reachable \d+/);
+  await expect(footer).toContainText(/unreachable\/overdue \d+/);
+  await expect(footer).toContainText(/nominal \d+/);
+  await expect(footer).toContainText(/maintenance \d+/);
+  await expect(footer).toContainText(/detected unknown \d+/);
+
+  // 🔑 THE PROPERTY THE STRIP IS FOR: two independent readings of one set, each accounting
+  // for all of it. `current status` asks whether we can hear it, `last message` asks what
+  // it last told us, and both have to add up to the total printed beside them. A group that
+  // does not sum leaves a remainder no label explains, which is what this strip did while
+  // it counted contacts and radar sites in the same number as our own kit.
   const text = await footer.innerText();
-  expect(Number(text.match(/mesh (\d+) links/)?.[1] ?? 0), "computed radio links").toBeGreaterThan(0);
-  expect(Number(text.match(/(\d+) groups/)?.[1] ?? 0), "connected groups").toBeGreaterThan(0);
+  const count = (re: RegExp) => Number(text.match(re)?.[1] ?? -1);
+  const total = count(/our assets\s+(\d+)/);
+  expect(total).toBeGreaterThan(0);
+  expect(
+    count(/(?<!un)reachable (\d+)/) + count(/unreachable\/overdue (\d+)/),
+    "current status must account for every one of our assets",
+  ).toBe(total);
+  expect(
+    count(/nominal (\d+)/) + count(/maintenance (\d+)/),
+    "last message must account for every one of our assets",
+  ).toBe(total);
+
+  // ⛔ AND NEITHER GROUP MAY QUIETLY GROW TO INCLUDE THEM AGAIN. The radar layer is not
+  // ours and a contact is not an asset, so the words that used to carry them are gone from
+  // this strip rather than merely unused.
+  await expect(footer).not.toContainText(/not on mesh/);
+  await expect(footer).not.toContainText(/not reporting/);
+
+  // ⚠️ THE MESH LEFT THE STATUS STRIP, so its derivation is asserted at the endpoint that
+  // computes it rather than at a label that no longer exists. It is still computed per
+  // request rather than stored, which is the property worth proving: connectivity is a
+  // question you ask, and the map draws the answer.
+  const meshBody = await page.evaluate(() => fetch("/api/mesh").then((r) => r.json()));
+  expect(meshBody.links.length, "computed radio links").toBeGreaterThan(0);
+  expect(meshBody.groups.length, "connected groups").toBeGreaterThan(0);
 });
 
 test("the ice timebar scrubs to a different measurement and the map follows", async ({ page }) => {
   /**
-   * 🥇 The assertion that guards the layer's one claim. Moving the control has to
-   * change BOTH the date shown and the extent reported, because those come from
-   * different places: the date is the snapped measurement, the extent was computed
-   * on the source grid at build time. A decoder that silently returned the same
+   * 🥇 The assertion that guards the layer's one claim: moving the control has to change
+   * what is DRAWN, not merely what is labelled. A decoder that silently returned the same
    * frame for every date would still move the label and would fail here.
    *
-   * March against September is chosen deliberately. The Arctic maximum is roughly
-   * four times the minimum, so this is a gap no rounding or off-by-one can produce.
+   * ⚠️ IT USED TO READ AN EXTENT FIGURE OUT OF THE STATUS STRIP, and that figure has been
+   * removed from the display. The magnitude claim it was making did not need a browser and
+   * is asserted better without one: `test_march_and_september_bracket_the_published_seasonal_range`
+   * checks every vendored March against 13-16M km2 and every September against 3-6.5M, on
+   * the source data, with no rendering in the way. What is left here is the half that only
+   * a browser can answer, which is whether pressing GO changes the picture.
+   *
+   * March against September is still chosen deliberately: the Arctic maximum is roughly four
+   * times the minimum, so it is a difference no rounding can produce.
    */
-  await page.goto("/");
-  await waitForIceLoaded(page);
+  // 🔴 THE DEFAULT 30 SECONDS CANNOT HOLD THIS TEST, AND THE ARITHMETIC SAYS SO RATHER THAN
+  // THE MOOD OF THE MACHINE. It settles the picture three separate times, and `settledImage`
+  // budgets up to forty samples at 400ms apiece, so the waiting alone can reach 48 seconds
+  // before a single measurement tile is fetched. It passed for as long as the map happened
+  // to hold still quickly every time, which made a structural shortfall look like an
+  // intermittent one: it went red under the load of a full suite run, green on its own, then
+  // red on its own once something else was busy.
+  //
+  // ⚠️ RAISING THE CLOCK WEAKENS NOTHING. Every assertion below is unchanged, and
+  // `settledImage` still refuses to measure an unsettled frame. What was failing was the
+  // budget, not the claim.
+  test.setTimeout(150_000);
+
+  await page.goto("/?live=off");
+  await waitForAppLoaded(page);
+  await waitForMapPainted(page);
 
   const picker = page.locator(".timebar .icepick");
-  const footer = page.locator(".strip.bottom");
-  // The select IS the readout now, so what is shown is asserted on its value rather than
-  // on a second label that would only ever repeat it.
-  const shown = async () =>
-    await picker.locator("option:checked").innerText();
-
-  const extentNow = async () =>
-    Number((await footer.innerText()).match(/ice ([\d.]+)M/)?.[1] ?? 0);
+  const go = page.locator(".timebar .icego");
+  // The select IS the readout, so what is shown is asserted on its value rather than on a
+  // second label that would only ever repeat it.
+  const shown = async () => await picker.locator("option:checked").innerText();
 
   // Found by reading the option text rather than by assuming an index, so this survives
   // the vendored range being extended or a month being missing from a year.
@@ -199,31 +252,36 @@ test("the ice timebar scrubs to a different measurement and the map follows", as
   expect(march, "a March measurement must be selectable").toBeTruthy();
   expect(september, "a September measurement must be selectable").toBeTruthy();
 
-  // Choosing is free; GO is what draws it. Selecting without pressing GO must change
-  // nothing on the map, which is the whole reason the button exists.
-  const go = page.locator(".timebar .icego");
-  const extentBefore = await extentNow();
+  // Choosing is free; GO is what draws it. Selecting without pressing GO must leave the
+  // map alone, which is the whole reason the button exists.
   await picker.selectOption(march);
-  expect(await extentNow(), "choosing a month must not draw it yet").toBe(extentBefore);
-
-  // 🔑 GO DISABLES WHEN THE MAP HAS CAUGHT UP, which is the app's own statement that the
-  // chosen month is the drawn one. Waiting on it beats a sleep: each date now fetches its
-  // own measurement tile, so reading the extent too early gets the PREVIOUS month's figure
-  // and the winter-against-summer comparison quietly compares a month to itself.
   await go.click();
   await expect(go).toBeDisabled();
   expect(await shown(), "the control must show the March measurement").toContain("MAR");
-  const winter = await extentNow();
+  const winter = await settledImage(page);
 
   await picker.selectOption(september);
+  const stillWinter = await settledImage(page);
+  expect(
+    differingPixels(winter, stillWinter),
+    "choosing a month must not draw it until GO is pressed",
+  ).toBeLessThan(2000);
+
+  // 🔑 GO DISABLES WHEN THE MAP HAS CAUGHT UP, which is the app's own statement that the
+  // chosen month is the drawn one. Waiting on it beats a sleep: each date fetches its own
+  // measurement tile, so measuring too early compares a month against itself.
   await go.click();
   await expect(go).toBeDisabled();
   expect(await shown(), "the control must show the September measurement").toContain("SEP");
-  const summer = await extentNow();
+  const summer = await settledImage(page);
 
-  expect(winter, "March extent").toBeGreaterThan(12);
-  expect(summer, "September extent").toBeLessThan(7);
-  expect(winter, "winter must carry far more ice than summer").toBeGreaterThan(summer * 1.5);
+  // The Arctic loses roughly three quarters of its ice between these two months, so the
+  // frames cannot be close. A bar rather than an exact figure: how many pixels that is
+  // depends on the camera, and the camera is not what this test is about.
+  expect(
+    differingPixels(winter, summer),
+    "March and September must not draw the same ice",
+  ).toBeGreaterThan(20000);
 });
 
 test("the timebar only ever offers dates that were actually measured", async ({ page }) => {
@@ -298,9 +356,32 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
    * view, so if this ever silently became a bounded range, every polar filter
    * would start dropping assets.
    */
+  // 🔑 ASSERTED THROUGH THE CONTRACT ITSELF, NOT THROUGH A LABEL. The status strip used to
+  // print the viewport, and this read that text. The readout is gone, and asking the
+  // command layer is the stronger test anyway: it exercises the thing the readout was only
+  // ever evidence FOR, which is that a pole-centred camera reporting every longitude
+  // survives all the way into a filter rather than being treated as a bad box.
   await page.goto("/");
   await waitForAppLoaded(page);
-  await expect(page.locator(".strip.bottom")).toContainText("view all longitudes");
+  await waitForMapPainted(page);
+
+  // 🔑 TYPED INTO THE REAL COMMAND BAR, so the box under test is the one the live map
+  // computed rather than one this test made up. Posting a hand-written bbox to the API
+  // would assert that the SERVER handles a global box, which was never in doubt; what
+  // matters is that the client produces one and it survives the round trip.
+  await page.locator(".cmdinput").fill("show me assets in the current view");
+  await page.locator(".cmdinput").press("Enter");
+
+  const transcript = page.locator(".activity");
+  // ⚠️ MATCHES THE SENTENCE, NOT THE OLD COUNTER. The listing tool used to answer "N
+  // matching"; it now names what it found, so this asserts the shape a person reads.
+  await expect(transcript).toContainText(/assets match:|one asset matches:/, {
+    timeout: 20_000,
+  });
+  await expect(
+    transcript,
+    "a pole-centred view must not be refused for having no meaningful longitude",
+  ).not.toContainText(/current window.*nothing to mean/);
 });
 
 test("all nine asset kinds load and reach the map", async ({ page }) => {
@@ -339,9 +420,17 @@ test("all nine asset kinds load and reach the map", async ({ page }) => {
     ground_party: 3,
   });
 
-  // The footer counts everything on the map, seeded or placed, which is correct for a
-  // status strip. So it is asserted against the total rather than against the seed.
-  await expect(page.locator(".strip.bottom")).toContainText(`assets ${body.entities.length}`);
+  // 🔑 THE STRIP'S TOTAL IS THE FRIENDLY SET, NOT EVERY ROW, and the difference is the
+  // reason its numbers add up. Every condition it counts is a fact about our own
+  // equipment: whether we can reach it, and what its last message said. Neither is a fact
+  // about a ship that has never reported to us, so counting contacts in the same total
+  // left a remainder no label could explain. Contacts get their own count.
+  //
+  // Asserted against the live total rather than the seed, because a placed asset is as
+  // real as a seeded one and the strip is right to count it.
+  const MESH_KINDS = new Set(["node", "patrol", "uas", "launch_site", "hydrophone"]);
+  const ours = body.entities.filter((e: { kind: string }) => MESH_KINDS.has(e.kind));
+  await expect(page.locator(".strip.bottom")).toContainText(`our assets ${ours.length}`);
 });
 
 test("the non-broadcasting contacts are surfaced, and one is held by nothing", async ({
@@ -563,11 +652,7 @@ test("the mesh link lines are drawn without anyone asking, and cannot be switche
   // of a contract without depending on a world that moves.
   const withLinks = await settledImage(page);
 
-  // ⚠️ EVERYTHING NEEDING REAL DATA IS ASSERTED HERE, on the first load, rather than after a
-  // third reload to undo the mock. Removing a way to hide the lines changed nothing about
-  // what the mesh IS, and the footer is the readout that says so.
-  await expect(page.locator(".strip.bottom")).toContainText(/mesh \d+ links/);
-  // And the control really is gone, so nothing puts it back by accident.
+  // The control really is gone, so nothing puts it back by accident.
   await expect(page.locator('.toggle:has-text("MESH LINKS")')).toHaveCount(0);
 
   await page.route("**/api/mesh", (route) =>

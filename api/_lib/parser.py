@@ -58,6 +58,12 @@ KIND_WORDS: dict[str, str] = {
 
 _COORD = r"(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)"
 
+# 🔑 THE VERBS THAT MEAN "ADD SOMETHING TO THE WORLD", kept here because two branches far
+# above the place branch have to know about them. A sentence carrying one of these is
+# describing a thing to create, so the words in it name properties of that thing rather
+# than a filter over the things already on the map.
+_PLACING = re.compile(r"\b(?:place|drop|put)\b")
+
 
 def _kind(text: str) -> str | None:
     """Longest match wins, so "mesh nodes" is not read as "nodes" inside a longer phrase."""
@@ -184,6 +190,104 @@ def parse(utterance: str) -> list[dict[str, Any]] | None:
     ):
         return None
 
+    # --- what is drawn ----------------------------------------------------
+    # 🔑 ABOVE EVERY LISTING BRANCH, BECAUSE THESE SENTENCES CONTAIN LISTING SENTENCES.
+    # "show only the vessels" ends in "the vessels", so anything that matches a kind and
+    # answers with a list will take it first and quietly return a highlight for a request
+    # that was about the map's contents rather than about its answer.
+    #
+    # ⚠️ AND `only`/`except` COME BEFORE PLAIN hide/show FOR THE SAME REASON one layer down:
+    # "hide everything except the radar" contains "hide", and reading it as a hide would do
+    # the exact opposite of what was asked.
+    if re.search(r"\b(show|display|bring back|unhide|restore)\b.*\b(all|every)\s+"
+                 r"(assets?|kinds?|types?|layers?|of them|thing)\b", text) or re.search(
+        r"\b(unhide|show|restore)\s+everything\b|\bstop hiding\b|\bclear the (view )?filters?\b",
+        text,
+    ):
+        return plan("set_visible_kinds", mode="all")
+
+    only = re.search(
+        r"\b(?:show|display|view)\s+only\b(?P<rest>.*)"
+        r"|\bonly\s+(?:show|display)\b(?P<rest2>.*)"
+        r"|\bhide\s+(?:everything|all|the rest|all others?)\s+(?:except|but|other than)\b(?P<rest3>.*)"
+        r"|\b(?:show|display)\s+(?:nothing|no)\s+but\b(?P<rest4>.*)",
+        text,
+    )
+    if only:
+        tail = next(
+            (g for g in (only.group("rest"), only.group("rest2"),
+                         only.group("rest3"), only.group("rest4")) if g),
+            "",
+        )
+        kind = _kind(tail)
+        if kind:
+            return plan("set_visible_kinds", mode="only", kinds=[kind])
+        # 🔴 DECLINE RATHER THAN FALL THROUGH, and this is the branch that proved why. "Hide
+        # everything except for unknowns" is unambiguously an instruction about visibility,
+        # and "unknown" is a property of a contact rather than a kind, so there is no kind to
+        # act on. Falling through carried the sentence down to the unidentified-contacts
+        # branch, which matched the bare word "unknowns", HIGHLIGHTED four contacts, hid
+        # nothing at all, and reported it as though it had done what was asked.
+        #
+        # 🔑 THIS IS THE PARSER'S OWN CONTRACT, APPLIED WHERE IT WAS BEING BROKEN: it declines
+        # when it does not know, because a half match steals the utterance from the tier
+        # that is allowed to be uncertain. Returning None sends this to tier 2, which is told
+        # that visibility works by kind and answers by saying so.
+        #
+        # ⚠️ SCOPED TO THE EXPLICIT CONSTRUCTION ONLY. The bare "hide X" branch below still
+        # falls through on purpose, because "hide the track" is about something else and
+        # `_kind` finding nothing is what lets its real owner have it. "Show only" and "hide
+        # everything except" are never anything but visibility instructions.
+        return None
+
+    # ⚠️ "hide" ONLY, NOT "remove" OR "turn off", AND THAT IS A DELIBERATE NARROWING. Both
+    # of those already mean something here: "remove the marker" deletes an entity and "turn
+    # off" is how a fault gets described. This branch sits above both of them, so accepting
+    # either verb would silently convert a delete into a display filter, which is the worst
+    # possible way to be wrong about a destructive command.
+    #
+    # A hide is also only a hide when it names a KIND. "hide the track" is about something
+    # else, and `_kind` returning nothing is what lets it fall through to whatever owns it.
+    if re.search(r"\bhide\b", text) and not re.search(r"\b(except|but|other than)\b", text):
+        kind = _kind(text)
+        if kind:
+            return plan("set_visible_kinds", mode="hide", kinds=[kind])
+
+    # --- the way out ------------------------------------------------------
+    # 🔴 A SENTENCE THAT PLACES SOMETHING IS NEVER A REQUEST TO LIST IT, and both of the
+    # branches below learned that the same way. "place a hydrophone with its own satellite
+    # terminal at 74.3, -84.2" came back as a count of the twelve assets that already carry
+    # one, and "place an unknown vessel at 74.2, -84.0" came back as the unknown contact
+    # list. Both matched on a keyword, both answered confidently, and neither placed
+    # anything. These branches sit above the place branch on purpose, so the guard belongs
+    # on them rather than in the ordering.
+    #
+    # ⚠️ THE VERB ALONE IS ENOUGH, WITHOUT REQUIRING COORDINATES. "place an unknown vessel"
+    # with no position is not a listing request either; it is an incomplete placement, and
+    # handing it to tier 2 to ask for the missing position is the right answer where
+    # reciting the contact list is not.
+    #
+    # ⚠️ ABOVE THE CONNECTIVITY BRANCH, which matches "mesh status" and would otherwise take
+    # "how many assets can reach a backhaul over the mesh" and answer a different question
+    # with it. This one is about the satellite terminals; that one is about radio links.
+    #
+    # 🔴 AND IT DECLINES A QUESTION ABOUT THE WORD ITSELF. "What is a backhaul" contains
+    # "backhaul" and is not a request for a count; answering it with eleven asset names is
+    # the confident-wrong-answer failure this whole tier is supposed to avoid, and it
+    # happened the first time somebody asked. A definition is exactly the kind of language
+    # tier 2 exists for, so this hands it over rather than matching on a keyword and
+    # answering a different question.
+    if (
+        re.search(r"\bbackhauls?\b|\bsatellite terminals?\b|\bgateways?\b|\buplinks?\b", text)
+        and not _PLACING.search(text)
+        and not re.search(
+            r"\bwhat(?:'s| is| are| does)\b|\bwhats\b|\bdefine\b|\bexplain\b|\bmean(?:s|ing)?\b"
+            r"|\bwhy\b|\bhow does\b|\btell me about\b",
+            text,
+        )
+    ):
+        return plan("backhaul_status")
+
     # --- connectivity -----------------------------------------------------
     if re.search(r"\b(mesh|connectivity|network) (status|state)\b", text) or re.search(
         r"\bwhich (clusters?|groups?) are (cut off|isolated|disconnected)\b", text
@@ -202,11 +306,15 @@ def parse(utterance: str) -> list[dict[str, Any]] | None:
     # ⚠️ "unknown" IS NOT MATCHED AS A BARE WORD INSIDE A LONGER QUESTION, the same care
     # "dark" needed below. "I do not know" and "unknown position" are ordinary English in
     # this domain and are not requests for the contact list.
-    if re.search(
-        r"\bunknowns?\b|\bunidentified\b|\bunknown (?:contacts?|vessels?|aircraft|parties)\b"
-        r"|\bwho is out there\b|\bnot (?:identified|squawking)\b",
-        text,
-    ) and not re.search(r"\b(?:do not|don't|dont|cannot|can't) know\b", text):
+    if (
+        re.search(
+            r"\bunknowns?\b|\bunidentified\b|\bunknown (?:contacts?|vessels?|aircraft|parties)\b"
+            r"|\bwho is out there\b|\bnot (?:identified|squawking)\b",
+            text,
+        )
+        and not _PLACING.search(text)
+        and not re.search(r"\b(?:do not|don't|dont|cannot|can't) know\b", text)
+    ):
         return plan("show_unknown")
 
     # --- the flagship query ----------------------------------------------
@@ -333,11 +441,34 @@ def parse(utterance: str) -> list[dict[str, Any]] | None:
     # loose listing branch and came back as `focus_entity(target="whole arctic")`, which
     # then failed to resolve. A wrong answer, not a decline, which is the exact failure
     # the module docstring warns about.
-    if re.search(
+    # 🔴 "SHOW ME EVERYTHING" AND "SHOW ME EVERYTHING IN THE CURRENT VIEW" ARE OPPOSITES, and
+    # this branch answered both by moving the camera. The first asks to widen out to the whole
+    # Arctic; the second asks what is inside the window the operator is already looking at,
+    # and answering it with a camera move destroys the very view being asked about. It is one
+    # of the phrasings this console is most likely to be handed, since it is a near quote of
+    # the example a reader would try first.
+    #
+    # ⚠️ A SCOPE PHRASE IS NOT A QUALIFIER, IT CHANGES THE REQUEST. So it is not enough to
+    # let the words fall through as ignored: this branch must not claim the utterance at all,
+    # and the listing branches below, which know about the viewport, take it instead.
+    scoped_to_view = re.search(
+        r"\b(?:in|on|inside|within)\s+(?:the\s+)?(?:current\s+)?"
+        r"(?:view|window|screen|viewport|zoom(?:\s+window)?|frame)\b"
+        r"|\bon\s+screen\b|\bin\s+view\b|\bcurrent\s+(?:view|window|zoom)\b",
+        text,
+    )
+    if not scoped_to_view and re.search(
         r"\b(reset|default|restore)\s+(the\s+)?(view|camera|map)\b"
         r"|\bzoom\s+(the\s+\w+\s+)?(all\s+the\s+way\s+)?out\b"
         r"|\bunzoom\b|\bback\s+out\b|\bpull\s+(back|out)\b"
         r"|\bshow\s+(me\s+)?(the\s+)?(whole|entire|full)\s+(arctic|map|picture|world|thing)\b"
+        # ⚠️ "focus on the entire world" IS A CAMERA COMMAND THAT NAMES NOTHING, and it was
+        # falling through to the focus branch, which hunted for an asset called "entire
+        # world", failed, and escalated. The model then read it as "show everything" and
+        # brought every hidden kind back, which is a visibility change nobody asked for.
+        # Widening the view and revealing hidden kinds are separate acts.
+        r"|\b(?:focus|zoom|centre|center|pan)\s+(?:on\s+|to\s+|out\s+to\s+)?(?:the\s+)?"
+        r"(?:whole|entire|full)\s+(?:world|map|arctic|picture|thing)\b"
         r"|\bshow\s+(me\s+)?everything\b|\bwide\s+view\b|\boverview\b"
         r"|\bfit\s+everything\b|\bwhole\s+arctic\b|\bdefault\s+view\b",
         text,
@@ -351,12 +482,29 @@ def parse(utterance: str) -> list[dict[str, Any]] | None:
     # --- place ------------------------------------------------------------
     m = re.search(rf"\b(?:place|drop|put)\b.*?\b(marker|node|hydrophone|launch site)\b.*?{_COORD}", text)
     if m:
-        return plan(
-            "place_asset",
-            kind=KIND_WORDS.get(m.group(1), m.group(1).replace(" ", "_")),
-            lat=float(m.group(2)),
-            lon=float(m.group(3)),
-        )
+        # 🔴 THE TWO FLAGS ARE READ HERE OR THEY ARE LOST SILENTLY, which is the worst
+        # outcome this tier can produce. "place a hydrophone with its own satellite terminal
+        # at 74.3, -84.2" matched, placed an ordinary hydrophone, and reported success: the
+        # operator said the words, the console agreed, and the asset had no terminal. A
+        # refusal or an escalation would both have been better than a confident wrong answer,
+        # and reading the words is better than either.
+        #
+        # ⚠️ THE VOCABULARY MATCHES THE LISTING BRANCHES ABOVE ON PURPOSE. Those two decide
+        # whether a sentence is ASKING about unknowns and backhauls; this decides whether a
+        # placement is one. Keeping the words identical is what stops "with a backhaul"
+        # meaning the flag in one branch and nothing in the other.
+        params: dict[str, Any] = {
+            "kind": KIND_WORDS.get(m.group(1), m.group(1).replace(" ", "_")),
+            "lat": float(m.group(2)),
+            "lon": float(m.group(3)),
+        }
+        if re.search(r"\bunknowns?\b|\bunidentified\b|\bunclassified\b", text):
+            params["unknown"] = True
+        if re.search(
+            r"\bbackhauls?\b|\bsatellite terminals?\b|\buplinks?\b|\bgateways?\b", text
+        ):
+            params["backhaul"] = True
+        return plan("place_asset", **params)
 
     # --- task a drone -----------------------------------------------------
     m = re.search(rf"\b(?:send|task|move|fly)\b\s+(.+?)\s+(?:to|toward)\s+{_COORD}", text)
@@ -375,9 +523,27 @@ def parse(utterance: str) -> list[dict[str, Any]] | None:
     if m:
         return plan("describe_entity", target=m.group(1).strip(" ?"))
 
-    m = re.search(r"\b(?:focus|select|go to|centre on|center on|zoom to)\s+(?:on\s+)?(?:the\s+)?(.+)", text)
+    # ⚠️ "zoom into" BEFORE "zoom in", or the shorter one matches first and leaves "to" at
+    # the head of the target. And "zoom in on Survey 03" is the phrasing people actually use:
+    # this branch knew "zoom to" and sent every "zoom in on" to the model, which answered it
+    # correctly and slowly, for a sentence naming one asset and one action.
+    m = re.search(
+        r"\b(?:focus|select|go to|centre on|center on|zoom to|zoom into|zoom in)"
+        r"\s+(?:on\s+|to\s+)?(?:the\s+)?(.+)",
+        text,
+    )
     if m:
-        return plan("focus_entity", target=m.group(1).strip(" ?"))
+        # 🔴 `.+` SWALLOWED THE REST OF THE SENTENCE INTO THE ASSET NAME, and that hid its
+        # own evidence. "Focus FLS Alert and hide everything else" became a search for an
+        # asset called "fls alert and hide everything else": it resolved to nothing, and the
+        # trace could not report the dropped instruction either, because every word of it was
+        # sitting inside a parameter value and therefore counted as used.
+        #
+        # 🔑 A SECOND INSTRUCTION IS NOT PART OF A NAME. Cutting at the conjunction leaves a
+        # target that can resolve and leaves the rest of the sentence visible to `trace`,
+        # which is what sends a genuinely compound request to the tier that can plan it.
+        target = re.split(r"\s+\b(?:and|then|also|plus)\b\s+", m.group(1).strip(" ?"), maxsplit=1)[0]
+        return plan("focus_entity", target=target.strip(" ?,"))
 
     # --- the current zoom window -------------------------------------------
     # 🔴 THE FIRST CAPABILITY THIS APPLICATION IS SUPPOSED TO HAVE, and it was answered
@@ -422,6 +588,15 @@ def parse(utterance: str) -> list[dict[str, Any]] | None:
         kind = _kind(target)
         steps: list[dict[str, Any]] = []
         if kind:
+            # 🔴 IT LISTED AND FRAMED, WHICH IS NOT ISOLATING. Nothing was hidden, so
+            # "isolate the drones" left every other kind on the map and differed from "show
+            # me the drones" only by a camera move. The word promises a picture with one kind
+            # in it, and the tool that does that was simply never in the plan.
+            #
+            # ⚠️ FILTER FIRST, THEN FRAME. Framing to the kind and then hiding the rest gives
+            # the same final picture, but for a moment the camera is settling over assets
+            # that are about to vanish, which reads as a glitch rather than a sequence.
+            steps.append({"tool": "set_visible_kinds", "params": {"mode": "only", "kinds": [kind]}})
             steps.append({"tool": "list_entities", "params": {"kind": kind}})
             steps.append({"tool": "frame_entities", "params": {"kind": kind}})
         else:
@@ -536,13 +711,13 @@ UNSUPPORTED: list[tuple[str, str]] = [
         # which now correctly goes to the model, so the refusal was quietly recommending
         # the slowest path in the app. A refusal that names what IS available should name
         # something the deterministic tier answers instantly.
-        "there is no live air traffic feed in this build, and nothing here fetches "
+        "there is no live air traffic feed here, and nothing on this display fetches "
         "anything at runtime, deliberately. The aircraft on this map are the ones in the "
         'world itself; try "show me the aircraft"',
     ),
     (
         r"\bforecast\b|\bwind speed\b|\btemperature\b|\bprecipitation\b|\bstorm\b",
-        "there is no weather forecast in this build. What is available is measured sea "
+        "there is no weather forecast here. What this display has is measured sea "
         'ice concentration; try "show me the ice overlay"',
     ),
 ]
@@ -568,6 +743,51 @@ def unsupported(utterance: str) -> str | None:
 # strict is latency and a fraction of a cent, paid on a request tier 1 could have answered.
 # The cost of being too loose is a word silently dropped from a question, answered
 # confidently, which is the failure this whole trace exists to expose. Err toward listing.
+# 🔴 VERBS THAT ARE FILLER ONLY WHEN THE PLAN ACTUALLY DOES WHAT THEY ASK. Every one of
+# these was in the blanket filler list, on the reasoning that a command verb selects a tool
+# and the tool's own name is already counted. That holds right up until the parser matches a
+# DIFFERENT branch, and then the verb is not a word it used, it is an instruction it threw
+# away while reporting a clean match.
+#
+# Four real half-matches, all reporting `ignored: []` before this existed:
+#
+#   "show only the drones and frame them"     filtered, never framed
+#   "isolate the hydrophone"                  listed ten, isolated nothing
+#   "focus FLS Alert and hide everything else"  swallowed the tail into the asset name
+#   "hide everything except for unknowns"     silently became something else
+#
+# 🔑 THE MAPPING IS THE VERB TO THE TOOL THAT WOULD HONOUR IT. Present, and the word did its
+# job. Absent, and the operator asked for something that did not happen, which is the exact
+# condition that should send the utterance to the tier allowed to be uncertain.
+#
+# ⚠️ KEPT SHORT DELIBERATELY. Every entry can only ever cause an escalation, which costs a
+# model call and a few seconds, so this holds the verbs whose absence was actually observed
+# to produce a wrong answer rather than every verb that could theoretically be dropped.
+EARNED_BY: dict[str, tuple[str, ...]] = {
+    "frame": ("frame_entities",),
+    # Isolating one asset goes through `focus_entity`; isolating a KIND goes through the
+    # visibility filter. Either honours the word, and neither is the bare list that used to.
+    "isolate": ("focus_entity", "set_visible_kinds"),
+    "hide": ("set_visible_kinds",),
+    "except": ("set_visible_kinds",),
+    "task": ("task_uas",),
+    "place": ("place_asset",),
+    "drop": ("place_asset",),
+    "remove": ("remove_asset",),
+    "delete": ("remove_asset",),
+    # reset_view is included because "focus on the whole world" is a focus honoured by
+    # widening the camera rather than by picking an asset.
+    "focus": ("focus_entity", "frame_entities", "reset_view"),
+    # 🔴 "zoom back out and show everything" ANSWERED ONLY THE SECOND HALF. The visibility
+    # branch sits above the reset branch and claimed the utterance, so the camera never
+    # moved, and every word carrying the zoom ("zoom", "back", "out") was filler, so the
+    # trace reported a clean match on a command that had done half of what was asked.
+    #
+    # Honoured by any of the three tools that actually move the camera: reset_view widens
+    # out, focus_entity zooms to one asset, frame_entities zooms to a set.
+    "zoom": ("reset_view", "focus_entity", "frame_entities"),
+}
+
 FILLER = {
     # asking
     "show", "shows", "showing", "display", "list", "find", "get", "give", "tell", "see",
@@ -575,12 +795,21 @@ FILLER = {
     "were", "do", "does", "did", "can", "could", "would", "will", "let", "want", "need",
     "look", "looking", "check", "know", "there", "here", "any", "some", "all", "every",
     "please", "just", "now", "currently", "right", "still", "again", "also", "too",
+    # Changing what is drawn. These name the request the same way "show" and "list" do, so
+    # leaving one out sends a command tier 1 answered perfectly off to the model as a
+    # partial match. ("only", "bring", "back" and "than" are already listed above.)
+    "unhide", "restore", "other",
     # glue
     "me", "my", "i", "we", "us", "you", "it", "its", "the", "a", "an", "of", "for", "to",
     "in", "on", "at", "by", "with", "from", "and", "or", "but", "that", "this", "these",
     "those", "them", "their", "they", "he", "she", "his", "her", "be", "been", "being",
     "have", "has", "had", "up", "out", "over", "about", "into", "onto", "as", "if", "then",
     "than", "so", "not", "no", "yes", "ok", "okay",
+    # The satellite link, said the several ways people say it. These name the subject the
+    # way "asset" does rather than narrowing it, and an unlisted synonym is reported as a
+    # dropped word, which escalates a question tier 1 has already answered in full.
+    "backhaul", "backhauls", "gateway", "gateways", "uplink", "uplinks",
+    "satellite", "terminal", "terminals",
     # the domain's own generic nouns: they name the subject, never narrow it
     "asset", "assets", "entity", "entities", "thing", "things", "unit", "units", "one",
     "ones", "item", "items", "everything", "anything", "something", "map", "screen",
@@ -588,10 +817,19 @@ FILLER = {
     "detail", "details", "data", "lists",
     # command verbs: they choose the tool, and the tool name is already counted, but
     # not every verb appears in the name it selects ("send" picks `task_uas`)
-    "send", "task", "move", "go", "fly", "put", "place", "drop", "add", "set", "make",
-    "open", "focus", "centre", "center", "zoom", "frame", "select", "reset", "return",
-    "remove", "delete", "take", "clear", "fix", "isolate", "narrow", "only", "down",
+    #
+    # 🔴 SEVEN OF THESE MOVED OUT, TO `EARNED_BY`. A verb is filler because it SELECTED a
+    # tool, so it stops being filler the moment the plan does not contain that tool: then it
+    # is not a word the parser used, it is an instruction the parser dropped. Listed
+    # unconditionally, they made the trace claim a clean match on utterances that had plainly
+    # been half understood, which is precisely what `ignored` exists to catch.
+    "send", "move", "go", "fly", "put", "add", "set", "make",
+    "open", "centre", "center", "select", "reset", "return",
+    "take", "clear", "fix", "narrow", "only", "down",
     "back", "start", "started", "rid", "kill", "pull", "bring", "break", "disable", "silence", "knock",
+    # Scope qualifiers on a camera command. "Show me the whole arctic" was escalating on the
+    # word "whole", which is a command tier 1 answers perfectly.
+    "way", "whole", "entire", "full", "arctic",
     "inject", "fault", "faults",
     # the viewport, which becomes a placeholder rather than a word in the plan
     "current", "window", "visible", "onscreen", "viewport",
@@ -694,14 +932,30 @@ def trace(utterance: str, plan: list[dict[str, Any]] | None) -> dict[str, Any]:
             elif isinstance(value, (int, float)):
                 used.add(str(value))
                 used.add(str(int(value)) if float(value).is_integer() else str(value))
+            elif isinstance(value, list):
+                # A list parameter carries words exactly as a string one does. Without this
+                # every item in it reads as a word the parser ignored.
+                for item in value:
+                    if isinstance(item, str):
+                        used.update(_words(item.replace("_", " ")))
 
     # Every way of saying the kinds this plan actually filtered on. "parties" and "party"
     # both mean `ground_party`, and only the one the operator typed is in the utterance.
-    kinds = {
-        str(step.get("params", {}).get("kind"))
-        for step in plan
-        if step.get("params", {}).get("kind")
-    }
+    #
+    # 🔴 BOTH `kind` AND `kinds`, AND MISSING THE SECOND ONE BROKE A WHOLE BRANCH. The view
+    # tools take a LIST of kinds rather than one, so reading only the singular key left the
+    # kind word itself unaccounted for: "hide all radars" reported `radars` as a word the
+    # parser had thrown away, which is a partial match, which escalates. The command parsed
+    # perfectly, cost a model call, and came back refused by a model that had been asked to
+    # do the thing tier 1 had already done.
+    kinds: set[str] = set()
+    for step in plan:
+        params = step.get("params") or {}
+        if params.get("kind"):
+            kinds.add(str(params["kind"]))
+        listed = params.get("kinds")
+        if isinstance(listed, list):
+            kinds.update(str(k) for k in listed)
     for word, kind in KIND_WORDS.items():
         if kind in kinds:
             used.update(_words(word))
@@ -711,6 +965,12 @@ def trace(utterance: str, plan: list[dict[str, Any]] | None) -> dict[str, Any]:
     # the bare numbers in the utterance are that expression, not dropped words.
     if any("days" in (step.get("params") or {}) for step in plan):
         used.update(w for w in words if w.replace(".", "").replace("-", "").isdigit())
+
+    # A verb that names an action counts as used only if the plan performs that action.
+    # See `EARNED_BY`: listed unconditionally, these made a half match look like a clean one.
+    for verb, tools_that_honour_it in EARNED_BY.items():
+        if any(t in tools_matched for t in tools_that_honour_it):
+            used.update(_variants(verb))
 
     ignored = [w for w in words if w not in used]
 

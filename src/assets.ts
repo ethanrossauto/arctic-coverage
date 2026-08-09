@@ -31,6 +31,31 @@ export type AssetKind =
   | "marker";
 
 /**
+ * The kinds that carry one of our radios, which is to say the equipment we operate and
+ * can hear from.
+ *
+ * 🔑 THIS IS THE LINE THE STATUS STRIP COUNTS AGAINST, and drawing it here is what makes
+ * those numbers add up. Two things sit outside it, for the same reason. A CONTACT is what
+ * the network is watching rather than part of it: a ship is not one of our assets that
+ * happens to be unreachable. A RADAR SITE is friendly but not ours, carries `owned:
+ * false`, and reports to its own operator, so it can be neither reachable nor overdue to
+ * us. Every condition the strip tracks is a fact about our own kit, and neither of those
+ * two can answer any of them.
+ *
+ * ⚠️ MIRRORS `mesh.MESH_KINDS` ON THE SERVER, WHICH IS A DRIFT RISK AND IS PINNED BY A
+ * TEST. `test_the_client_and_server_agree_on_the_mesh_kinds` reads this file and compares
+ * the set against the Python one, so adding a kind on one side and not the other is a
+ * failing suite rather than a status strip that quietly miscounts.
+ */
+export const MESH_KINDS: ReadonlySet<string> = new Set<AssetKind>([
+  "node",
+  "patrol",
+  "uas",
+  "launch_site",
+  "hydrophone",
+]);
+
+/**
  * ⚠️ MID-MIGRATION, AND BOTH SHAPES ARE LISTED ON PURPOSE. The server is moving to
  * `nominal` plus `maintenance`; the other three are what it still serves today. Narrowing
  * this type before the server narrows its output would not make the old values stop
@@ -342,6 +367,17 @@ export const KIND_LABEL: Record<AssetKind, string> = {
 };
 
 /**
+ * Every kind, derived from the label table rather than written out again.
+ *
+ * 🔑 ONE LIST, SO "show only the vessels" CANNOT GO STALE. That command hides every kind
+ * except the named one, which means it needs to know what "every kind" is. A second
+ * hand-maintained array would work until somebody added a kind and forgot it, and the
+ * symptom would be a kind that silently refuses to hide.
+ */
+export const ALL_KINDS = Object.keys(KIND_LABEL) as AssetKind[];
+
+
+/**
  * UNDETECTED UNKNOWN: contacts the console cannot honestly claim to have.
  *
  * 🔑 THE LINE IS "DID THE DETECTION REACH THIS CONSOLE", NOT "DOES A SENSOR HOLD IT". That
@@ -411,6 +447,21 @@ export interface MeshStatus {
   /** Assets on no mesh at all. Reported separately from one-member groups on purpose. */
   isolated: string[];
   meshCapable: number;
+  /**
+   * Assets something we hear from can carry a message home for, and those it cannot.
+   *
+   * 🔑 TAKEN FROM THE SERVER RATHER THAN RECOMPUTED HERE. Reachability is a property of
+   * the whole graph, and the client holds no link budget, no gateway roles and no view of
+   * which relays are being heard. `isUnreachable` falls back to "overdue means cut off"
+   * precisely because these were being dropped on the way in, and that fallback applies a
+   * mesh rule to contacts, which are not on the mesh at all.
+   *
+   * ⚠️ THESE TWO PARTITION THE MESH-CAPABLE SET, NOT THE WORLD. Their sum is
+   * `meshCapable`, because a vessel and a radar site carry no radio of ours and neither
+   * word is a fact about them.
+   */
+  serverReachable: string[];
+  unreachable: string[];
 }
 
 export async function fetchMesh(): Promise<MeshStatus> {
@@ -428,6 +479,8 @@ export async function fetchMesh(): Promise<MeshStatus> {
     groups: body.groups as MeshGroup[],
     isolated: body.isolated as string[],
     meshCapable: body.mesh_capable as number,
+    serverReachable: (body.server_reachable ?? []) as string[],
+    unreachable: (body.unreachable ?? []) as string[],
   };
 }
 

@@ -315,6 +315,79 @@ def _reachability(
     return reachable, unreachable, unknown
 
 
+def heard_through_mesh(
+    assets: Iterable[dict[str, Any]],
+    transmitted_age_s: dict[str, float],
+) -> dict[str, float]:
+    """How old this console's newest information about each asset is, given how long ago
+    each one last transmitted. Returns seconds, keyed by id; absent means no route home
+    has ever existed.
+
+    🔑 THE DIFFERENCE BETWEEN TRANSMITTING AND BEING HEARD, WHICH IS THE WHOLE POINT. An
+    asset having a working radio is a fact about the asset. This console having its data is
+    a fact about the entire path back to a gateway, and a path is only as fresh as its
+    stalest hop. A relay that stopped forwarding two days ago caps everything behind it at
+    two days, however healthy those units are and however recently they transmitted.
+
+    So the answer for an asset is the best path it has, and the worth of a path is its worst
+    hop: minimise, over every route to a gateway, the maximum age along that route. That is
+    a bottleneck path, and it is computed here rather than approximated, because the
+    approximation people reach for, "fresh if the asset is fine and its cluster has a
+    gateway", cannot say HOW stale a cut-off asset is and so reports a live figure for
+    something nothing has been heard from since Thursday.
+
+    🔴 THIS IS WHAT STOPS THE DISPLAY CONTRADICTING ITSELF. Before it existed, freshness was
+    stamped per asset with no reference to the graph, so the console could report an asset
+    as cut off from the network and heard from eight minutes ago in the same frame. Nine of
+    thirteen unreachable assets were doing exactly that.
+
+    ⚠️ AND IT IS NOT CIRCULAR, WHICH THE OBVIOUS IMPLEMENTATION IS. `_reachability` decides
+    who is live by asking whether each asset is overdue, and overdue is computed from the
+    freshness this function produces. Feeding one into the other means the graph is built
+    out of its own output. `transmitted_age_s` breaks that: it is read from the stored row
+    alone, so nothing here depends on a value anything here wrote.
+
+    The sweep is freshest-first, adding one asset at a time and unioning it with the
+    neighbours already in. An asset is assigned the age at which it FIRST joins a component
+    holding a gateway, which is its best path by construction, since every later step is
+    staler. O(n^2) over the mesh-capable set, which is tens of assets and microseconds.
+    """
+    nodes = _positioned(assets)
+    by_id = {a["id"]: a for a in nodes}
+
+    adjacent: dict[str, list[str]] = {}
+    for link in compute_links(nodes):
+        adjacent.setdefault(link.a, []).append(link.b)
+        adjacent.setdefault(link.b, []).append(link.a)
+
+    # Assets we have no transmit age for cannot be placed on the timeline at all, so they
+    # are left out rather than guessed at. A caller that gets no answer keeps what it had.
+    order = sorted(
+        (i for i in by_id if i in transmitted_age_s), key=lambda i: transmitted_age_s[i]
+    )
+
+    union = _Union(by_id)
+    present: set[str] = set()
+    heard: dict[str, float] = {}
+    for asset_id in order:
+        age = transmitted_age_s[asset_id]
+        present.add(asset_id)
+        for neighbour in adjacent.get(asset_id, ()):
+            if neighbour in present:
+                union.union(asset_id, neighbour)
+
+        # A gateway is its own way out, so a lone base with no neighbours is heard the
+        # moment it transmits. Recomputed each step because the asset just added may BE the
+        # gateway that brings a whole component into contact.
+        gateway_roots = {union.find(i) for i in present if is_gateway(by_id[i])}
+        if not gateway_roots:
+            continue
+        for i in present:
+            if i not in heard and union.find(i) in gateway_roots:
+                heard[i] = age
+    return heard
+
+
 def mesh_status(assets: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """The whole picture: links, connected groups, what reaches a gateway, and what is on
     no mesh at all.
@@ -458,6 +531,10 @@ def _label_for(members: list[str], by_id: dict[str, dict[str, Any]]) -> str:
         if cluster:
             names[cluster] = names.get(cluster, 0) + 1
     if not names:
-        return f"{len(members)} assets"
+        # ⚠️ A LABEL, NOT A COUNT. The caller prints "{label} ({size})", so returning the
+        # size here rendered as "10 assets (10)", which reads as a bug rather than a group
+        # whose members share no cluster. Operator-placed assets have no cluster name, so
+        # this is the ordinary fate of anything somebody put down themselves.
+        return "unclustered"
     best = max(names.items(), key=lambda kv: kv[1])[0]
     return str(best).split(" /")[0]

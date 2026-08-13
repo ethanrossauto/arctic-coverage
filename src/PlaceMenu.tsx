@@ -123,14 +123,14 @@ export function PlaceMenu({ open, onOpenChange }: {
           <div className="placeattr">
             <label
               className="toggle"
-              title="classify it unknown and silence it, so it is only visible if a sensor holds it"
+              title="place it as a hostile contact: unidentified, not announcing itself, and only visible if a sensor holds it"
             >
               <input
                 type="checkbox"
                 checked={placing.unknown}
                 onChange={(e) => setPlacing({ ...placing, unknown: e.target.checked })}
               />
-              UNKNOWN
+              HOSTILE
             </label>
 
             {/* 🔑 THE OTHER THING THAT CHANGES BEHAVIOUR RATHER THAN THE LABEL, and the

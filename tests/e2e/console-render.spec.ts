@@ -365,23 +365,44 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
   await waitForAppLoaded(page);
   await waitForMapPainted(page);
 
-  // 🔑 TYPED INTO THE REAL COMMAND BAR, so the box under test is the one the live map
-  // computed rather than one this test made up. Posting a hand-written bbox to the API
-  // would assert that the SERVER handles a global box, which was never in doubt; what
-  // matters is that the client produces one and it survives the round trip.
-  await page.locator(".cmdinput").fill("show me assets in the current view");
-  await page.locator(".cmdinput").press("Enter");
-
-  const transcript = page.locator(".activity");
-  // ⚠️ MATCHES THE SENTENCE, NOT THE OLD COUNTER. The listing tool used to answer "N
-  // matching"; it now names what it found, so this asserts the shape a person reads.
-  await expect(transcript).toContainText(/assets match:|one asset matches:/, {
-    timeout: 20_000,
+  // 🔑 THE BOX UNDER TEST IS THE ONE THE LIVE MAP COMPUTED, which is the whole point: a
+  // hand-written bbox posted to the API would assert that the SERVER handles a global box,
+  // and that was never in doubt. What matters is that the CLIENT produces one.
+  //
+  // ⚠️ THIS USED TO TYPE "show me assets in the current view" AND READ THE ANSWER, and that
+  // stopped working when tier 1 became one wording per tool: `bbox` is a parameter of
+  // `list_entities` and its single declared sentence does not set it, so those words now go
+  // to the model, and asserting on a model's choice of parameters would make this test
+  // non-deterministic and paid.
+  //
+  // 🔑 SO IT ASSERTS THE REQUEST INSTEAD OF THE ANSWER, which is closer to the claim in the
+  // first place. The client attaches its viewport to EVERY command, so any command exercises
+  // the plumbing, and reading it off the wire removes both tiers from the test.
+  let posted: { bbox?: Record<string, unknown> } | null = null;
+  await page.route("**/api/command", async (route) => {
+    posted = JSON.parse(route.request().postData() ?? "{}").context ?? {};
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, summary: "mesh status", tier: "parser", results: [] }),
+    });
   });
-  await expect(
-    transcript,
-    "a pole-centred view must not be refused for having no meaningful longitude",
-  ).not.toContainText(/current window.*nothing to mean/);
+
+  await page.locator(".cmdinput").fill("mesh status");
+  await page.locator(".cmdinput").press("Enter");
+  await expect(page.locator(".activity")).toContainText("mesh status");
+
+  const sent = posted as { bbox?: Record<string, unknown> } | null;
+  expect(sent?.bbox, "the client must attach the viewport it is looking at").toBeTruthy();
+  const box = sent!.bbox!;
+  expect(
+    typeof box.south === "number" && typeof box.north === "number",
+    "a pole-centred view still has latitudes",
+  ).toBe(true);
+  // A pole-centred camera legitimately spans every longitude, and the flag is how the client
+  // says so rather than sending a west greater than its east and hoping.
+  if (box.global !== true) {
+    expect(typeof box.west === "number" && typeof box.east === "number").toBe(true);
+  }
 });
 
 test("all nine asset kinds load and reach the map", async ({ page }) => {
@@ -756,11 +777,36 @@ test("the radar layer is present, unowned, and never counted as overdue", async 
    * not as owned kit, and it reports into nothing. Two properties follow, and both
    * are easy to break silently:
    *
-   *   - `owned: false`, so a count of "my assets" never quietly includes twelve sites
-   *     belonging to somebody else.
+   *   - `relationship: third_party`, so a count of "my assets" never quietly includes
+   *     twelve sites belonging to somebody else.
    *   - no `last_heard`, so it cannot be overdue. Giving radar a reporting threshold
    *     would make all twelve permanently overdue and bury the four assets that
    *     genuinely are.
+   *
+   * 🔴 THIS TEST ASSERTED A DESIGN THAT HAD BEEN DELIBERATELY REPLACED, and it went red the
+   * first time the browser suite ran after the field schema landed. It read
+   * `props.owned === false`, `props.operator === "NORAD"` and
+   * `props.position_accuracy === "approximate"`. All three props were removed when per-asset
+   * props were cut from 48 keys to 12: a single `owned` boolean put a NORAD radar site and an
+   * unidentified vessel in one bucket, so it became two axes, `relationship` and `threat`,
+   * derived and served at the top level.
+   *
+   * ⚠️ SO THE ASSERTION MOVES TO WHERE THE FACT LIVES NOW, and it is a stronger one: the value
+   * is declared once in `domain.KINDS` and derived into every payload, rather than written onto
+   * one kind by the seed and true only where somebody remembered to write it.
+   *
+   * 🔴 AND NOTHING HERE ASSERTS THE SHAPE OF `props`, WHICH IS THE HARDER LESSON. This suite ran
+   * twice on 2026-08-12 against a database shared with the deployed site, and between the two
+   * runs that deployment reseeded the world on its idle timer: every radar's props changed from
+   * `{detection_radius_km}` to the nine-key seed the deployed commit writes, and a props
+   * assertion that had just passed failed with `undefined`. Neither run was wrong. They were
+   * reading worlds written by two different seeds.
+   *
+   * ✅ THE SHARING IS FIXED: local work now runs against its own Neon branch. The assertions
+   * below stay derived anyway, because that is the stronger test and not merely the one that
+   * survives a reseed: `relationship` is declared once in `domain.KINDS` and derived into every
+   * payload, where `props.owned` was written onto one kind by the seed and true only where
+   * somebody remembered to write it.
    */
   const gotAssets = page.waitForResponse(
     (r) => r.url().includes("/api/entities") && r.status() === 200,
@@ -771,12 +817,9 @@ test("the radar layer is present, unowned, and never counted as overdue", async 
   const radars = body.entities.filter((a: { kind: string }) => a.kind === "radar");
   expect(radars).toHaveLength(12);
   for (const r of radars) {
-    expect(r.props.owned, `${r.name} must not be marked as owned`).toBe(false);
-    expect(r.props.operator).toBe("NORAD");
+    expect(r.relationship, `${r.name} must not read as ours`).toBe("third_party");
     expect(r.last_heard, `${r.name} must not report a heartbeat`).toBeNull();
-    // The approximation is declared in the data, not just in a comment, so a
-    // consumer cannot mistake these for surveyed positions.
-    expect(r.props.position_accuracy).toBe("approximate");
+    expect(r.overdue, `${r.name} cannot be late to a network it is not on`).toBe(false);
   }
 });
 

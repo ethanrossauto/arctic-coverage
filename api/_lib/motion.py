@@ -29,24 +29,28 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
-from . import terrain
+from . import domain, terrain
 from .mesh import EARTH_R_KM, haversine_km
 
 # The kinds that are contacts rather than kit of ours. They are the world being observed,
-# so their motion is ground truth and does not depend on our hearing from them. Kept beside
-# the motion rules rather than imported from `detect`, which imports this module.
-CONTACT_KINDS = frozenset({"vessel", "aircraft", "ground_party"})
+# so their motion is ground truth and does not depend on our hearing from them.
+#
+# ⚠️ THIS USED TO BE A SECOND COPY OF THE SET IN `detect`, and the comment here explained
+# that it had to be: `detect` imports this module, so importing it back was a cycle.
+# `domain` imports nothing, which is what makes one declaration reachable from both.
+CONTACT_KINDS = domain.CONTACT_KINDS
 
-_SPEED_FIELDS = (("speed_kmh", 1.0), ("cruise_kmh", 1.0), ("speed_kn", 1.852))
-
-
+# 🔑 ONE STORED SPEED, IN ONE UNIT. This was a three-way lookup over `speed_kmh`,
+# `cruise_kmh` and `speed_kn`, with a conversion factor per name, and the client had a
+# second three-way lookup of its own to render them. Three names for one quantity means
+# every consumer needs the same table and any consumer can miss a case.
+#
+# 🔑 THE UNIT ON SCREEN IS UNCHANGED, and that is the point: knots are right for a ship and
+# km/h for a patrol, so the choice moved to the display, where it belongs. Storage is
+# canonical, formatting is per kind, and neither has to know about the other.
 def _speed_kmh(row: dict[str, Any]) -> float | None:
-    props = row.get("props") or {}
-    for field_name, to_kmh in _SPEED_FIELDS:
-        value = props.get(field_name)
-        if value:
-            return float(value) * to_kmh
-    return None
+    value = (row.get("props") or {}).get("speed_kmh")
+    return float(value) if value else None
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -127,6 +131,56 @@ def _point_at(points: list[tuple[float, float]], distance_km: float) -> tuple[fl
             )
         remaining -= leg
     return points[-1]
+
+
+def _bearing_deg(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Initial great-circle bearing from a to b, in degrees.
+
+    Great circle rather than rhumb, because at 74N a rhumb bearing is wrong by degrees over
+    a leg this long, and the whole point of computing this is that it agrees with the drawn
+    track rather than nearly agreeing with it.
+    """
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    dlon = lon2 - lon1
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def heading_at(points: list[tuple[float, float]], distance_km: float) -> float:
+    """Which way something is pointing after travelling `distance_km` along `points`.
+
+    🔴 IT HAS TO KNOW WHICH WAY ROUND, and the first version did not. `_point_at` folds an
+    open route: run off the end and the asset retraces its own path rather than teleporting
+    back to the start. On that return pass it is travelling from `points[i+1]` toward
+    `points[i]`, so the leg's forward bearing is exactly backwards. Two contacts were
+    reported on a heading 179 degrees from the direction they were visibly moving, which is
+    worse than the stale number this replaced.
+
+    A closed loop never folds, so it is always forward.
+    """
+    if len(points) < 2:
+        return 0.0
+    legs = _legs(points)
+    total = sum(legs)
+    if total <= 0:
+        return 0.0
+
+    closed = points[0] == points[-1]
+    if closed:
+        remaining, reverse = distance_km % total, False
+    else:
+        folded = distance_km % (2 * total)
+        reverse = folded > total
+        remaining = folded if not reverse else (2 * total) - folded
+
+    for i, leg in enumerate(legs):
+        if remaining <= leg or i == len(legs) - 1:
+            a, b = points[i], points[i + 1]
+            return _bearing_deg(b, a) if reverse else _bearing_deg(a, b)
+        remaining -= leg
+    return 0.0
 
 
 def _offset_along(points: list[tuple[float, float]], lat: float, lon: float) -> float:
@@ -231,64 +285,26 @@ def _drift(row: dict[str, Any], hours: float) -> tuple[float, float] | None:
     return None
 
 
-# A drone lands with this much endurance still in hand rather than flying the tank dry,
-# which is what a real crew plans for and what makes the number on screen mean something.
-UAS_RESERVE_MIN = 20.0
-
-# Long enough to be a real interruption, short enough to see happen during a demo. It is a
-# battery swap and a turnaround, not a full charge from flat.
-UAS_RECHARGE_MIN = 45.0
-
+# 🔑 A DRONE HOLDS ITS ALTITUDE, LIKE ANY OTHER AIRCRAFT ON THIS MAP. It used to run a
+# fly-then-recharge cycle: `_uas_cycle` derived endurance from the clock, offset each drone
+# by a hash of its id so the fleet was out of phase, flipped `alt_m` between cruise and
+# zero, and parked the ones on the ground so they did not walk their route.
+#
+# ⚠️ IT WAS DELETED AS UNREQUESTED COMPLEXITY, and the arithmetic it produced was the tell:
+# `endurance_min_remaining`, `endurance_min_full` and `battery_pct` were written on every
+# read and consulted by nothing. A simulation of battery chemistry is not what this display
+# is for, and a fleet that lands and relaunches on a hidden timer makes the mesh flicker
+# for a reason the operator cannot see.
+#
+# 🔑 WHAT WAS KEPT IS THE ONE NUMBER THAT DECIDED SOMETHING: how far a drone can be sent.
+# `flight_radius_km` is the tasking limit, and a refusal quotes it. Endurance in minutes was
+# an indirection on top of that, and the refusal reads better without it.
 UAS_CRUISE_ALT_M = 3200.0
 
-
-def _uas_cycle(row: dict[str, Any], minutes_elapsed: float) -> dict[str, Any] | None:
-    """Where this drone is in its fly-then-recharge cycle, or None if it never flies.
-
-    🔑 ENDURANCE IS DERIVED, NOT DECREMENTED. The stored value is a full tank, and what is
-    left right now is computed from the clock, exactly like position. Nothing has to keep
-    rewriting a row as fuel burns, there is no sweeper job, and running this twice gives the
-    same answer. It is the same argument the audit log makes for not storing `overdue`.
-
-    🔑 AND THE FLEET IS DELIBERATELY OUT OF PHASE. Each drone's cycle is offset by a stable
-    hash of its id, so they do not all launch and all land together. That is what makes
-    "another one goes up when this one comes down" true across the fleet rather than a thing
-    that has to be choreographed: at any moment some are flying and some are on the pad.
-
-    ⚠️ A drone in maintenance never enters the cycle. It is unserviceable, and the tool that
-    refuses to task it says so for the same reason.
-    """
-    props = row.get("props") or {}
-    if props.get("state") == "maintenance":
-        return None
-
-    full = float(props.get("endurance_min_remaining") or 0.0)
-    if full <= UAS_RESERVE_MIN:
-        return None
-
-    flight_min = full - UAS_RESERVE_MIN
-    period = flight_min + UAS_RECHARGE_MIN
-    offset = _drift_heading_deg(str(row.get("id", ""))) / 360.0 * period
-    t = (minutes_elapsed + offset) % period
-
-    if t < flight_min:
-        remaining, state, airborne = full - t, "on_station", True
-    else:
-        charging_for = t - flight_min
-        recovered = (full - UAS_RESERVE_MIN) * (charging_for / UAS_RECHARGE_MIN)
-        remaining, state, airborne = UAS_RESERVE_MIN + recovered, "charging", False
-
-    # 🔑 THE PERCENTAGE IS COMPUTED FROM THE MINUTES, not stored beside them. They are one
-    # fact in two units, and the only way to guarantee an operator never sees "8% / 74 min"
-    # is for the second number to be arithmetic on the first. `full` is the capacity, kept
-    # so the ratio can be checked rather than taken on trust.
-    return {
-        "airborne": airborne,
-        "state": state,
-        "remaining": round(remaining, 1),
-        "full": round(full, 1),
-        "pct": round(remaining / full * 100),
-    }
+#: How far from its current position a drone may be tasked, out and back. A single declared
+#: number rather than a fuel model, because the only question this world asks of it is
+#: whether a requested point is reachable.
+UAS_FLIGHT_RADIUS_KM = 174.0
 
 
 def position_at(row: dict[str, Any], when: datetime) -> tuple[float | None, float | None]:
@@ -375,27 +391,18 @@ def advance(rows: list[dict[str, Any]], now: datetime | None = None) -> None:
         # a patrol moving at 18 km/h came back 4 km long.
         #
         # ⚠️ AND IT IS `as_of`, NOT `now`. That is the whole edit above: our own assets run
-        # on the clock of their last report, contacts run on the wall clock. Everything
-        # derived from this line inherits it, the drone's battery included, which is right:
-        # if we cannot hear a drone we cannot claim to know how much fuel it has left.
+        # on the clock of their last report, contacts run on the wall clock. A drone we
+        # cannot hear stops where it was last reported, exactly like every other asset of
+        # ours, which is the rule at the top of this file rather than a special case.
         hours = (as_of - started).total_seconds() / 3600.0
 
-        # 🔋 A DRONE BURNS ITS BATTERY, LANDS, RECHARGES AND GOES UP AGAIN. Endurance and
-        # altitude are both derived here, so the number in the info panel is the number the
-        # link model is using when it decides whether that drone is a 50 km air relay or a
-        # 25 km ground asset. Two displays of one fact cannot disagree if there is one fact.
+        # ✈️ A DRONE FLIES AT ITS CRUISE ALTITUDE AND KEEPS FLYING. It does not land, charge
+        # and relaunch on a hidden timer any more; see the note beside `UAS_CRUISE_ALT_M`.
+        # The altitude is still set here rather than trusted from the row, because it is what
+        # `mesh` reads to decide whether this is an air relay or a ground asset, and one fact
+        # in two places is how those two displays disagree.
         if row.get("kind") == "uas":
-            phase = _uas_cycle(row, hours * 60.0)
-            if phase is not None:
-                props["endurance_min_remaining"] = phase["remaining"]
-                props["endurance_min_full"] = phase["full"]
-                props["battery_pct"] = phase["pct"]
-                props["state"] = phase["state"]
-                row["alt_m"] = UAS_CRUISE_ALT_M if phase["airborne"] else 0.0
-                row["props"] = props
-            # A drone on its pad is parked, not travelling, so it never walks a route.
-            if not (row.get("alt_m") or 0) > 0:
-                continue
+            row["alt_m"] = UAS_CRUISE_ALT_M
 
         points = _track_points(row)
         speed = _speed_kmh(row)
@@ -414,7 +421,17 @@ def advance(rows: list[dict[str, Any]], now: datetime | None = None) -> None:
         # always the seeded one, because `advance` edits the rows in memory and never writes
         # back, so this stays deterministic however many times it runs.
         start_km = _offset_along(points, float(row["lat"]), float(row["lon"]))
-        lat, lon = _point_at(points, start_km + speed * hours)
+        travelled = start_km + speed * hours
+        lat, lon = _point_at(points, travelled)
         row["lat"] = round(lat, 5)
         row["lon"] = round(lon, 5)
+
+        # 🔑 STAMPED HERE, WHERE THE TRAVELLED DISTANCE IS KNOWN, because that is the only
+        # place the fold direction can be worked out. The display no longer reads a heading
+        # seeded once and never updated; it reads the direction this asset is actually
+        # moving, and `heading_source` records that it was derived rather than reported.
+        props = dict(row.get("props") or {})
+        props["heading_deg"] = round(heading_at(points, travelled))
+        props["heading_source"] = "derived"
+        row["props"] = props
 

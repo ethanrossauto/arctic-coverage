@@ -41,7 +41,17 @@ try:
 except Exception:  # noqa: BLE001
     detect = None  # type: ignore[assignment]
 
-from ._lib import executor, lifecycle, parser, plaintext, ratelimit, transcribe
+from ._lib import (
+    domain,
+    executor,
+    fields,
+    grammar,
+    lifecycle,
+    parser,
+    plaintext,
+    ratelimit,
+    transcribe,
+)
 from ._lib import llm as llmlib
 from ._lib import mesh as meshlib
 from ._lib import tools as toollib
@@ -246,6 +256,23 @@ def mesh() -> JSONResponse:
 
     payload = meshlib.mesh_status(rows)
     payload["model"] = _mesh_model()
+    # 🔑 THE SECOND GRAPH OVER THE SAME ASSETS: which sensor is holding which contact. It
+    # rides here rather than on its own endpoint because the map already polls this one and
+    # both are the same kind of thing, a set of pairs computed from live positions and never
+    # stored. Adding a third request per tick to draw one more line layer is a worse trade.
+    #
+    # ⚠️ ADDED TO THE ENDPOINT, NOT TO `meshlib.mesh_status`. The `mesh_status` TOOL answers
+    # a question about radio connectivity, and detections are not that; giving it a field it
+    # never reads would put them in an answer nobody asked for.
+    #
+    # Every pair carries `reported`, and the client draws only the ones that reach us. A
+    # sensor holding something whose uplink is down is exactly the case this project refuses
+    # to draw: the console cannot legitimately know it.
+    # ⚠️ GUARDED, BECAUSE `detect` IS OPTIONAL BY CONSTRUCTION. The import at the top of this
+    # file falls back to None so a missing detection layer costs a field and never a route.
+    # Calling it unconditionally would have turned that guarantee into a 500 on the endpoint
+    # the map polls twice a tick.
+    payload["detections"] = detect.detections(rows) if detect else []
     return JSONResponse(payload, headers={"cache-control": "no-store"})
 
 
@@ -518,6 +545,49 @@ def _dressed(cause: str = "") -> str:
         return f"{lead} {_WHAT_THIS_IS}"
     return f"{lead} {_WHAT_THIS_IS} Try {_TRY_THESE}."
 
+def _log_tier2_failed(
+    req: CommandRequest,
+    exc: llmlib.LLMUnavailable,
+    *,
+    why: str,
+    command_id: str | None = None,
+    parent_command_id: str | None = None,
+) -> None:
+    """Write down a tier-2 failure in enough detail to diagnose it from the log alone.
+
+    🔴 WHAT THIS REPLACED, AND THE DAY IT COST SOMETHING. Both failure paths wrote a row saying
+    `unparsed / rejected` with the exception squashed into one sentence, and no tier. So the
+    failures were invisible to every question anybody asks of this log: `where tier = 'llm'`
+    missed them entirely, because a call that failed was recorded as if no tier had run.
+
+    A live timeout was diagnosed by reading that one string and then going to the source for the
+    ceiling, the retry count and the measured latency, none of which were in the row. Every one
+    of them is here now, next to the utterance that provoked it.
+
+    ⚠️ tier IS 'llm' AND result IS 'error', BOTH DELIBERATE. The call was made, so the tier ran
+    and the log should say so; and by this codebase's own convention `rejected` means the request
+    was refused while `error` means the machinery did not work, which is what an unreachable
+    provider is. Both values are in the schema's check constraints, which is checked here rather
+    than assumed: a value the database refuses turns every failure into a 500.
+    """
+    db.log_event(
+        tool="tier2_failed",
+        source=req.source,
+        tier="llm",
+        result="error",
+        command_id=command_id,
+        parent_command_id=parent_command_id,
+        latency_ms=exc.elapsed_ms,
+        params={"utterance": req.utterance, "why": why, **exc.as_params()},
+        detail=(
+            f"{why}; tier 2 unavailable"
+            + (f" after {exc.elapsed_ms} ms" if exc.elapsed_ms is not None else "")
+            + (f" over {exc.attempts} attempt(s)" if exc.attempts else "")
+            + f": {exc}"
+        ),
+    )
+
+
 def _log_tier1(
     req: CommandRequest,
     plan: list[dict] | None,
@@ -532,24 +602,35 @@ def _log_tier1(
     params beside it, so the narrative is readable and the underlying values are checkable.
     """
     matched = trace.get("matched")
-    ignored = trace.get("ignored") or []
+    sentence = trace.get("grammar")
     tools_n = len(toollib.REGISTRY)
 
-    if matched and not ignored:
-        story = f"searched {tools_n} available tools, selected {matched}"
+    if matched:
+        # 🔑 THE SENTENCE, NOT ONLY THE TOOL. Which declared phrasing answered is the one thing
+        # in this row an operator could act on, and it is exactly what the reference card
+        # prints. The row that used to sit here reported which words the parser had thrown
+        # away, because a branch could answer half a question; an anchored grammar accounts for
+        # every word by construction, so there is nothing left to report as dropped.
+        story = f'matched the declared command "{sentence}", so {matched} ran with no model call'
         result = "ok"
-    elif matched and ignored:
-        story = (
-            f"searched {tools_n} available tools, matched {matched} but could not account "
-            f"for {', '.join(ignored)}; a partial match is not an answer, so escalating"
-        )
-        result = "escalated"
     else:
         story = (
-            f"searched {tools_n} available tools, no deterministic match for this phrasing; "
+            f"searched {tools_n} available tools, no declared command matches this phrasing; "
             "escalating to the reasoning layer"
         )
-        result = "escalated"
+        # 🔴 THIS WAS `"escalated"` AND THE DATABASE HAS BEEN REFUSING IT ALL ALONG. The check
+        # constraint allows ok, rejected, clarify and error, so every insert raised, and
+        # `log_event` is wrapped below in a try that swallows anything rather than taking a
+        # command down. The result: tier 1 has never once logged an escalation, silently, while
+        # the row for a successful match wrote fine. The log looked healthy and was missing the
+        # half that says when the model gets used and why.
+        #
+        # ⚠️ `rejected` IS THE HONEST FIT AMONG THE FOUR, and the tool name is what keeps it
+        # unambiguous: `tier1_parse` + `rejected` is this tier declining, where `unsupported` +
+        # `rejected` is the console declining to the operator. Adding `escalated` to the
+        # constraint would be better and is a migration on two live databases, which is a
+        # decision rather than a fix.
+        result = "rejected"
 
     try:
         db.log_event(
@@ -562,7 +643,8 @@ def _log_tier1(
             params={
                 "utterance": req.utterance,
                 "matched": matched,
-                "ignored": ignored,
+                "grammar": sentence,
+                "declined": trace.get("declined"),
                 "extracted": trace.get("extracted") or {},
             },
             detail=story,
@@ -720,25 +802,24 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
         # README rather than something anyone can check afterwards.
         _log_tier1(req, plan, thinking, command_id=command_id)
 
-        # 🔴 A PARTIAL MATCH IS NOT AN ANSWER, and this is where it stops being presented as
-        # one. Every tier-1 branch matches on part of an utterance and returns on the first
-        # hit, so words outside that part are dropped in silence:
+        # 🔴 THE PARTIAL-MATCH ESCALATION USED TO LIVE HERE, AND IT IS GONE BECAUSE THE
+        # CONDITION IT TESTED CAN NO LONGER ARISE. Tier 1 was thirty branches, each matching
+        # its keywords anywhere in the sentence, so a branch could answer part of an utterance
+        # and drop the rest in silence:
         #
         #   "show me all unkown parties"          -> the ground parties
         #   "show me all unkown parties on foot"  -> the SAME ground parties
         #
-        # Two different questions, one byte-identical answer, nothing anywhere admitting
-        # that "unkown" and "on foot" were thrown away. The parser's own contract says it
-        # declines rather than half-matching, and `trace` is what finally makes a half
-        # match visible enough to act on.
+        # This block caught that after the fact, by asking `trace` which words appeared nowhere
+        # in the plan and escalating when any did, keeping the partial plan as a fallback.
         #
-        # ⚠️ THE PARSER PLAN IS KEPT AS A FALLBACK, NOT DISCARDED. If the model is rate
-        # limited or unavailable, a partial answer WITH its dropped words named is better
-        # than no answer at all, and the trace travels with it either way.
+        # 🔑 THE GRAMMAR REMOVED THE FAILURE RATHER THAN THE SYMPTOM. Every sentence tier 1
+        # accepts is now anchored to the WHOLE utterance, so a match accounts for every word by
+        # construction and a non-match produces no plan at all. There is no half-understood
+        # plan left to keep, and no dropped-word list left to test. `fallback` went with it:
+        # what it protected was the case where tier 1 had *something* and the model was
+        # unavailable, and tier 1 now either has the answer or has nothing.
         fallback: list[dict] | None = None
-        if plan is not None and thinking["ignored"]:
-            fallback = plan
-            plan = None
 
         if plan is None:
             # ---- TIER 2 ----------------------------------------------------
@@ -773,14 +854,12 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                     _model_context(req.context, heard=req.heard, running=req.utterance),
                 )
             except llmlib.LLMUnavailable as exc:
-                db.log_event(
-                    tool="unparsed",
-                    source=req.source,
-                    result="rejected",
+                _log_tier2_failed(
+                    req,
+                    exc,
+                    why="no deterministic parse",
                     command_id=command_id,
                     parent_command_id=req.parent_command_id,
-                    params={"utterance": req.utterance},
-                    detail=f"no deterministic parse; tier 2 unavailable: {exc}",
                 )
                 if fallback is None:
                     return JSONResponse(
@@ -827,10 +906,18 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                     "latency_ms": selection.usage.get("latency_ms"),
                     "cost_usd": selection.usage.get("cost_usd"),
                 }
-                # Only when tier 1 actually looked and came up short. A phrasing it never
-                # recognised at all has an empty trace, and showing "ignored: nothing" would
-                # imply it had an opinion it does not have.
-                if handed_over and (handed_over.get("ignored") or handed_over.get("matched")):
+                # 🔑 ATTACHED ON EVERY ESCALATION NOW, AND THAT CHANGED WITH THE GRAMMAR. It
+                # used to be attached only when tier 1 had matched something or had words it
+                # could not place, on the reasoning that a phrasing it never recognised at all
+                # has no opinion worth showing and "ignored: nothing" would imply one.
+                #
+                # Tier 1 has an opinion on every utterance now: `declined` says whether the
+                # sentence was near a declared command or nowhere close, which is the difference
+                # between "say it the printed way and it is instant and free" and "this needed
+                # the model". That is the most useful thing on the screen during a wait.
+                if handed_over and (
+                    handed_over.get("matched") or handed_over.get("declined")
+                ):
                     thinking["parser"] = handed_over
                 # 🔑 The model call is logged BEFORE the plan runs, with its own cost. That
                 # ordering matters: a plan the validator then rejects still cost money, and an
@@ -1033,9 +1120,60 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
     # something to read during a wait is the small reason. The real one is that a dropped
     # word is invisible in an answer and obvious in a trace.
     outcome["thinking"] = thinking
+
+    # 🔑 TEACH THE FAST PATH AT THE MOMENT IT WOULD HAVE HELPED. The model just reached a
+    # tool the deterministic tier can reach for nothing, so the operator is shown the
+    # sentence that gets there directly. It is the same list the reference card is built
+    # from, which is the point: one canonical phrasing per tool, learned either by reading
+    # the card before or by being shown it after.
+    #
+    # ⚠️ ONLY AFTER TIER 2, because after tier 1 there is nothing to teach: the operator
+    # already said something the parser answered.
+    #
+    # ⚠️ AND IT IS NOT A TRANSLATION OF WHAT THEY ASKED. "Which hydrophones have gone
+    # quiet" is not the same question as "show the hydrophones"; the tool is the same. So
+    # the wording says the tool is reachable without the model rather than claiming the two
+    # sentences are equivalent, because they are not and an operator would find that out.
+    if tier == "llm":
+        outcome["teach"] = _teach(outcome.get("plan"))
+
     # `plan` is set by the executor and is the RESOLVED one; do not overwrite it with the
     # pre-resolution copy this function still holds.
     return JSONResponse(outcome, headers={"cache-control": "no-store"})
+
+
+def _teach(plan: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """The deterministic phrasing for every tool a model plan reached.
+
+    🔑 TEACHES THE FAST PATH AT THE MOMENT IT WOULD HAVE HELPED. The model just used a tool
+    the parser can reach for nothing, so the operator is shown the sentence that gets there
+    directly. It is the same one-per-tool list the reference card is built from, so reading
+    it beforehand and being shown it afterwards teach the same words.
+
+    ⚠️ NOT A TRANSLATION OF THE QUESTION. "Which hydrophones have gone quiet" is not the
+    same question as "show the hydrophones"; only the tool is the same. The caller words it
+    as "reachable without the model" rather than "next time say this", because an operator
+    who tried the substitution and got a different answer would stop believing the line.
+
+    ⚠️ AND IT LIVES HERE BECAUSE THERE ARE TWO TIER-2 PATHS. The direct one and the
+    escalation have drifted apart before, and a capability that exists on one of them is a
+    capability that works depending on how the question was phrased.
+    """
+    # 🔑 THE VALUES FROM THIS ANSWER, NOT THE CARD'S EXAMPLE. `phrase_for` fills the declared
+    # sentence from the plan the model actually produced, so asking about FLS Resolute Bay is
+    # answered with "tell me about FLS Resolute Bay" rather than the card's Daymark. The card
+    # teaches the shape before; this teaches the sentence they could have said.
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for step in plan or []:
+        name = step.get("tool")
+        if not name or name in seen or name not in toollib.REGISTRY:
+            continue
+        seen.add(name)
+        say = grammar.phrase_for(name, step.get("params") or {})
+        if say:
+            out.append({"tool": name, "say": say})
+    return out
 
 
 def _escalate_to_tier_two(
@@ -1086,11 +1224,12 @@ def _escalate_to_tier_two(
             req.utterance, _model_context(context, heard=req.heard, running=req.utterance)
         )
     except llmlib.LLMUnavailable as exc:
-        db.log_event(
-            tool="unparsed", source=req.source, result="rejected",
-            command_id=parent, parent_command_id=parent,
-            params={"utterance": req.utterance, "escalated_from": "parser"},
-            detail=f"tier 1 named something that does not exist; tier 2 unavailable: {exc}",
+        _log_tier2_failed(
+            req,
+            exc,
+            why="tier 1 named something that does not exist",
+            command_id=parent,
+            parent_command_id=parent,
         )
         return None
 
@@ -1187,6 +1326,7 @@ def _escalate_to_tier_two(
     # case where tier 1 had already given up, so without it the answer arrives with no sign
     # that anything understood the question.
     _lead_in(outcome, selection.reasoning)
+    outcome["teach"] = _teach(outcome.get("plan"))
     return JSONResponse(outcome, headers={"cache-control": "no-store"})
 
 
@@ -1251,8 +1391,25 @@ async def transcribe_audio(request: Request) -> JSONResponse:
     # mechanism a clarification uses, and deliberately so: both are cases where one
     # interaction spans more than one request.
     command_id = str(uuid.uuid4())
+    # 🔑 NO TIER, AND THE COLUMN'S OWN DEFINITION IS THE ARGUMENT. `db/schema.sql` calls it
+    # "which tier produced the plan"; transcription produces no plan. It turns audio into a
+    # sentence and stops, so the honest value is null.
+    #
+    # 🔴 IT WAS `llm` AND THAT BROKE THE ONE QUESTION THE COLUMN EXISTS FOR. Every spoken
+    # command looked as though it had reached the reasoning tier, so "the model is only
+    # called when it earns its latency" stopped being answerable here, and the badge chain
+    # read `llm → parser` for a command tier 1 had answered by itself.
+    #
+    # ⚠️ AND IT WAS BRIEFLY `transcribe`, WHICH THE DATABASE REFUSED. `events_tier_check`
+    # allows null, 'parser' or 'llm' and nothing else, so every spoken command 500'd. The
+    # suite could not see it: those tests run on fixtures with no database, so a constraint
+    # is not in the room. That the fix is null rather than a wider constraint is lucky
+    # rather than clever, but it is also the right answer on the merits.
+    #
+    # The model that ran is not lost: `tool` says `transcribe`, and `params` carries the
+    # model name, the token counts and the latency.
     db.log_event(
-        tool="transcribe", source="voice", tier="llm", result="ok",
+        tool="transcribe", source="voice", result="ok",
         command_id=command_id,
         params={k: v for k, v in out.items() if k != "text"},
         detail=out["text"],
@@ -1278,10 +1435,32 @@ async def transcribe_audio(request: Request) -> JSONResponse:
 def tools_list() -> JSONResponse:
     """The registry as data.
 
-    One source for the model's prompt and the UI's button list, so a tool that exists is
-    reachable from both and a tool that is removed disappears from both at once.
+    One source for the model's prompt, the UI's button list and the command reference the
+    console shows an operator, so a tool that exists is reachable from all three and a tool
+    that is removed disappears from all three at once.
+
+    `reference` is the same registry grouped by operator intent rather than by tool name,
+    because `set_visible_kinds` is a schema word and "hide the radars" is what a person
+    says. Every phrasing in it is exercised against the parser by the suite.
     """
-    return JSONResponse({"tools": toollib.schemas()})
+    return JSONResponse({"tools": toollib.schemas(), "reference": toollib.reference()})
+
+
+@app.get("/api/schema")
+def asset_schema() -> JSONResponse:
+    """Every field an asset can carry, declared once and served to whoever draws it.
+
+    🔑 THE PANEL'S SHAPE IS NOW SERVER-OWNED. It used to be a hand-written row list inside a
+    React component, so the operator-facing shape of an asset lived somewhere the server
+    could not see and nothing could check. Same argument as the command reference: a second
+    list maintained by hand is a list that drifts.
+
+    Static for the life of the process, so it is the one response here that may be cached.
+    """
+    return JSONResponse(
+        {"fields": fields.schema(), "kinds": sorted(domain.KINDS)},
+        headers={"cache-control": "public, max-age=300"},
+    )
 
 
 @app.get("/api/events")

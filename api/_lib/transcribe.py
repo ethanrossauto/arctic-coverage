@@ -23,6 +23,11 @@ import os
 import time
 from typing import Any
 
+# ⚠️ SAFE AT MODULE LEVEL, UNLIKE `db` AND THE PARSER BELOW. The grammar imports nothing but
+# the standard library, so the spoken vocabulary can be built at import time and voice still
+# survives a database that will not answer.
+from . import grammar
+
 # Whisper-class models will happily "transcribe" silence into a plausible sentence, and a
 # hallucinated command is worse than no command, so anything shorter than this is refused
 # before it costs anything.
@@ -75,9 +80,10 @@ MODEL = "gemini-3.5-flash-lite"
 # the display has for distinguishing "it did not hear me" from "it did not understand me",
 # and those need completely different reactions from the person at the keyboard.
 #
-# Spelling is a different matter and is still corrected: the vocabulary hint below exists so
-# that "Daymark" does not arrive as "day mark". Fixing how a word is written is not the same
-# as deciding which words were said.
+# Which WORD was said is a different matter and is still resolved: the vocabulary hint below
+# exists so that "Daymark" does not arrive as "day mark" and "hydrophone" does not arrive as
+# "hydro phone". Deciding which word the audio carried is not the same as deciding which
+# sentence the speaker meant.
 PROMPT = (
     "Transcribe this audio verbatim. Write down every word that was spoken, in the order "
     "they were spoken. Do NOT shorten it, do not turn it into a command, do not drop "
@@ -107,11 +113,16 @@ JSON_INSTRUCTION = (
     '"heard": the verbatim transcription described above, using ONLY the words actually '
     "spoken. Never substitute a name from any list into this field, never expand a plural "
     "into individual names, and never add a word the speaker did not say.\n"
-    '"command": the same sentence with any proper noun corrected to the spelling used on '
-    "the map, and with spoken numbers written as digits. If nothing needed correcting, "
-    'repeat "heard" exactly.\n'
+    '"command": the SAME SENTENCE, word for word, with one kind of change and no other: a word '
+    "whose SOUND is close to a term in the list below is resolved to that term, and spoken "
+    "numbers are written as digits. Do NOT rephrase, reorder, shorten or complete anything, and "
+    "never replace a sentence with a different one that happens to use listed words. If nothing "
+    'in the audio was close to a listed term, repeat "heard" word for word. NEVER add a number, '
+    "suffix or identifier the speaker did not say: resolving which word was said is allowed, "
+    "completing a name is not. If the audio matches the word part of several listed names, "
+    "write only that word part.\n"
     'If the audio contains no intelligible speech, set both fields to "NO_SPEECH".\n'
-    "⚠️ The names listed below exist to spell real speech correctly. NEVER assemble a "
+    "⚠️ The terms listed below exist to decide which word real speech carried. NEVER assemble a "
     "command out of them to fill silence, faint audio or noise: if you cannot make out "
     'actual words, the answer is "NO_SPEECH", not a plausible sentence.'
 )
@@ -127,34 +138,80 @@ JSON_INSTRUCTION = (
 # and it improves exactly the utterances that matter most, because a misheard asset name
 # is a command that resolves to nothing or, worse, to the wrong asset.
 #
-# ⚠️ IT IS A HINT, NOT A CONSTRAINT. The instruction says prefer these spellings when the
-# audio is close, never force them. An operator who says a word that is not on the map
+# ⚠️ IT IS A HINT, NOT A CONSTRAINT. The instruction says lean toward these when the audio is
+# close, never force them. An operator who says a word that is not on the map
 # must still be transcribed faithfully, or "place a marker at Fury and Hecla" becomes
 # impossible to say the first time.
 
-# What people say that is not a name: the verbs the parser listens for, the states the
-# display shows, and the domain nouns. A misheard verb loses the whole command even when
-# every name in it was perfect.
-COMMAND_VOCABULARY: tuple[str, ...] = (
-    # what to do
-    "isolate", "frame", "focus", "zoom out", "reset the view", "place", "remove", "delete",
-    "task", "send", "history", "track", "describe", "show", "list", "filter",
-    # 🔑 CHANGING WHAT IS DRAWN, and these are the words a test cannot notice are missing.
-    # The vocabulary check pins the static half to the code's enums, so a new fault, overlay
-    # or kind gets caught automatically. A new VERB is in no enum at all: nothing knew the
-    # display had learned "hide" until somebody said it and got the wrong command back, with
-    # every asset name in the sentence heard perfectly.
-    "hide", "unhide", "only", "except", "show only", "hide everything except",
-    "show all assets", "show everything", "bring back",
-    # breaking and fixing, which are near-homophones of ordinary words
-    "kill", "silence", "take down", "fault", "maintenance", "unserviceable", "out of service",
-    "fix", "repair", "restore", "clear the fault",
-    # the states the map draws
-    "overdue", "nominal", "silent", "isolated", "unreachable", "not broadcasting", "dark",
-    "tracked", "untracked", "undetected", "coverage", "blind spot",
-    # domain nouns that sound like other words
-    "mesh", "backhaul", "gateway", "uplink", "AIS", "sea ice", "concentration",
-    "hydrophone", "sonobuoy", "beacon", "heartbeat", "endurance", "on station",
+# 🔑 WHAT BELONGS IN A HINT LIST IS WHAT IS HARD TO HEAR, NOT WHAT IS IMPORTANT.
+# "Spelling" is a typing idea and this is audio: there is no misspelling, only a
+# word the transcriber resolved to the wrong word. So the question for every candidate term is
+# not "does the console act on it" but "would a general model get this wrong", and most command
+# verbs fail that test in the useful direction. "Show", "hide", "remove" and "fix" are ordinary
+# English a transcriber has never once dropped, and listing them dilutes the terms that need the
+# weight and gives the model more phrasings to snap a near miss onto.
+#
+# 🔴 I HAD THIS WRONG TWICE, IN OPPOSITE DIRECTIONS, IN ONE DAY. First the list was everything
+# tier 1 declares, which lost "isolate" and "take down" the moment the grammar was cut. Then it
+# was everything a person might say, which put whole sentences in front of the model and turned
+# a spoken "show me all the hydrophones" into "show the hydrophones" on screen. Both were the
+# same error: choosing terms by what the SYSTEM cares about rather than by what the EAR gets
+# wrong.
+#
+# ⚠️ THE NAMES ARE NOT HERE, AND THAT IS THE OTHER HALF. Asset names and ids come from the live
+# world in `_live_vocabulary`, which is the genuinely proper-noun half and cannot go stale. This
+# tuple is the domain vocabulary around them.
+HARD_TO_HEAR: tuple[str, ...] = (
+    # Initialisms, the worst case for any transcriber, and the two here are the ones a demo
+    # cannot afford on screen: "UAS" arrives as "you ass" or "USA", "AIS" as "eyes".
+    "UAS", "AIS",
+    # Domain nouns a general model has never met in this sense.
+    "hydrophone",   # "hydro phone", "high drofone"
+    "sonobuoy",     # "sono boy" -- buoy is the classic one
+    "backhaul",     # "back haul", "backhoe"
+    "uplink",       # "up link"
+    "emitting",     # "a meeting"
+    "unserviceable",  # "un serviceable", "on serviceable"
+    # Ordinary words that collide with a MORE ordinary word, which is the dangerous shape: the
+    # transcript reads as a plausible English sentence and nobody can see what went wrong.
+    "isolate",      # "I so late"
+    "patrol",       # "petrol"
+    "launch site",  # "lunch site"
+    "node",         # "known", "nod"
+    "ice",          # "eyes"
+    "sea ice",      # "see eyes"
+    "beacon",       # "bacon"
+    "marker",       # "mark her"
+    "quiet",        # "quite", and "gone quiet" is how an operator asks the flagship question
+    "mesh",         # "mash", "mess"
+    "unknowns",     # "no ones"
+    # Domain jargon: rare enough in ordinary speech to be worth the weight.
+    "overdue", "nominal", "fault", "maintenance", "not broadcasting", "dark",
+)
+
+#: The rest of the likely vocabulary: the command words themselves. Ordinary English, rarely
+#: misheard, and worth listing anyway because they are what the operator is most likely to say
+#: and the model is being asked to lean toward what is likely.
+#:
+#: 🔧 DERIVED FROM `grammar.RULES`, so a verb the language gains is hinted the day it is
+#: declared. A command verb is in no enum, so nothing else would have noticed: the display
+#: learned "hide" once while the transcriber had not, and `recent_activity` was reachable by
+#: typing and unsayable for a day.
+#:
+#: ⛔ WORDS, NEVER PHRASES, AND THAT IS NOT A STYLE PREFERENCE. This list held the filled card
+#: sentences for a few hours, and a spoken "show me all the hydrophones" came back on screen as
+#: "show the hydrophones": a phrase in the list is a phrase the model can snap a near miss onto,
+#: and the operator reads their own words rewritten into words they did not say. A single word
+#: can only decide which word was said.
+_LIKELY: tuple[str, ...] = tuple(grammar.spoken_terms())
+
+#: Enum values a person can say that neither list above would otherwise carry. The suite pins
+#: every fault, overlay and flag to this vocabulary, so a new one is caught here rather than by
+#: somebody saying it into a microphone and getting the wrong command back.
+_SAYABLE_VALUES: tuple[str, ...] = ("silent",)
+
+COMMAND_VOCABULARY: tuple[str, ...] = tuple(
+    dict.fromkeys([*HARD_TO_HEAR, *_LIKELY, *_SAYABLE_VALUES])
 )
 
 # The map is small, so every name fits. A world of thousands would need the visible ones
@@ -217,10 +274,10 @@ def _live_vocabulary() -> list[str]:
     terms: list[str] = list(COMMAND_VOCABULARY)
 
     try:
-        from . import db, parser  # noqa: PLC0415 - deferred; voice must survive their absence
+        from . import db  # noqa: PLC0415 - deferred; voice must survive its absence
 
         # The spoken forms of every kind: "drone", "uas", "ranger", "launch site".
-        terms.extend(parser.KIND_WORDS.keys())
+        terms.extend(grammar.KIND_WORDS.keys())
 
         for row in db.fetch_entities():
             name = (row.get("name") or "").strip()
@@ -234,6 +291,26 @@ def _live_vocabulary() -> list[str]:
                 terms.append(ident.replace("-", " "))
     except Exception:  # noqa: BLE001 - the static vocabulary still helps
         pass
+
+    # 🔴 THE FAMILY NAME, NOT ONLY THE INSTANCES. Five drones are called "Daymark 01"
+    # through "Daymark 05" and nothing on this list was ever just "Daymark", so a speaker
+    # who said the bare family name had no legal spelling to land on and the nearest match
+    # was always a specific one. "What is daymark" arrived as "what is daymark 01", which
+    # is not a mishearing: the instruction says to resolve a word toward the listed term it
+    # sounds like, and the only listed forms were numbered.
+    #
+    # ⚠️ AND IT KILLED AMBIGUITY HANDLING ON THE SPOKEN PATH. Asking about "daymark" is
+    # supposed to produce a question and five buttons. Resolved to one drone before the
+    # parser ever sees it, the question can never be asked, so a feature that works when
+    # typed was dead when spoken. Nothing could see that: the automated probe reaches the
+    # transcription boundary and stops.
+    #
+    # The stem is added ALONGSIDE the instances, never instead of them, so "daymark oh one"
+    # still has an exact match to prefer.
+    for term in list(terms):
+        stem = term.rsplit(" ", 1)[0] if " " in term else ""
+        if stem and term.rsplit(" ", 1)[1].isdigit():
+            terms.append(stem)
 
     # Deduplicate case-insensitively while keeping the first spelling seen, so the model
     # is shown "Barrow Strait 05" rather than a lower-cased version of it.
@@ -263,11 +340,12 @@ def build_prompt() -> str:
 
     return (
         PROMPT
-        + "\n\nThe speaker is looking at a map containing these names and is likely to "
-        'say some of them. These names apply to the "command" field ONLY: when the audio '
-        'is a close match to one, use its spelling exactly as written here in "command". '
-        "Do NOT force a match: if the speaker clearly says something else, keep what they "
-        'said. The "heard" field never uses this list at all.\n'
+        + "\n\nBelow are the words most likely to be spoken to this display: the names on the "
+        "map, and the domain terms a transcriber most often resolves to the wrong word. They "
+        'apply to the "command" field ONLY. Lean toward them when the audio is close, most of '
+        "all for the ones that sound like an ordinary English word. Do NOT force a match: if "
+        "the speaker clearly said something else, keep what they said, and a word that is not "
+        'here is not wrong. The "heard" field never uses this list at all.\n'
         + ", ".join(vocabulary)
         + "\n\nCoordinates are spoken as numbers and must be written as digits: "
         '"seventy three point two minus ninety five point nine" is "73.2 -95.9". '

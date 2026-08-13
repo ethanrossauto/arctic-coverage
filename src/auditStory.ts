@@ -116,6 +116,9 @@ const LABELS: Record<string, string> = {
   rate_limited: "spend guard",
   unsupported: "parser",
   unparsed: "model",
+  // A tier-2 call that was made and did not come back. It reads as the model's row because
+  // that is whose failure it was, and the panel shows the reason beside it.
+  tier2_failed: "model",
   world_reset: "world",
 };
 

@@ -28,7 +28,17 @@ from fastapi.testclient import TestClient
 # next to the thing that needs it rather than in a config file nothing else requires.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from api._lib import db, executor, freshness, llm, parser, terrain, tools, transcribe  # noqa: E402
+from api._lib import (  # noqa: E402
+    db,
+    executor,
+    freshness,
+    grammar,
+    llm,
+    parser,
+    terrain,
+    tools,
+    transcribe,
+)
 
 NOW = datetime.now(UTC)
 
@@ -148,8 +158,9 @@ def writes(monkeypatch) -> list[dict]:
 
 def test_overdue_is_not_a_condition_filter():
     """The regression itself. "Overdue" used to be an alias for a different question."""
-    plan = parser.parse("which assets are overdue")
-    assert plan == [{"tool": "list_entities", "params": {"overdue": True}}]
+    # ⚠️ `overdue` IS A PARAMETER AND HAS NO SENTENCE OF ITS OWN on tier 1 (one wording per
+    # tool), so the distinction being asserted lives in the tool rather than in the phrasing.
+    assert parser.parse("which assets are overdue") is None
 
 
 def test_overdue_and_maintenance_name_different_sets(world, log):
@@ -195,18 +206,42 @@ def test_overdue_counts_from_the_instant_not_the_wall_clock():
 @pytest.mark.parametrize(
     "utterance,target,days",
     [
-        ("show me 4 days of history for daymark-3", "daymark-3", 4.0),
-        ("show me the history of daymark 3 over the last 3 days", "daymark 3", 3.0),
-        ("history for daymark-3 this week", "daymark-3", 7.0),
-        ("history for daymark 3 for the last 12 hours", "daymark 3", 0.5),
         ("where has daymark 3 been", "daymark 3", 1.0),
-        ("daymark-3 history", "daymark-3", 1.0),
+        ("where has daymark-3 been", "daymark-3", 1.0),
     ],
 )
 def test_history_reads_a_window_and_a_target(utterance, target, days):
-    """Both orderings people actually use: duration before the name, and after it."""
+    """The declared sentence. The window is fixed at a day, and asking for another goes to
+    the model.
+
+    ⚠️ THIS TEST USED TO CARRY SIX PHRASINGS AND NOW CARRIES ONE FRAME, which is the exact
+    trade the grammar makes. "Show me 4 days of history for daymark-3", "history for daymark-3
+    this week" and "daymark-3 history" were four ways to say one thing, matched by stripping
+    time words out of whatever a loose pattern had captured. That stripping is what produced
+    targets like "location this asset", and it is gone: the frame is fixed, the window is a
+    parameter, and the other phrasings escalate to the model, which answers them correctly.
+    """
     plan = parser.parse(utterance)
     assert plan == [{"tool": "entity_history", "params": {"target": target, "days": days}}]
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "show me 4 days of history for daymark-3",
+        "history for daymark-3 this week",
+        "daymark-3 history",
+        "where has daymark 3 been lately",
+        # A window is a PARAMETER, and one sentence per tool means this tool's sentence fixes
+        # it at a day. `entity_history` still takes `days`, so the model reaches it.
+        "where has daymark 3 been in the last 3 days",
+    ],
+)
+def test_an_undeclared_history_phrasing_escalates_whole(utterance):
+    """🔑 THE POINT OF THE TRADE. An undeclared phrasing is not half-answered with whatever a
+    pattern could salvage; it goes to the tier that can read it, entire. `None` is the whole
+    mechanism, and it is what these six phrasings cost and bought."""
+    assert parser.parse(utterance) is None
 
 
 def test_history_degrades_honestly_when_nothing_records_positions(world, log, monkeypatch):
@@ -493,9 +528,14 @@ def test_a_human_move_is_recorded_as_intent_not_as_a_do_not_touch_flag(world, lo
     writes.clear()
     tools.task_uas(target="Daymark 05", lat=71.2, lon=-97.4)
     props = writes[0]["props"]
-    assert props["state"] == "on_station"
     assert props["station"] == [71.2, -97.4]
     assert props["motion_frozen"] is True
+    # ⚠️ AND `state` IS NOT WRITTEN, which is the point rather than an omission. It used to
+    # be set to "on_station" beside the station itself: two fields for one fact, where the
+    # second one carries the coordinates and the first only asserts that they exist. Nothing
+    # read it once the drone's flight cycle went, so it would have been a value the display
+    # wrote to itself.
+    assert "state" not in props
 
 
 def test_every_kind_the_database_accepts_can_be_placed(world, log, writes):
@@ -506,6 +546,107 @@ def test_every_kind_the_database_accepts_can_be_placed(world, log, writes):
     declared = re.search(r"kind in \(([^)]*)\)", schema).group(1)
     in_db = {k.strip().strip("'") for k in declared.split(",")}
     assert in_db == set(tools.PLACEABLE_KINDS)
+
+
+def test_every_result_the_code_writes_is_a_result_the_database_accepts():
+    """The twin of the tier test below, and it was missing while the tier one existed.
+
+    🔴 THE SAME FAILURE IS AVAILABLE THROUGH `result`, and nothing was comparing the two lists.
+    A tier-2 failure now writes `result="error"`, which is legal, but the next value somebody
+    reaches for might not be: the constraint allows exactly ok, rejected, clarify and error, the
+    suite runs on fixtures with no database, and a refused insert surfaces as a 500 on whatever
+    path happened to be logging. One list in SQL, one in Python, nothing checking them.
+    """
+    schema = (Path(__file__).resolve().parents[1] / "db" / "schema.sql").read_text()
+    declared = re.search(r"result in \(([^)]*)\)", schema).group(1)
+    allowed = {v.strip().strip("'") for v in declared.split(",")}
+
+    written = set()
+    for path in (Path(__file__).resolve().parents[1] / "api").rglob("*.py"):
+        for match in re.finditer(r'result\s*=\s*"([a-z0-9_]+)"', path.read_text()):
+            written.add(match.group(1))
+
+    unknown = sorted(written - allowed)
+    assert not unknown, (
+        f"the code writes result={unknown} and the database only accepts {sorted(allowed)}, so "
+        "those rows are refused at insert time and no fixture-based test can see it"
+    )
+
+
+def test_a_tier_two_failure_is_logged_with_enough_to_diagnose_it(world, log, monkeypatch):
+    """🔴 WRITTEN AFTER A LIVE FAILURE THAT THE LOG COULD NOT EXPLAIN. Production answered a
+    command with "tier 2 unavailable: APITimeoutError", and everything needed to act on that was
+    somewhere else: the client's ceiling, its retry count, how long the operator actually waited,
+    and which model. The row is the artifact somebody reads afterwards, so it carries them now.
+
+    ⚠️ AND IT IS A TIER-2 ROW, WHICH IT WAS NOT. It used to log as `unparsed` with no tier at
+    all, so `where tier = 'llm'` missed every failure this tier ever had: the log could report
+    what the model cost when it worked and nothing at all when it did not.
+    """
+    from api import index
+
+    def boom(*_args, **_kwargs):
+        raise llm.LLMUnavailable(
+            "APITimeoutError: Request timed out",
+            kind="APITimeoutError",
+            model="claude-opus-5",
+            elapsed_ms=30_012,
+            attempts=2,
+            timeout_s=15.0,
+        )
+
+    monkeypatch.setattr(llm, "default_provider", lambda: type("P", (), {"select": boom})())
+    monkeypatch.setattr(index.ratelimit, "origin_allowed", lambda origin: True)
+    monkeypatch.setattr(index.ratelimit, "check", lambda ip: type("V", (), {"allowed": True})())
+
+    client = TestClient(index.app)
+    client.post("/api/command", json={"utterance": "what is this map about", "source": "typed"})
+
+    rows = [r for r in log if r["tool"] == "tier2_failed"]
+    assert len(rows) == 1, "a tier-2 failure writes exactly one row, and it is its own row"
+    row = rows[0]
+    assert row["tier"] == "llm" and row["result"] == "error"
+    assert row["latency_ms"] == 30_012, "how long the operator waited is the row's own column"
+
+    params = row["params"]
+    assert params["error"] == "APITimeoutError"
+    assert params["model"] == "claude-opus-5"
+    assert params["attempts"] == 2 and params["timeout_s"] == 15.0
+    assert params["why"] == "no deterministic parse"
+    # 🔑 THE READING, NOT JUST THE NUMBERS. Spending the whole ceiling and failing fast are
+    # opposite diagnoses, and the row says which rather than leaving the arithmetic to a reader.
+    assert "upstream slow or unreachable" in params["verdict"]
+
+
+def test_every_tier_the_code_writes_is_a_tier_the_database_accepts():
+    """The tier values in the code and the check constraint are two copies of one list.
+
+    🔴 THIS TEST EXISTS BECAUSE THE MISSING VERSION OF IT COST A WORKING FEATURE. Logging
+    transcription as `tier="transcribe"` was reasonable, passed lint, types and 300 tests,
+    and made every spoken command return a 500: the constraint allows null, 'parser' or
+    'llm'. The suite runs on fixtures with no database, so a constraint violation is not
+    something it can see, and the first thing that noticed was a person pressing the
+    microphone.
+
+    ⚠️ THE SAME SHAPE AS THE PLACEABLE-KIND TEST ABOVE, and that one existed already. A
+    constraint is a list maintained in a different language in a different file, and the
+    only way it stays in step is for something to compare them.
+    """
+    schema = (Path(__file__).resolve().parents[1] / "db" / "schema.sql").read_text()
+    declared = re.search(r"tier in \(([^)]*)\)", schema).group(1)
+    allowed = {v.strip().strip("'") for v in declared.split(",")}
+
+    source = (Path(__file__).resolve().parents[1] / "api").rglob("*.py")
+    written = set()
+    for path in source:
+        for match in re.finditer(r'tier\s*=\s*"([a-z0-9_]+)"', path.read_text()):
+            written.add(match.group(1))
+
+    unknown = sorted(written - allowed)
+    assert not unknown, (
+        f"the code writes tier={unknown} and the database only accepts {sorted(allowed)} or "
+        "null, so those rows are refused at insert time and no fixture-based test can see it"
+    )
 
 
 def test_every_placeable_kind_has_a_medium_classified():
@@ -788,14 +929,14 @@ def test_down_is_a_condition_only_where_it_says_something_is_down():
     the drones" as a maintenance filter and answered with one asset, confidently and
     wrongly. "Down" is a direction and half of a dozen phrasal verbs before it is ever a
     condition. Same class of collision as "dark", and the same fix."""
-    for said in ("which nodes are down", "what is down", "show me anything down"):
-        assert parser.parse(said) == [
-            {"tool": "list_entities", "params": {"status": "maintenance", **({"kind": "node"} if "nodes" in said else {})}}
-        ]
-
-    # The phrasing that actually bit, plus its relatives.
-    assert parser.parse("narrow it down to the drones") is None
-    assert parser.parse("cut it down to the vessels") is None
+    # 🔑 THE WORD IS NOT IN THE LANGUAGE AT ALL NOW, WHICH IS STRONGER THAN A GUARDED KEYWORD.
+    # The rule used to be a lookahead ("down", but not followed by "to", and only after a form
+    # of "be"), which is a pattern that has to anticipate every collision it might ever meet.
+    # `status` is a parameter and this tool's one sentence does not set it, so every sentence
+    # below reaches the model, which reads them properly.
+    for said in ("which nodes are down", "what is down", "show me anything down",
+                 "narrow it down to the drones", "cut it down to the vessels"):
+        assert parser.parse(said) is None, said
 
 
 def test_a_sentence_naming_two_actions_goes_to_the_tier_that_can_serialize_it():
@@ -808,13 +949,20 @@ def test_a_sentence_naming_two_actions_goes_to_the_tier_that_can_serialize_it():
     assert parser.parse("mesh status after that show me the nodes") is None
 
 
-def test_a_plain_and_is_not_a_sequence_and_still_answers_in_tier_1():
-    """⚠️ The guard above must never fire on a bare "and". "The nodes and the drones" is
-    one request with two filters, and deferring it would push a perfectly good
-    deterministic answer onto a model, for latency and money, for nothing."""
-    assert parser.parse("show me the nodes and the drones") is not None
-    assert parser.parse("which assets are overdue") is not None
-    assert parser.parse("isolate the drones") is not None
+def test_a_two_kind_request_is_not_a_one_kind_answer():
+    """🔴 THIS TEST USED TO ASSERT THE OPPOSITE, AND IT WAS PINNING A BUG.
+
+    It read: "the nodes and the drones" is one request with two filters, so tier 1 should
+    answer it. But `list_entities` takes ONE kind, and the branch resolved the kind by longest
+    match, so the utterance came back as the drones alone with "nodes" dropped in silence. The
+    docstring described a capability the code did not have.
+
+    The saving grace was downstream: `trace` noticed the unaccounted word and the API escalated
+    anyway, which is why nobody saw it. Now the sentence simply is not in the language, so the
+    escalation happens in one step and for a stated reason.
+    """
+    assert parser.parse("show me the nodes and the drones") is None
+    assert parser.parse("show the nodes") is not None
 
 
 # --------------------------------------------------------------------------
@@ -961,24 +1109,51 @@ def test_a_write_never_persists_a_derived_value(world, log, writes):
     "utterance,tool_name",
     [
         ("kill node-barrow-05", "inject_fault"),
-        ("take down the alert node", "inject_fault"),
-        ("put daymark 03 into maintenance", "inject_fault"),
+        ("kill the alert node", "inject_fault"),
         ("fix node-barrow-05", "clear_fault"),
         ("remove vsl-unk-01", "remove_asset"),
-        ("get rid of the marker", "remove_asset"),
     ],
 )
 def test_breaking_and_repairing_reach_tier_one(utterance, tool_name):
-    """An operator says kill it, break it, take it down. Nobody types "inject a fault"."""
+    """An operator says kill it, take it down, mark it unserviceable. Nobody types "inject a
+    fault", and a destructive command answered in milliseconds is the one place latency is
+    most obvious.
+
+    ⚠️ ONE WORDING PER TOOL, WHICH IS STRICTER THAN ONE PER MEANING. "Take down X", "mark X
+    unserviceable", "repair X" and "get rid of X" were all on this list. They are gone: `fault`
+    is a parameter and `kill` fixes it to `silent`, so putting an asset unserviceable is the same
+    tool with the other value and goes to the model, as do the second and third ways to say
+    remove and fix.
+    """
     plan = parser.parse(utterance)
     assert plan and plan[0]["tool"] == tool_name
 
 
-def test_an_action_verb_beats_the_adjective_it_contains():
-    """"take down X" is an order and "which nodes are down" is a question, and the
-    question's keyword sits inside the order's phrasing."""
-    assert parser.parse("take down the alert node")[0]["tool"] == "inject_fault"
-    assert parser.parse("which nodes are down")[0]["params"]["status"] == "maintenance"
+@pytest.mark.parametrize(
+    "utterance",
+    ["put daymark 03 into maintenance", "get rid of the marker", "scrub marker 01",
+     "take down the alert node", "mark daymark 03 unserviceable", "repair node-barrow-05"],
+)
+def test_a_second_way_of_saying_a_write_escalates_rather_than_guessing(utterance):
+    """The synonyms this tier used to carry for destructive verbs.
+
+    🔑 WHY DROPPING THEM IS THE RIGHT WAY ROUND. A synonym list on a WRITE is the worst place
+    for a near miss: "take X off the map" and "take X out of service" differ by three words and
+    delete versus disable. The model reads the sentence properly, and the operator waits four
+    seconds for a command they issue once.
+    """
+    assert parser.parse(utterance) is None
+
+
+def test_an_order_and_a_question_can_no_longer_collide():
+    """🔴 THIS TEST WAS ABOUT A COLLISION THAT NO LONGER HAS ROOM TO HAPPEN. "Take down X" is an
+    order, "which nodes are down" is a question, and the question's keyword sat inside the
+    order's phrasing, so the two branches had to be ordered against each other. Neither
+    sentence is in the language now: one wording per tool leaves "kill X" for the order, and the
+    condition filter is a parameter the model reaches."""
+    assert parser.parse("kill the alert node")[0]["tool"] == "inject_fault"
+    assert parser.parse("take down the alert node") is None
+    assert parser.parse("which nodes are down") is None
 
 
 def test_coverage_names_the_contacts_nobody_has(world, log, monkeypatch):
@@ -1021,12 +1196,30 @@ def test_coverage_refuses_honestly_when_nothing_computes_it(world, log, monkeypa
     assert "mesh connectivity" in str(caught.value)
 
 
+def test_asking_what_we_cannot_see_reaches_tier_one():
+    """The declared sentence for the coverage question."""
+    assert parser.parse("show coverage")[0]["tool"] == "coverage"
+    # ⚠️ "show me coverage" IS A SECOND WORDING, and a droppable "me" is exactly the case Ethan
+    # ruled on: one wording per tool means one.
+    assert parser.parse("show me coverage") is None
+
+
 @pytest.mark.parametrize(
     "utterance",
     ["what are we not seeing", "which adversaries are undetected", "show me blind spots"],
 )
-def test_asking_what_we_cannot_see_reaches_tier_one(utterance):
-    assert parser.parse(utterance)[0]["tool"] == "coverage"
+def test_the_other_ways_of_asking_about_coverage_escalate(utterance):
+    """⚠️ THESE THREE USED TO REACH TIER 1 AND NOW DO NOT, WHICH IS THE COST WORTH NAMING.
+    They are good, natural phrasings of the flagship question, and each was a keyword the old
+    branch matched anywhere in a sentence: "coverage", "undetected", "blind spot". That is the
+    shape that answered "which of these could reach the contact before it gets dark" with a
+    list of vessels holding no AIS.
+
+    The exchange is deliberate: an operator who reads the card says "show coverage" and pays
+    nothing, and anybody who says it their own way gets the model, which reads the sentence
+    properly. What is no longer possible is a keyword answering a question it appeared in.
+    """
+    assert parser.parse(utterance) is None
 
 
 # --------------------------------------------------------------------------
@@ -1035,11 +1228,25 @@ def test_asking_what_we_cannot_see_reaches_tier_one(utterance):
 
 
 def test_the_current_zoom_window_is_a_filter_not_a_search():
-    """🔴 The first capability the application is meant to have, and for a while it was
-    answered by a guess: this phrase fell through to the loose listing branch and became a
-    search for an asset literally named "assets in the current zoom window"."""
-    plan = parser.parse("show me assets in the current zoom window")
-    assert plan == [{"tool": "list_entities", "params": {"bbox": executor.VIEWPORT}}]
+    """🔴 The first capability the application is meant to have, and for a while it was answered
+    by a guess: this phrase fell through to the loose listing branch and became a search for an
+    asset literally named "assets in the current zoom window".
+
+    🔑 IT IS NOW A PARAMETER WITH NO SENTENCE OF ITS OWN, which is the cost of one wording per
+    tool. `bbox` is `list_entities`' parameter and the tool's single sentence does not set it, so
+    the words go to the model, which sets it. The placeholder still means what it meant, and the
+    executor still binds it to whatever is on screen.
+    """
+    for said in ("show me assets in the current zoom window",
+                 "show the assets in view",
+                 "show me everything in the current view"):
+        assert parser.parse(said) is None, said
+
+    resolved = executor.resolve_context(
+        _plan("list_entities", bbox=executor.VIEWPORT),
+        {"bbox": {"north": 72.0, "south": 68.0, "east": -90.0, "west": -110.0}},
+    )
+    assert resolved[0]["params"]["bbox"]["north"] == 72.0
 
 
 def test_a_viewport_filter_keeps_only_what_is_on_screen(world, log):
@@ -1054,24 +1261,38 @@ def test_a_viewport_filter_keeps_only_what_is_on_screen(world, log):
 
 def test_deixis_resolves_against_what_the_operator_is_looking_at():
     """"this asset" is how anyone refers to the thing they just clicked. A system that
-    cannot resolve it makes them type a name already visible on their screen."""
-    plan = parser.parse("show me the historic location of this asset")
+    cannot resolve it makes them type a name already visible on their screen.
+
+    ⚠️ THE UTTERANCE HERE CHANGED AND THE CAPABILITY DID NOT. It used to be "show me the
+    historic location of this asset", which reached `entity_history` through a pattern that
+    stripped noise words out of a captured tail; the same words are now said in the declared
+    frame. Deixis is a NAME, and a name slot takes "this asset" exactly as it takes "Daymark
+    03": the grammar does not resolve either one, and the executor resolves both.
+    """
+    plan = parser.parse("where has this asset been")
     assert plan[0]["params"]["target"] == "this asset"
 
     resolved = executor.resolve_context(plan, {"selected_id": "uas-daymark-03"})
     assert resolved[0]["params"]["target"] == "uas-daymark-03"
 
+    # And in the other two frames that take a name, because deixis must not depend on which
+    # question is being asked about the thing on screen.
+    for said in ("tell me about this", "focus this one"):
+        assert executor.resolve_context(
+            parser.parse(said), {"selected_id": "uas-daymark-03"}
+        )[0]["params"]["target"] == "uas-daymark-03"
+
 
 def test_an_unresolvable_reference_is_refused_with_a_reason():
     """Dropping the parameter would silently widen the request to the whole world, which
     is the most expensive possible way to be wrong about what someone asked for."""
-    plan = parser.parse("show me the historic location of this asset")
+    plan = parser.parse("where has this asset been")
     with pytest.raises(executor.PlanRejected) as caught:
         executor.resolve_context(plan, {})
     assert "nothing is selected" in caught.value.reasons[0]
 
     with pytest.raises(executor.PlanRejected) as caught:
-        executor.resolve_context(parser.parse("show me assets in the current view"), {})
+        executor.resolve_context(_plan("list_entities", bbox=executor.VIEWPORT), {})
     assert "on screen" in caught.value.reasons[0]
 
 
@@ -1085,7 +1306,7 @@ def test_a_malformed_viewport_is_refused_rather_than_crashing_a_tool(world, log)
     that knows what was asked, so the operator gets an internal error for a request that was
     merely unanswerable and the audit row records a crash instead of a refusal.
     """
-    plan = parser.parse("show me assets in the current view")
+    plan = _plan("list_entities", bbox=executor.VIEWPORT)
 
     for bad in (
         {"south": 80, "north": 60, "west": -1, "east": 1},   # south above north
@@ -1106,7 +1327,7 @@ def test_the_two_awkward_viewports_are_still_accepted(world, log):
     west or east, and an oblique view produces west greater than east. Both look malformed
     to a naive check, and both are exactly what an Arctic display shows.
     """
-    plan = parser.parse("show me assets in the current view")
+    plan = _plan("list_entities", bbox=executor.VIEWPORT)
 
     resolved = executor.resolve_context(plan, {"bbox": {"south": 60, "north": 90, "global": True}})
     assert resolved[0]["params"]["bbox"]["global"] is True
@@ -1119,10 +1340,10 @@ def test_the_two_awkward_viewports_are_still_accepted(world, log):
 def test_one_request_performs_several_actions(world, log):
     """One request has to adjust the frame, filter the picture, isolate the asset and open
     its detail. Every parser branch returned exactly one step until this landed."""
-    plan = parser.parse("isolate the drones")
+    plan = _isolate_kind("uas")
     assert len(plan) > 1
 
-    outcome = executor.execute(plan, source="typed", tier="parser", utterance="isolate the drones")
+    outcome = executor.execute(plan, source="llm", tier="llm", utterance="isolate the drones")
     assert len(outcome["results"]) == len(plan)
     # One command id over several actions is what makes the log readable as one intent.
     ran = [r for r in log if r["tool"] in ("list_entities", "frame_entities")]
@@ -1132,15 +1353,34 @@ def test_one_request_performs_several_actions(world, log):
 
 
 def test_active_flights_are_answerable_now_that_aircraft_exist():
-    """Refusing this was right when the world had no aircraft. It has four."""
-    plan = parser.parse("show active flights in the zoom window")
+    """Refusing this was right when the world had no aircraft. It has four.
+
+    ⚠️ "active" IS NO LONGER A WORD THIS TIER IGNORES, and that is the change. It used to be
+    listed as filler, on the measured argument that this world has no inactive subset to narrow
+    to, so an adjective that cannot filter anything should not cost a model call. Filler lists
+    are gone with the rest of the word accounting: the declared sentence names the kind and the
+    window, and "active" escalates like any other word the language does not contain.
+    """
+    plan = parser.parse("show the flights")
     assert plan[0]["params"]["kind"] == "aircraft"
-    assert plan[0]["params"]["bbox"] == executor.VIEWPORT
+    # The viewport is a parameter with no sentence of its own, so scoping the question to the
+    # window goes to the model. The kind itself is a slot, so the aircraft are reachable.
+    assert parser.parse("show the flights in the current zoom window") is None
+    assert parser.parse("show active flights in the zoom window") is None
 
 
 def test_an_overlay_request_offers_what_exists_and_claims_nothing_more(world, log):
-    plan = parser.parse("show me weather overlays for the current zoom window")
+    plan = parser.parse("show the ice")
     assert plan[0]["tool"] == "show_overlay"
+    # "show me the ice overlay" carries two droppable words and is therefore two wordings away
+    # from the declared one.
+    assert parser.parse("show me the ice overlay") is None
+
+    # ⚠️ "weather" IS NOT ANSWERED WITH SEA ICE BY THIS TIER ANY MORE. The old branch matched
+    # the word and returned the ice overlay, which is a substitution an operator has not agreed
+    # to: measured ice concentration is not a forecast. The model can offer the substitution in
+    # a sentence that says it is one, and the refusal below already does exactly that.
+    assert parser.parse("show me weather overlays now") is None
 
     out = tools.show_overlay(layer="ice")
     assert out.ui_effects["overlay"] == {"layer": "ice", "visible": True}
@@ -1159,8 +1399,9 @@ def test_a_refusal_that_went_stale_was_retired(world, log):
     assert parser.unsupported("show active flights in the zoom window") is None
     assert parser.unsupported("show me weather overlays for the current zoom window") is None
 
-    assert parser.parse("show active flights in the zoom window")[0]["params"]["kind"] == "aircraft"
-    assert parser.parse("show me weather overlays now")[0]["tool"] == "show_overlay"
+    # The capability is real and reachable, in the declared words for each.
+    assert parser.parse("show the aircraft")[0]["params"]["kind"] == "aircraft"
+    assert parser.parse("show the ice")[0]["tool"] == "show_overlay"
 
     # And what genuinely is absent is still refused, with what exists named instead.
     assert "ice" in (parser.unsupported("what is the forecast tomorrow") or "")
@@ -1179,11 +1420,14 @@ def test_the_transcription_prompt_carries_what_is_on_the_map(world, log):
     vocabulary = transcribe._live_vocabulary()
 
     assert "Daymark 03" in vocabulary  # a coined callsign
-    assert "uas" in vocabulary  # an initialism said as letters
+    # ⚠️ CASE-INSENSITIVE: an initialism is hinted in the form a reader would write it, "UAS",
+    # because that is what the model should put on screen. The dedup keeps the first spelling.
+    assert any(t.lower() == "uas" for t in vocabulary)  # an initialism said as letters
     # The id is said out loud too, and it is the harder half: "uas daymark 03".
     assert "uas daymark 03" in vocabulary
     # A misheard verb loses the command even when every name in it was perfect.
-    assert "isolate" in vocabulary and "overdue" in vocabulary
+    assert "overdue" in vocabulary  # a state word, from the near-homophone list
+    assert "kill" in vocabulary      # a verb, derived from the grammar
 
     prompt = transcribe.build_prompt()
     assert "Daymark 03" in prompt
@@ -1241,7 +1485,7 @@ def test_the_vocabulary_survives_the_world_being_unreadable(monkeypatch):
     monkeypatch.setattr(db, "fetch_entities", boom)
     vocabulary = transcribe._live_vocabulary()
 
-    assert "isolate" in vocabulary  # the static half still helps
+    assert "overdue" in vocabulary  # the static half still helps
     assert transcribe.build_prompt().startswith(transcribe.PROMPT[:40])
 
 
@@ -1465,23 +1709,32 @@ def test_the_parser_will_not_guess_a_single_asset_from_a_plural_or_an_all(world,
     unknowns" is a filter over many things, so `focus_entity` was the wrong tool before a
     misspelling was ever involved."""
     assert parser.parse("show me all unkowns") is None
-
-    # ⚠️ "unknowns" SPELLED CORRECTLY IS A REAL COMMAND NOW, and it was not when this test
-    # was written. It answers with the unidentified contacts the network actually holds,
-    # so asserting None here would pin the parser to a gap that has since been filled.
-    # The misspelling above still declines, which is the behaviour this test is about.
-    assert parser.parse("show me all unknowns") == [{"tool": "show_unknown", "params": {}}]
-    assert parser.parse("show me the unknowns") == [{"tool": "show_unknown", "params": {}}]
-
-    # A plural tail that is not a known command still declines rather than guessing.
+    assert parser.parse("show me all unknowns") is None
     assert parser.parse("show me all stragglers") is None
 
-    # And it still names a single asset when the tail really is one.
-    assert parser.parse("show me daymark 03") == [
+    # The declared sentence for that question, which is what the card teaches.
+    assert parser.parse("show the unknowns") == [{"tool": "show_unknown", "params": {}}]
+
+    # 🔑 THE GUARD IS NOW STRUCTURAL RATHER THAN A LOOKAHEAD ON THE TAIL. A name slot refuses
+    # a determiner plus a kind word and refuses anything opening with "all", so no declared
+    # sentence can put a set where a single asset belongs. There is also no longer a loose
+    # `show me <anything>` rule for it to be refused BY: the old fallback is what produced
+    # `focus_entity(target="all unkowns")`, `focus_entity(target="event log")` and
+    # `focus_entity(target="whole arctic")`, each a confident answer to a question nobody asked.
+    assert parser.parse("focus the drones") is None
+    assert parser.parse("focus all nodes") is None
+
+    # ⚠️ AND THE COST, STATED. "Show me daymark 03" used to reach `focus_entity` through that
+    # same fallback and now escalates twice over: there is no loose listing rule to catch it, and
+    # "show me" is not a declared wording either. Opening one asset by name is said "focus
+    # Daymark 01" or "tell me about Daymark 01", both of which are printed on the card.
+    assert parser.parse("show me daymark 03") is None
+    assert parser.parse("find kanguk") is None
+    assert parser.parse("focus daymark 03") == [
         {"tool": "focus_entity", "params": {"target": "daymark 03"}}
     ]
-    assert parser.parse("find kanguk") == [
-        {"tool": "focus_entity", "params": {"target": "kanguk"}}
+    assert parser.parse("tell me about kanguk") == [
+        {"tool": "describe_entity", "params": {"target": "kanguk"}}
     ]
 
 
@@ -1521,6 +1774,17 @@ def test_a_misspelled_target_reaches_tier_2_and_the_chain_is_recorded(world, log
     assert body["tier"] == "llm"
     assert body["escalated_from"] == "parser"
     assert body["ok"] is True
+    # 🔑 THE ESCALATION TEACHES TOO, and this is here because it did not. There are two
+    # routes to tier 2, the direct one and this one, and the teaching line was added to the
+    # direct one only, so whether an operator was shown the free phrasing depended on
+    # whether the parser had guessed wrong first. Both call one function now.
+    #
+    # 🔴 AND IT TEACHES THIS ANSWER'S ASSET, NOT THE CARD'S. This assertion read "tell me about
+    # Daymark 01" until 2026-08-13, which is the card's example: the right verb attached to
+    # somebody else's asset, printed under an answer about a different one. Asked about FLS
+    # Resolute Bay, the console suggested a drone. The line is rendered from the plan now, so
+    # what it prints is the sentence that would have produced THIS answer for nothing.
+    assert body["teach"] == [{"tool": "describe_entity", "say": "tell me about Daymark 03"}]
 
     # 🔗 Every row of the escalation hangs off the first command.
     chained = [r for r in log if r.get("parent_command_id") == first["command_id"]]
@@ -1609,62 +1873,82 @@ def test_a_spoken_command_may_still_escalate(world, log, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_the_trace_names_the_words_the_parser_threw_away():
-    """🔴 THE BUG THIS EXISTS FOR. Two utterances differing by three words came back
-    byte-identical, because the parser matched "parties", answered that, and discarded
-    "unkown" and "on foot" without a word. A partial match presented as a complete answer
-    is the characteristic failure of a deterministic parser, and it is invisible in the
-    answer."""
-    said = "show me all unkown parties on foot"
-    trace = parser.trace(said, parser.parse(said))
+def test_a_partial_match_cannot_be_produced_at_all():
+    """🔴 THE BUG THE OLD TRACE EXISTED FOR, NOW ABSENT BY CONSTRUCTION.
 
-    assert trace["ignored"] == ["unkown", "foot"]
-    assert "parties" in trace["consumed"]
+    Two utterances differing by three words came back byte-identical, because a branch matched
+    "parties", answered that, and discarded "unkown" and "on foot" without a word:
 
+        "show me all unkown parties"          -> the ground parties
+        "show me all unkown parties on foot"  -> the SAME ground parties
 
-def test_a_clean_utterance_ignores_nothing():
-    """The trace has to be quiet on the ordinary case, or it is noise nobody reads and the
-    escalation below fires on everything."""
+    The fix was an `ignored` list, computed by subtracting a two-hundred-word filler vocabulary
+    and a table of verbs-that-count-only-if-honoured from the utterance, then escalating when
+    anything was left. It worked and it was fragile in both directions: a word missing from the
+    filler list escalated a command tier 1 had answered perfectly, and a word wrongly in it hid
+    a real omission.
+
+    🔑 SO THE PROPERTY IS PINNED HERE INSTEAD OF THE MECHANISM. Every declared sentence is
+    anchored to the whole utterance, so either every word is accounted for or there is no plan.
+    Nothing needs to notice a dropped word, because a dropped word means no match.
+    """
     for said in (
-        "show me the drones",
-        "which assets are overdue",
-        "mesh status",
-        "what is not broadcasting",
-        "reset the view",
-        "isolate the drones",
-        "place a marker at 74.1 -95.2",
+        "show me all unkown parties",
+        "show me all unkown parties on foot",
+        "show me the nodes and the drones",
+        "focus fls alert and hide everything else",
+        "show me everything that has gone quiet, then reset the view",
     ):
-        assert parser.trace(said, parser.parse(said))["ignored"] == [], said
+        assert parser.parse(said) is None, said
 
 
-def test_a_coordinate_is_never_reported_as_a_dropped_word():
-    """⚠️ A naive tokeniser turns "-95.9" into "95" and "9" and reports both as ignored,
-    which would escalate every task and place command in the app: the one shape where
-    every character already matters."""
+def test_a_match_says_which_declared_sentence_answered():
+    """What replaced `ignored` as the useful field: the sentence, which is actionable.
+
+    An operator reading "matched list_entities" learns nothing they can repeat. Reading the
+    phrasing that answered them teaches the card at the moment they are already looking, and it
+    is the same string the card prints, so the two cannot say different things.
+    """
+    for said, sentence in (
+        ("show the drones", "show the hydrophones"),
+        ("hide the vessels", "hide the radars"),
+        ("mesh status", "mesh status"),
+        ("place a marker at 74.1 -95.2", "place a marker at 73.2 -95.9"),
+    ):
+        trace = parser.trace(said, parser.parse(said))
+        assert trace["grammar"] == sentence, said
+        assert trace["declined"] is None
+
+
+def test_the_trace_reports_the_window_and_the_coordinates_it_read():
+    """The parameters are the half nobody can see. A voice test heard "which assets are
+    overdue" as "Hydrophone Lancaster Sound 01 overdue", and the difference between the right
+    answer and the wrong one was an unannounced `kind="hydrophone"`."""
     said = "send daymark 05 to 73.0 -95.9"
-    assert parser.trace(said, parser.parse(said))["ignored"] == []
+    assert parser.trace(said, parser.parse(said))["extracted"] == {
+        "target": "daymark 05",
+        "lat": 73.0,
+        "lon": -95.9,
+    }
+
+    said = "where has daymark 3 been"
+    assert parser.trace(said, parser.parse(said))["extracted"]["days"] == 1.0
 
 
-def test_a_duration_is_not_reported_as_dropped_digits():
-    """"the last 12 hours" becomes `days=0.5`, so the digits that expressed it appear
-    nowhere in the plan and would otherwise read as words the parser lost."""
-    said = "history for daymark 3 for the last 12 hours"
-    assert parser.trace(said, parser.parse(said))["ignored"] == []
+def test_no_plan_says_why_tier_1_handed_over():
+    """A declined utterance goes onward whole, and the trace says whether it was CLOSE.
 
-
-def test_a_dropped_kind_is_caught():
-    """"the nodes and the drones" is two kinds and the parser can only answer one, so it
-    silently answers the second. That is a real partial match and must show."""
-    said = "show me the nodes and the drones"
-    assert "nodes" in parser.trace(said, parser.parse(said))["ignored"]
-
-
-def test_no_plan_means_nothing_was_thrown_away():
-    """A declined utterance goes onward whole. Reporting its words as "ignored" would
-    escalate an utterance that is already being escalated."""
+    🔑 "Not recognised" is true and useless. Whether the sentence nearly matched something is
+    the difference between "say it the declared way and it is free" and "this genuinely needs
+    the model", and that distinction is the one an operator can act on.
+    """
     trace = parser.trace("something nobody anticipated", None)
-    assert trace["ignored"] == []
     assert trace["matched"] is None
+    assert trace["grammar"] is None
+    assert "no declared command" in trace["declined"]
+
+    near = parser.trace("show me every single drone", None)
+    assert "show the hydrophones" in near["declined"]
 
 
 def test_a_second_request_reuses_the_pooled_connection(fake_connections):
@@ -1716,6 +2000,37 @@ RECENT = {
 }
 
 
+# 🔑 A PLAN BUILT BY HAND IS THE HONEST WAY TO TEST WHAT TIER 1 NO LONGER SAYS. One wording per
+# tool leaves the previous-answer reference, the viewport filter, the visibility modes and the
+# serialized action reachable only through the model or a button, and every one of them is still
+# a real capability of the executor and the tools. Testing them through a phrasing that no longer
+# exists would delete coverage of a capability that does; testing them through the plan is what
+# tier 2 and the buttons actually produce.
+def _plan(tool: str, **params: object) -> list[dict]:
+    return [{"tool": tool, "params": params}]
+
+
+#: The serialized action, as a plan. ⚠️ "isolate the drones" and "isolate Daymark 01" WERE tier-1
+#: sentences and are not any more: `isolate` is not a tool, so under one wording per tool it has
+#: no sentence of its own, and both of its shapes reached tools that already had theirs. The
+#: capability is untouched and is what these tests are about, so the plans are written out here
+#: exactly as tier 2 emits them.
+def _isolate_kind(kind: str) -> list[dict]:
+    return [
+        {"tool": "set_visible_kinds", "params": {"mode": "only", "kinds": [kind]}},
+        {"tool": "list_entities", "params": {"kind": kind}},
+        {"tool": "frame_entities", "params": {"kind": kind}},
+    ]
+
+
+def _isolate_named(target: str) -> list[dict]:
+    return [
+        {"tool": "focus_entity", "params": {"target": target}},
+        {"tool": "list_entities", "params": {"ids": [executor.SUBJECT]}},
+        {"tool": "describe_entity", "params": {"target": executor.SUBJECT}},
+    ]
+
+
 def test_them_binds_to_the_previous_answer_not_to_the_whole_world():
     """🔴 THE BUG, VERBATIM FROM A LIVE SESSION:
 
@@ -1727,8 +2042,11 @@ def test_them_binds_to_the_previous_answer_not_to_the_whole_world():
     "Them" reached no branch, fell through to the loose listing rule, matched no kind and
     widened to everything. Answering a narrower question with a wider answer is the worst
     shape of wrong available here, because 76 looks like a working command."""
-    plan = parser.parse("list them")
-    assert plan == [{"tool": "list_entities", "params": {"ids": executor.RESULT}}]
+    # ⚠️ "list them" USED TO BE SAYABLE ON TIER 1 AND IS NOT ANY MORE: `ids` is a parameter, and
+    # this tool's one sentence is "show the {kind}". The placeholder is what the capability
+    # actually is, so the plan is built the way the model builds it.
+    assert parser.parse("list them") is None
+    plan = _plan("list_entities", ids=executor.RESULT)
 
     resolved = executor.resolve_context(plan, RECENT)
     assert resolved[0]["params"]["ids"] == ["uas-daymark-03", "uas-daymark-05"]
@@ -1736,7 +2054,7 @@ def test_them_binds_to_the_previous_answer_not_to_the_whole_world():
 
 def test_them_actually_narrows_the_answer(world, log):
     """End to end: the ids reach `list_entities` and it returns those two, not the world."""
-    plan = executor.resolve_context(parser.parse("show me them"), RECENT)
+    plan = executor.resolve_context(_plan("list_entities", ids=executor.RESULT), RECENT)
     outcome = executor.execute(plan, source="typed", tier="parser")
 
     assert outcome["results"][0]["data"]["ids"] == ["uas-daymark-03", "uas-daymark-05"]
@@ -1748,13 +2066,13 @@ def test_them_with_no_previous_answer_refuses_and_says_why():
     Dropping the parameter would widen the request back to every asset in the world, which
     is the exact bug this branch exists to fix, reintroduced by the error path."""
     with pytest.raises(executor.PlanRejected) as caught:
-        executor.resolve_context(parser.parse("list them"), {})
+        executor.resolve_context(_plan("list_entities", ids=executor.RESULT), {})
     assert "them" in str(caught.value)
 
     # A malformed history from the browser reads as "no previous answer", never a crash.
     for junk in ({"recent": "nope"}, {"recent": []}, {"recent": [{"ids": "no"}]}, {"recent": [None]}):
         with pytest.raises(executor.PlanRejected):
-            executor.resolve_context(parser.parse("list them"), junk)
+            executor.resolve_context(_plan("list_entities", ids=executor.RESULT), junk)
 
 
 def test_an_empty_previous_answer_stays_empty(world, log):
@@ -1766,11 +2084,15 @@ def test_an_empty_previous_answer_stays_empty(world, log):
 
 
 def test_frame_them_frames_rather_than_lists():
-    """Same referent, different verb. "Frame them" is a camera request and `frame_entities`
-    is the tool that takes a set."""
-    assert parser.parse("frame them") == [
-        {"tool": "frame_entities", "params": {"targets": executor.RESULT}}
-    ]
+    """Same referent, different verb. `frame_entities` is the tool that takes a set, and its
+    `targets` parameter is what carries the previous answer.
+
+    ⚠️ NEITHER "frame them" NOR "list them" IS SAYABLE ON TIER 1 NOW. Both were second wordings
+    of a tool that already has one, so the plan is what is asserted.
+    """
+    assert parser.parse("frame them") is None
+    resolved = executor.resolve_context(_plan("frame_entities", targets=executor.RESULT), RECENT)
+    assert resolved[0]["params"]["targets"] == ["uas-daymark-03", "uas-daymark-05"]
 
 
 def test_the_context_sent_to_the_model_is_bounded():
@@ -1812,9 +2134,13 @@ def test_every_command_a_refusal_SUGGESTS_actually_works():
     for command in quoted:
         plan = parser.parse(command)
         assert plan is not None, f"refusal suggests {command!r}, which tier 1 cannot answer"
-        assert parser.trace(command, plan)["ignored"] == [], (
-            f"refusal suggests {command!r}, and the parser drops "
-            f"{parser.trace(command, plan)['ignored']} from it"
+        # ⚠️ THE DROPPED-WORD CHECK THAT USED TO SIT HERE IS STRUCTURAL NOW. A declared sentence
+        # is anchored to the whole utterance, so a plan at all means every word was accounted
+        # for. What is worth asserting instead is that the suggestion is one of the sentences
+        # the card teaches, since a refusal that recommends a phrasing nobody can look up is
+        # teaching a word of mouth.
+        assert parser.trace(command, plan)["grammar"], (
+            f"refusal suggests {command!r}, which no declared sentence covers"
         )
         assert executor.validate(plan) == [], f"refusal suggests {command!r}, which does not validate"
 
@@ -1823,7 +2149,7 @@ def test_flights_is_a_synonym_the_shared_table_knows():
     """A synonym one branch knows and `KIND_WORDS` does not is invisible to everything that
     reads the table, `trace` included. That is how a correctly-answered command came to be
     reported as a partial match and pushed to the model."""
-    assert parser.parse("show me the flights") == [
+    assert parser.parse("show the flights") == [
         {"tool": "list_entities", "params": {"kind": "aircraft"}}
     ]
 
@@ -1901,14 +2227,24 @@ def test_show_unknown_degrades_rather_than_crashing_without_the_detection_layer(
     assert "mesh connectivity" in said
 
 
-@pytest.mark.parametrize(
-    "utterance",
-    ["show unknown", "show me the unknowns", "unknown contacts", "what is unidentified",
-     "who is out there", "show me all unknowns"],
-)
-def test_the_ways_people_ask_for_unknowns(utterance):
-    assert parser.parse(utterance) == [{"tool": "show_unknown", "params": {}}]
-    assert parser.trace(utterance, parser.parse(utterance))["ignored"] == []
+def test_the_declared_way_of_asking_for_unknowns():
+    """One sentence, and it is the one on the card.
+
+    🔴 THIS USED TO BE SIX PHRASINGS AND THAT LIST WAS THE PROBLEM. "show unknown", "unknown
+    contacts", "what is unidentified", "who is out there" and "show me all unknowns" all
+    reached this tool by matching a keyword anywhere in the sentence, which is why "hide
+    everything except for unknowns" highlighted four contacts and hid nothing, and why "i do
+    not know where it is" needed its own guard to stop being a request for the contact list.
+
+    ⚠️ THE OTHER FIVE NOW ESCALATE, and the model answers them. What is bought is that no
+    sentence containing the word "unknown" can be answered as though it asked for the list.
+    """
+    assert parser.parse("show the unknowns") == [{"tool": "show_unknown", "params": {}}]
+
+    for said in ("show unknown", "unknown contacts", "what is unidentified", "who is out there",
+                 "show me the unknowns", "show me all unknowns",
+                 "hide everything except for unknowns"):
+        assert parser.parse(said) is None, said
 
 
 def test_not_knowing_something_is_not_a_request_for_the_contact_list():
@@ -1927,7 +2263,7 @@ def test_isolating_a_named_asset_does_all_four_things_in_one_request(world, log)
     picture, isolate the asset, open its details. It used to do three of the four, and the
     missing one was the FILTER, because filtering to one asset needs its id and the parser
     only ever had the words the operator typed."""
-    plan = parser.parse("isolate daymark 03")
+    plan = _isolate_named("daymark 03")
     assert [s["tool"] for s in plan] == ["focus_entity", "list_entities", "describe_entity"]
     assert executor.validate(plan) == []
 
@@ -1946,7 +2282,7 @@ def test_the_subject_is_bound_from_the_step_that_resolved_it(world, log):
     """The parser cannot know the id and must not: working from words alone is what lets it
     be tested with no database. So the placeholder is bound between steps, at the only
     moment the id exists."""
-    plan = parser.parse("isolate daymark 03")
+    plan = _isolate_named("daymark 03")
 
     # Still a placeholder on the way in.
     assert plan[1]["params"]["ids"] == [executor.SUBJECT]
@@ -1989,11 +2325,15 @@ def test_isolating_a_kind_hides_the_others_rather_than_only_framing(world, log):
     "isolate the drones" left every other kind on the map and differed from "show me the
     drones" by a camera move. The trace could not catch it either, because "isolate" sat in
     the blanket filler list and counted as used whatever the plan did."""
-    plan = parser.parse("isolate the drones")
+    plan = _isolate_kind("uas")
     assert [s["tool"] for s in plan] == ["set_visible_kinds", "list_entities", "frame_entities"]
     assert plan[0]["params"] == {"mode": "only", "kinds": ["uas"]}
-    # And the word is now accounted for, so this stays on tier 1 instead of escalating.
-    assert parser.trace("isolate the drones", plan)["ignored"] == []
+    # ⚠️ AND THE WORD IS NO LONGER SAYABLE ON THIS TIER AT ALL. It was in the blanket filler
+    # list and counted as used whatever the plan did, which is how listing and framing passed for
+    # isolating; the fix was a table of verbs that only count when the plan contains the tool
+    # honouring them. Both mechanisms are gone: `isolate` is not a tool, so it gets no sentence,
+    # and the shape it produced is what tier 2 emits and what is asserted above.
+    assert parser.parse("isolate the drones") is None
 
 
 def test_the_trace_reports_the_parameters_it_inferred():
@@ -2002,19 +2342,27 @@ def test_the_trace_reports_the_parameters_it_inferred():
     heard "which assets are overdue" as "Hydrophone Lancaster Sound 01 overdue", and the
     whole difference between the right answer and the wrong one was an unannounced
     `kind="hydrophone"`."""
-    said = parser.trace("which assets are overdue", parser.parse("which assets are overdue"))
-    misheard_text = "Hydrophone Lancaster Sound 01 overdue"
-    misheard = parser.trace(misheard_text, parser.parse(misheard_text))
+    said = parser.trace("show the hydrophones", parser.parse("show the hydrophones"))
+    assert said["extracted"] == {"kind": "hydrophone"}
 
-    assert said["extracted"] == {"overdue": True}
-    assert misheard["extracted"] == {"overdue": True, "kind": "hydrophone"}
+    # 🔑 AND THE MISHEARING THAT PROMPTED THIS TEST NO LONGER REACHES A PLAN AT ALL. "Hydrophone
+    # Lancaster Sound 01 overdue" once matched the overdue branch on one word and inferred
+    # `kind="hydrophone"` from another, answering a question the operator had not asked. It is
+    # not a declared sentence, so tier 1 has no opinion on it and the model gets the whole
+    # thing, which is what the extracted-parameters display existed to make survivable.
+    misheard_text = "Hydrophone Lancaster Sound 01 overdue"
+    assert parser.parse(misheard_text) is None
+    assert parser.trace(misheard_text, None)["extracted"] == {}
 
 
 def test_a_placeholder_never_hides_the_value_the_operator_would_recognise():
     """"Isolate daymark 01" resolves its own subject, so later steps carry `__subject__` on
     the same key the first step carried "daymark 01". Letting the last write win would show
     the operator an internal token instead of the name they said."""
-    trace = parser.trace("isolate daymark 01", parser.parse("isolate daymark 01"))
+    # ⚠️ THE UTTERANCE IS GONE AND THE MERGE RULE IS NOT. "Isolate daymark 01" was the tier-1
+    # sentence that produced a plan carrying both a real name and a placeholder on one key; tier 2
+    # produces the same shape, and `trace` runs over a plan rather than over a phrasing.
+    trace = parser.trace("isolate daymark 01", _isolate_named("daymark 01"))
     assert trace["extracted"]["target"] == "daymark 01"
 
 
@@ -2054,8 +2402,12 @@ def test_the_parser_trace_survives_an_escalation_to_tier_2(world, log, monkeypat
 
     handed = thinking.get("parser")
     assert handed, "the trace that explains WHY the model was called must survive"
-    assert handed["ignored"] == ["lancaster", "sound", "01"]
-    assert handed["extracted"] == {"overdue": True, "kind": "hydrophone"}
+    # ⚠️ WHAT IT CARRIES CHANGED WITH THE GRAMMAR. It used to be the three words tier 1 could
+    # not place, which is how a partial match announced itself. Tier 1 no longer half-matches
+    # this at all, so what survives is its finding: it looked, nothing in the language reads
+    # like this, and it handed over. That sentence is the reason for the call.
+    assert handed["matched"] is None
+    assert handed["declined"], "an escalation with no stated reason is a silent handover"
 
 
 # --------------------------------------------------------------------------
@@ -2070,31 +2422,54 @@ def test_hiding_a_kind_is_a_display_intent_not_a_computed_set(world, log):
     asked to do and the client resolves it, which is also what keeps `only` and `all`
     absolute: "show only the vessels" has to mean the same thing whatever was hidden first.
     """
-    plan = parser.parse("hide all radars")
+    plan = parser.parse("hide the radars")
     assert plan == [{"tool": "set_visible_kinds", "params": {"mode": "hide", "kinds": ["radar"]}}]
 
-    out = executor.execute(plan, source="typed", tier="parser", utterance="hide all radars")
+    out = executor.execute(plan, source="typed", tier="parser", utterance="hide the radars")
     assert out["ui_effects"]["kinds"] == {"mode": "hide", "kinds": ["radar"]}
 
 
-def test_only_and_except_mean_the_same_thing(world, log):
-    """Two phrasings of one intent, and both have to beat the plain hide and show branches
-    that their own words contain."""
-    for utterance in (
-        "show only the vessels",
-        "only show vessels",
-        "hide everything except the vessels",
-    ):
-        plan = parser.parse(utterance)
-        assert plan == [
-            {"tool": "set_visible_kinds", "params": {"mode": "only", "kinds": ["vessel"]}}
-        ], utterance
+def test_only_is_one_declared_sentence_rather_than_three_phrasings(world, log):
+    """🔴 THE THREE PHRASINGS THIS TEST CARRIED WERE THE EXPENSIVE KIND.
+
+    "Show only the vessels", "only show vessels" and "hide everything except the vessels" were
+    one intent said three ways, and each had to be matched ABOVE the plain hide and show rules
+    because every one of them contains a hide or a show. That ordering is what broke: "hide
+    everything except for unknowns" fell past the visibility rules into the contact-list rule,
+    highlighted four contacts, hid nothing, and reported success.
+
+    One declared sentence needs no ordering at all, and the other two escalate.
+    """
+    # 🔑 AND THE ANSWER WENT FURTHER THAN ONE SENTENCE: `mode` is a parameter, and this tool's
+    # one sentence fixes it to `hide`. So "show only the vessels" is not the declared wording
+    # either, and the whole family reaches the model, which sets the mode from the words.
+    assert parser.parse("hide the vessels") == [
+        {"tool": "set_visible_kinds", "params": {"mode": "hide", "kinds": ["vessel"]}}
+    ]
+    for utterance in ("show only the vessels", "only show vessels",
+                      "hide everything except the vessels"):
+        assert parser.parse(utterance) is None, utterance
 
 
 def test_showing_everything_clears_the_filter(world, log):
-    for utterance in ("show all assets", "unhide everything", "show everything"):
-        plan = parser.parse(utterance)
-        assert plan == [{"tool": "set_visible_kinds", "params": {"mode": "all"}}], utterance
+    """The mode exists and the tool answers it; the sentence for it does not.
+
+    🔴 THE COLLISION THIS FAMILY CAUSED IS WORTH KEEPING WRITTEN DOWN. "Show everything" meant
+    clear the visibility filter and "show me everything" meant widen the camera, and which one
+    an utterance got was decided by which of two branches was checked first. Under one wording
+    per tool neither is sayable: the camera has "zoom out", and clearing the filter is
+    `set_visible_kinds` with a mode its one sentence does not set, so it goes to the model.
+    """
+    for utterance in ("show all assets", "show everything", "unhide everything",
+                      "bring back all assets", "show me everything"):
+        assert parser.parse(utterance) is None, utterance
+
+    out = executor.execute(
+        _plan("set_visible_kinds", mode="all"), source="llm", tier="llm",
+        utterance="show everything",
+    )
+    assert out["ui_effects"]["kinds"] == {"mode": "all", "kinds": []}
+    assert parser.parse("zoom out") == [{"tool": "reset_view", "params": {}}]
 
 
 def test_asking_for_a_kind_unhides_it_as_well_as_highlighting_it(world, log):
@@ -2104,7 +2479,7 @@ def test_asking_for_a_kind_unhides_it_as_well_as_highlighting_it(world, log):
     that they want it back, not that they want an empty highlight over a layer they cannot
     see. The list keeps its highlight; the unhide rides along with it.
     """
-    plan = parser.parse("show me the drones")
+    plan = parser.parse("show the drones")
     out = executor.execute(plan, source="typed", tier="parser", utterance="show me the drones")
 
     assert out["ui_effects"]["highlight"], "the highlight is unchanged"
@@ -2129,8 +2504,8 @@ def test_an_answer_reveals_the_kinds_it_names(world, log):
     The cost is real and accepted: a sweeping question reveals every kind it names, so a kind
     filter does not survive one. An explicit visibility command still wins, which is the case
     the old rule most wanted to protect."""
-    plan = parser.parse("which assets are overdue")
-    out = executor.execute(plan, source="typed", tier="parser", utterance="which assets are overdue")
+    plan = _plan("list_entities", overdue=True)
+    out = executor.execute(plan, source="llm", tier="llm", utterance="which assets are overdue")
 
     assert out["ui_effects"]["kinds"]["mode"] == "show"
     assert out["ui_effects"]["kinds"]["kinds"]
@@ -2153,9 +2528,19 @@ def test_hide_does_not_swallow_a_delete(world, log, deletes):
     worst possible way to be wrong about a delete: it appears to succeed and the asset is
     still there.
     """
-    plan = parser.parse("remove the marker")
+    plan = parser.parse("remove marker 01")
     assert plan is not None
     assert plan[0]["tool"] != "set_visible_kinds"
+
+    # 🔑 AND THE COLLISION IS NOW IMPOSSIBLE RATHER THAN AVOIDED. The narrowing this test was
+    # written about was a rule: accept "hide" as a display verb, never "remove" or "turn off",
+    # because those already mean something destructive. A declared sentence carries one verb, so
+    # no display rule can see a delete at all. "Remove the marker" names a KIND rather than an
+    # asset, which a name slot refuses, so it escalates rather than deleting something guessed.
+    assert parser.parse("remove the marker") is None
+    assert parser.parse("hide the markers") == [
+        {"tool": "set_visible_kinds", "params": {"mode": "hide", "kinds": ["marker"]}}
+    ]
 
 
 def test_a_kind_nobody_has_is_refused_by_name(world, log):
@@ -2179,8 +2564,21 @@ def test_every_view_verb_can_be_hinted_to_the_transcriber(world, log):
     verb loses the whole command even when every asset name in it was heard perfectly.
     """
     spoken = " ".join(transcribe._live_vocabulary()).lower()
-    for word in ("hide", "unhide", "only", "except"):
-        assert word in spoken, f"the view verb '{word}' cannot be hinted to the transcriber"
+    for word in ("hide", "show", "frame", "focus", "kill", "place", "remove", "fix"):
+        assert word in spoken, f"the verb '{word}' cannot be hinted to the transcriber"
+
+    # 🔑 AND THE TERMS CHOSEN FOR DIFFICULTY RATHER THAN FOR IMPORTANCE, which is what the list
+    # is actually for: a word the console needs and a general transcriber gets wrong. "Show" is
+    # important and easy; "backhaul" is important and hard, and only the second needs the weight.
+    for word in ("uas", "ais", "hydrophone", "sonobuoy", "backhaul", "isolate", "patrol"):
+        assert word in spoken, f"the hard-to-hear term '{word}' is not being hinted"
+
+    # 🔧 AND IT IS NOW MECHANICAL RATHER THAN A NOTE TO REMEMBER. Every literal word in every
+    # declared sentence is hinted, because the vocabulary is built from the same table the
+    # parser matches against. A verb the language gains is sayable the moment it is declared,
+    # which is the gap this test was written to stand in for.
+    for term in grammar.spoken_terms():
+        assert term.lower() in spoken, f"{term!r} is in the grammar and cannot be hinted"
 
 
 # --------------------------------------------------------------------------
@@ -2195,29 +2593,51 @@ def test_a_backhaul_question_answers_both_readings(world, log):
     one, a fact about the network. Picking either silently answers a different question from
     the one asked about half the time, and both numbers fit in a sentence.
     """
-    plan = parser.parse("how many assets have a backhaul")
+    plan = parser.parse("backhaul status")
     assert plan == [{"tool": "backhaul_status", "params": {}}]
 
     out = executor.execute(
-        plan, source="typed", tier="parser", utterance="how many assets have a backhaul"
+        plan, source="typed", tier="parser", utterance="backhaul status"
     )
     summary = out["results"][0]["message"]
     assert "carry a backhaul terminal" in summary
     assert "can currently reach one" in summary
 
 
-def test_every_way_of_saying_it_reaches_the_same_answer(world, log):
-    """A synonym known to one branch and not to the shared word list is the drift that sends
-    a question tier 1 answers perfectly off to the model as a partial match."""
+def test_the_synonyms_for_the_satellite_link_escalate_rather_than_matching_a_keyword(world, log):
+    """🔴 WHAT THIS TEST USED TO PIN, AND WHY IT IS THE OTHER WAY ROUND NOW.
+
+    Four phrasings of the backhaul question all reached tier 1, on a rule that matched
+    "backhaul", "gateway", "uplink" or "satellite terminal" anywhere in a sentence. It needed
+    two guards to survive: one so that "place a hydrophone with its own satellite terminal"
+    was not answered with a count, and one so that "what is a backhaul" was not answered with
+    eleven asset names. Both were found by somebody asking, in a live call.
+
+    ⚠️ THE WORDS ARE STILL A SINGLE LEXICON, WHICH IS WHAT THAT DRIFT WAS ABOUT: "with a
+    backhaul" means the flag in the placement sentence and nothing in the query sentence,
+    because the sentences say which. What is gone is a keyword that answers a question merely
+    by appearing in it.
+    """
+    assert parser.parse("backhaul status") == [{"tool": "backhaul_status", "params": {}}]
+
     for utterance in (
         "how many assets have a backhaul",
         "which assets have a gateway",
         "how many assets have a satellite terminal",
         "how many uplinks do we have",
+        "what is a backhaul",
     ):
-        plan = parser.parse(utterance)
-        assert plan == [{"tool": "backhaul_status", "params": {}}], utterance
-        assert parser.trace(utterance, plan)["ignored"] == [], utterance
+        assert parser.parse(utterance) is None, utterance
+
+    # ⚠️ AND THE PLACEMENT FLAG WENT WITH THEM, which is the one loss in this family worth
+    # noticing: `backhaul` is a parameter of `place_asset`, and that tool's one sentence does not
+    # set it. "Place a hydrophone with a backhaul at 74.3 -84.2" once matched, placed an ordinary
+    # hydrophone and reported success, which is why it is worth being explicit that the words now
+    # reach the model rather than being decoration beside a sentence that ignores them.
+    assert parser.parse("place a hydrophone with a backhaul at 74.3 -84.2") is None
+    assert parser.parse("place a hydrophone at 74.3 -84.2")[0]["params"] == {
+        "kind": "hydrophone", "lat": 74.3, "lon": -84.2
+    }
 
 
 def test_backhaul_does_not_steal_the_mesh_status_question(world, log):
@@ -2240,7 +2660,12 @@ def test_every_tool_is_reachable_by_tier_two_unless_deliberately_withheld():
     """
     # The camera is oriented automatically from whatever the data commands return, and the
     # prompt tells the model so. Offering it camera tools would invite it to fight that.
-    withheld = {"focus_entity", "frame_entities"}
+    withheld = {"focus_entity", "frame_entities",
+                # Editing is a dropdown, and a dropdown is what speech is worst at: most of
+                # what is editable is a choice from a closed list, where a near miss sets a
+                # field to a string nothing answers to instead of failing loudly. It is also
+                # two more `STEP_PARAMS` against a ceiling that breaks tier 2 at 15.
+                "edit_asset"}
 
     exposed = set(llm.DATA_TOOLS) | (set(llm.VIEW_TOOLS) - {"none"})
     unreachable = set(tools.REGISTRY) - exposed - withheld
@@ -2296,8 +2721,13 @@ def test_any_tier_one_refusal_reaches_the_model_not_the_operator(world, log, mon
     can be unsure ended at the operator, which is the same theft the parser's own contract
     forbids: it half-matched, and the tier allowed to be uncertain never saw the utterance.
 
-    Asserted through the endpoint rather than on the condition, because what matters is that
-    the operator gets the model's answer and not the parser's refusal.
+    ⚠️ THE UTTERANCE CHANGED BECAUSE THE FIRST HALF OF THAT FAILURE IS GONE. "What is this map
+    about" was answered by a `what is ...` rule that took the rest of the sentence as an asset
+    name; there is no such rule now, so it never reaches a plan and escalates on the ordinary
+    path. What this test is actually about is the SECOND half, which is still live and still
+    matters: tier 1 matched a real sentence, the name in it resolved to nothing, and the
+    operator must get the model rather than a refusal. "Tell me about the north pole" is that
+    shape said in the declared frame.
     """
     from api import index
 
@@ -2310,7 +2740,7 @@ def test_any_tier_one_refusal_reaches_the_model_not_the_operator(world, log, mon
         "default_provider",
         lambda: llm.ReplayProvider(
             {
-                "what is this map about": {
+                "tell me about the north pole": {
                     "reasoning": "This display shows Arctic sensor assets.",
                     "steps": [],
                     "view_tool": "none",
@@ -2321,7 +2751,7 @@ def test_any_tier_one_refusal_reaches_the_model_not_the_operator(world, log, mon
 
     client = TestClient(index.app)
     body = client.post(
-        "/api/command", json={"utterance": "what is this map about", "source": "typed"}
+        "/api/command", json={"utterance": "tell me about the north pole", "source": "typed"}
     ).json()
 
     assert body["tier"] == "llm", "a parser refusal must not be the last word"

@@ -100,6 +100,13 @@ const COLOR = {
   // different category and earns its own hue. It also has to stay legible over dark ocean,
   // dark land and bright ice, which rules out anything pale.
   track: "#c792ea",
+  // A sensor hold: which sensor can see which contact.
+  //
+  // 🔑 DESATURATED ON PURPOSE, and it is the same argument the radar colour makes. This
+  // line is evidence about a contact, not a condition of one, so it must not compete with
+  // the red that means "not broadcasting" nor with the green family that means our kit.
+  // Dotted carries the meaning; the colour only has to stay legible over ocean and ice.
+  detection: "#8fa6bd",
   // ---- the three condition rings, and nothing else uses these -------------
   /** Maintenance: the kit needs attention and we can still hear it. */
   maintenance: "#ffd166",
@@ -333,6 +340,26 @@ export function GlobeMap() {
       // one with 20 km look identical on any display that only draws connectivity, and
       // they are completely different operationally: the first is what "about to be cut
       // off" actually looks like. Amber is under 3 km of margin.
+      // 🔑 SENSOR HOLDS, DRAWN DOTTED SO THEY CANNOT BE READ AS RADIO LINKS. A solid line
+      // means "these two can talk to each other"; a dotted one means "this sensor can see
+      // that contact". They are different claims about different graphs, and drawing them
+      // in one style would invite an operator to read a detection as connectivity.
+      //
+      // Added BELOW the mesh links deliberately: where both run between the same patch of
+      // map, the network the operator owns is the one on top.
+      m.addSource("detections", { type: "geojson", data: emptyFC() });
+      m.addLayer({
+        id: "detections",
+        type: "line",
+        source: "detections",
+        paint: {
+          "line-color": COLOR.detection,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 2, 0.6, 6, 1.2],
+          "line-opacity": 0.55,
+          "line-dasharray": [2, 2],
+        },
+      });
+
       m.addSource("mesh-links", { type: "geojson", data: emptyFC() });
       m.addLayer({
         id: "mesh-links",
@@ -723,7 +750,12 @@ export function GlobeMap() {
                   kind,
                   lat,
                   lon,
-                  ...(unknown ? { unknown: true } : {}),
+                  // 🔑 BOTH FLAGS, BECAUSE THE CONTROL NOW SAYS HOSTILE. `unknown` makes it
+                  // unidentified and silent; `hostile` is how it is regarded. A seeded
+                  // UNKNOWN carries both, so sending only the first would place something
+                  // the strip counts as unjudged under a control labelled hostile, which
+                  // is the display asserting something it has not done.
+                  ...(unknown ? { unknown: true, hostile: true } : {}),
                   ...(backhaul ? { backhaul: true } : {}),
                 },
               },
@@ -1003,6 +1035,48 @@ export function GlobeMap() {
     src.updateImage({ url, coordinates });
   }, [ice, ready]);
 
+  // Sensor holds: a dotted line from each sensor to the contact it is holding.
+  //
+  // 🔒 REPORTED ONLY. A sensor holding something whose route home is down is the one case
+  // this display refuses to draw: the console cannot legitimately know that contact is
+  // there, and a line to it would be the map asserting knowledge that never arrived. The
+  // pair is shipped with the flag so the coverage view can still reveal it behind its own
+  // control; the default picture claims only what reached us.
+  //
+  // ⚠️ THE SAME ENDPOINT RULES AS THE MESH LINKS, and for the same reasons: a hidden kind
+  // drops its lines rather than running them to empty water, and an endpoint we cannot hear
+  // from drops them rather than drawing to a position we are no longer sure of.
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !ready || !mesh) return;
+    const at = new globalThis.Map(
+      assets
+        .filter((a) => a.lat !== null && !hiddenKinds.includes(a.kind))
+        .map((a) => [a.id, a] as const),
+    );
+    const now = Date.now();
+    setData(
+      m,
+      "detections",
+      (mesh.detections ?? []).flatMap((d) => {
+        if (!d.reported) return [];
+        const s = at.get(d.sensorId);
+        const c = at.get(d.contactId);
+        if (!s || !c) return [];
+        if (isUnreachable(s, now)) return [];
+        return [
+          line(
+            [
+              [s.lon as number, s.lat as number],
+              [c.lon as number, c.lat as number],
+            ],
+            { distance: d.distanceKm },
+          ),
+        ];
+      }),
+    );
+  }, [assets, mesh, ready, hiddenKinds]);
+
   // Mesh links. Endpoints are looked up from the asset list rather than sent as
   // coordinates, so a link can never draw to a stale position: the graph names ids, and
   // ids resolve against whatever the store currently holds. That lookup is why this
@@ -1135,6 +1209,10 @@ export function GlobeMap() {
  * between samples. Everything about position, range and connectivity stays server-side.
  */
 function headingOf(a: { kind: string; props: Record<string, unknown>; geometry: { coordinates: [number, number][] } | null }): number {
+  // 🔑 THE SERVER'S NUMBER, WHICH IS NOW THE COMPUTED ONE. `motion.heading_of` derives this
+  // from the leg the asset is actually on and falls back to a reported heading only when
+  // there is no route. Preferring the stored value here is what drew two ships more than 55
+  // degrees off their own course: the number was seeded once and the route turned.
   const reported = a.props?.heading_deg;
   if (typeof reported === "number" && Number.isFinite(reported)) return reported;
 

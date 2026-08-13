@@ -14,10 +14,14 @@ the whole argument for putting three kinds of sensor on one shoreline instead of
 more of the best one, and until now this project asserted it in prose without ever
 demonstrating it.
 
+    radar     470 km   aircraft ONLY: too coarse for a small drone, blind to the water
     rf         45 km   but ONLY against something that is transmitting
     eo_ir      15 km   sees anything above the surface, and is the one that identifies
     magnetic    4 km   steel hull or vehicle, works on something completely silent
     acoustic   18 km   the hydrophone array, and only against something in the water
+
+The radar line is the argument at its clearest: by far the longest reach and by far the
+narrowest domain, so buying range does not buy coverage of anything but one kind.
 
 ⚠️ WHAT THIS DELIBERATELY DOES NOT MODEL: weather, darkness, sea state, target size, the
 difference between detecting something and identifying it, and the fact that a real EO/IR
@@ -35,10 +39,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from . import domain
 from .mesh import haversine_km, mesh_status
 
-# Anything that can be held by a sensor. Everything else on the map is ours.
-CONTACT_KINDS: frozenset[str] = frozenset({"vessel", "aircraft", "ground_party"})
+# Anything that can be held by a sensor. Everything else on the map is ours or a known
+# third party. Derived from `domain.KINDS` rather than written out again here, because this
+# set and the identical one in `motion` were two answers to one question with nothing
+# claiming to be the original.
+CONTACT_KINDS: frozenset[str] = domain.CONTACT_KINDS
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,22 @@ SENSORS: dict[str, Sensor] = {
         needs_emission=False,
         label="acoustic",
     ),
+    # 🔑 THE LONG-RANGE SPECIALIST, AND IT SEES EXACTLY ONE THING. An air surveillance radar
+    # is built to find aircraft at hundreds of kilometres and is close to useless against
+    # everything else on this map: a small uncrewed aircraft is below its resolution, a
+    # ground party is buried in clutter, and nothing in the water is visible to it at all.
+    # That is the same argument the rest of this table makes, at the other end of the scale:
+    # the sensor with by far the longest reach is the one with the narrowest domain, so
+    # range and usefulness are not the same axis.
+    #
+    # The per-site figure overrides this default: the main stations reach 470 km and the
+    # short-range gap fillers 110 km.
+    "radar": Sensor(
+        range_km=110.0,
+        sees=frozenset({"aircraft"}),
+        needs_emission=False,
+        label="air surveillance radar",
+    ),
 }
 
 
@@ -96,6 +120,11 @@ def sensor_for(asset: dict[str, Any]) -> tuple[str, Sensor] | None:
     kind = asset.get("kind")
     if kind == "hydrophone":
         return "acoustic", SENSORS["acoustic"]
+    # A radar site's sensor is the reason it exists, like a hydrophone's, so it is not
+    # written in the seed either. Until now this function returned None for it, which made
+    # twelve installations scenery: they carried a range in the data and detected nothing.
+    if kind == "radar":
+        return "radar", SENSORS["radar"]
     if kind != "node":
         return None
     payload = (asset.get("props") or {}).get("payload")
@@ -128,6 +157,22 @@ def _range_for(sensor: Sensor, asset: dict[str, Any]) -> float:
     """
     override = (asset.get("props") or {}).get("detection_radius_km")
     return float(override) if override is not None else sensor.range_km
+
+
+def sensor_range_km(asset: dict[str, Any]) -> float | None:
+    """How far this asset can hold a contact, or None if it is not a sensor.
+
+    🔑 THE EFFECTIVE RANGE, NOT THE STORED ONE. A hydrophone and a radar site carry the
+    number in the seed; a node does not, because a node is a mast and its reach comes from
+    whichever payload is bolted to it. Reading `props` alone answered N/A for twenty-four
+    nodes that detect to fifteen kilometres, which is the panel disagreeing with the model
+    two layers down.
+    """
+    found = sensor_for(asset)
+    if found is None:
+        return None
+    _, sensor = found
+    return _range_for(sensor, asset)
 
 
 def detections(assets: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

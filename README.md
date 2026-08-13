@@ -14,18 +14,21 @@ Live: **[coverage.skryer.ca](https://coverage.skryer.ca)**
 
 ## What it does today
 
-- **Typed and spoken commands** answered through one registry of 17 validated tools. "Show me what is
+- **Typed and spoken commands** answered through one registry of 19 validated tools. "Show me what is
   not broadcasting", "fly Daymark 05 to Barrow Strait", "where has the Resolute patrol been",
   "what are we not seeing".
-- **A two-tier command path.** A deterministic parser answers roughly thirty phrasings with no model
-  call at all. Anything it does not recognise goes to a language model, which proposes a plan as JSON and
-  never touches state directly.
+- **A two-tier command path built on a declared command language.** The first tier answers 18
+  sentences with no model call at all, exactly one per tool, each anchored to the whole utterance, so
+  it either recognises a request completely or hands it over. Anything outside the language goes to a language model, which
+  proposes a plan as JSON and never touches state directly. The reference card in the console prints
+  the language, one canonical sentence per tool, and is rendered from the same table the parser matches
+  against.
 - **A question instead of a guess.** "Tell me about Daymark" names five drones, so the console asks
   which one and offers each as a button carrying the command with it. Answering costs a click rather
   than a retyped sentence, and the question comes from the deterministic tier, so it is immediate and
   free.
 - **One sentence, several actions.** "Isolate Daymark 05" expands into three steps: put the camera on
-  the asset and select it, filter the picture down to it, and open its detail. The steps refer back to
+  the asset and select it, resolve what the name matched, and open its detail. The steps refer back to
   what earlier steps resolved, so a plan is a sequence rather than a batch.
 - **An audit log** carrying every command: what was said, which tier answered, the plan, each step and
   its outcome. Written before any effect is visible, and readable on screen, where the steps of one
@@ -224,6 +227,10 @@ data.
 Worth its own section, because the failures this project most wanted to avoid are all overclaims.
 
 - **The mesh graph is optimistic.** See above. It is a planning aid, not a link budget.
+- **"Isolate" filters on a kind, not on a single asset.** Naming a kind hides everything else;
+  naming one asset moves the camera to it, selects it and opens its detail, but leaves the rest of the
+  picture drawn. That asymmetry is a gap rather than a decision, and it is stated here rather than
+  papered over, because a bullet above used to describe the single-asset case as filtering.
 - **Terrain refusals are trustworthy; terrain approvals are not.** The coastline is a simplified
   polygon set, so within a few kilometres of a shore the data cannot resolve which side a point is on.
   A refusal names a medium and a distance and can be checked. An approval near a coast proves nothing,
@@ -310,14 +317,14 @@ that should not be published.
   scheduling call was deliberate: the finding that matters is that the field naming a polygon's ice
   stage reports the **thickest** stage present, so reading it as "the thickness here" would
   systematically overstate how safe the ice is.
-- **Next: close the loop between the two tiers.** The deterministic parser works out which of your
-  words it could not place, and that finding is shown to you and withheld from the model. There are
-  two routes to the second tier and only one of them carries anything from the first: when the parser
-  produces a plan naming something that does not exist, the retry hands the model the failed name and
-  every real one. When the parser cannot place enough of the sentence to try, the model gets the
-  sentence alone. So an identical misspelling succeeds or fails depending on whether the parser
-  guessed first, which is arbitrary from where the operator is sitting. Passing the parser's trace and
-  the known names on every call would fix it. It is not done here for a reason worth stating: the
+- **Next: hand the model the known names on every call, not just on one route.** There are two routes
+  to the second tier. When the first tier produces a plan naming something that does not exist, the
+  retry hands the model the failed name and every real one; when the sentence is outside the command
+  language, the model gets the sentence alone. So an identical misspelling succeeds or fails depending
+  on which route it took, which is arbitrary from where the operator is sitting. Passing the known
+  names on every call would fix it. (The first tier's own finding does now travel on both routes: it
+  says whether the sentence was near a declared command or nowhere close, and that is shown to you
+  while the model is working.) It is not done here for a reason worth stating: the
   transcription prompt is built the same way, from live asset names, and on weak audio it inserted
   names nobody had said. A hint list that dominates is a failure mode this project has already
   measured once, and doing it to the tier that answers commands deserves the same measurement first.
@@ -374,11 +381,25 @@ touch the database.
 **As a runtime component.** The second tier of the command path is `claude-opus-5`. It proposes a plan
 as JSON and never touches state: a validator resolves every referenced entity against live data and
 rejects anything that does not resolve, on the principle that a hallucinated value must never reach
-real state on the model's word alone. The first tier is a deterministic parser that answers common
-phrasings with no model call, which is faster and cheaper, and means the app still works when the
-model is unavailable. Measured locally across 88 phrasings, tier 1 answers in a median 1.3 seconds
-against 7.2 for tier 2, and answered 23 of the 88 with no model call at all. That set was written to
-be awkward, so the share is a floor rather than a typical session.
+real state on the model's word alone. The first tier is a declared command language, 18 sentences
+matched exactly and printed in full on the reference card, which is faster and cheaper and means the app still works when the model is
+unavailable. Measured locally across 88 phrasings, tier 1 answers in a median 1.3 seconds against 7.2
+for tier 2.
+
+⚠️ **The share answered without a model call fell a long way when that tier became exact, and the
+number is worth reading carefully rather than as a regression.** An earlier version matched keywords
+anywhere in a sentence and caught 23 of those 88. On a set of 21 phrasings kept from that run it
+matched 16, but only **9** of those reached the operator: the other 7 were matched and then escalated
+anyway, by a second mechanism that subtracted a two-hundred-word list of words that did not count as
+dropped and handed over whatever was left. The 18-sentence language serves **3** of the same 21. Of the
+6 it stopped serving, 2 had been answered with the wrong tool ("what is the threat level" resolved to
+an asset search for something called "threat level") and 4 were correct answers that now cost a model
+call. Both mechanisms are gone, replaced by one that cannot half-match.
+
+**So the metric changed meaning.** It was "how often is an unrehearsed phrasing caught by accident",
+and it is now "an operator who reads the card drives every tool at zero cost, and everything else gets
+the model". The card is the whole language rather than a sample of it, which is the property that makes
+the deterministic tier a control surface instead of a cache: nothing is answerable that is not printed.
 
 **Voice transcription is `gemini-3.5-flash-lite`, and audio leaves the browser to reach it.** The two
 model components, Gemini for voice and Claude for text, are the only runtime network calls carrying

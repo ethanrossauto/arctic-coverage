@@ -66,6 +66,19 @@ export type AssetStatus = "nominal" | "maintenance" | "degraded" | "warning" | "
 /** Exactly one of these per asset, once the server ships it. */
 export type AssetFlag = "nominal" | "maintenance" | "overdue";
 
+/**
+ * Who operates this thing, derived on the server from the kind declaration.
+ *
+ * 🔑 SEPARATE FROM `AssetThreat` ON PURPOSE. A NORAD radar site and an unidentified vessel
+ * are both "not ours" and are not remotely the same thing: one is a known fixed
+ * installation somebody else runs, the other is a contact that will not say what it is.
+ * A single `owned` boolean put them in one bucket.
+ */
+export type AssetRelationship = "ours" | "third_party" | "contact";
+
+/** How it should be regarded. `unknown` is the honest default for an unjudged contact. */
+export type AssetThreat = "friendly" | "unknown" | "hostile";
+
 /** GeoJSON LineString, as the server stores it: lon-first. */
 export interface LineGeometry {
   type: "LineString";
@@ -103,6 +116,12 @@ export interface Asset {
    * closer to it, the other means go and look at what stopped relaying.
    */
   meshConnected?: boolean;
+  /** Who operates it. Server-derived; `undefined` from a build that does not send it. */
+  relationship?: AssetRelationship;
+  /** How it is regarded. Server-derived, and never guessed on the client. */
+  threat?: AssetThreat;
+  /** How far this asset can hold a contact, effective rather than stored. Sensors only. */
+  detectionRadiusKm?: number;
   /** Server-computed staleness. `undefined` until the server ships it. */
   overdue?: boolean;
   /** Contacts only: is it actually on our picture. Absent on anything that is not a contact. */
@@ -141,6 +160,9 @@ interface WireAsset {
   created_by: "seed" | "user" | "llm";
   server_reachable?: boolean;
   mesh_connected?: boolean;
+  relationship?: AssetRelationship;
+  threat?: AssetThreat;
+  detection_radius_km?: number;
   tracked?: boolean;
   held?: number;
   detected_unknown?: boolean;
@@ -170,6 +192,9 @@ export async function fetchAssets(kind?: AssetKind): Promise<Asset[]> {
     createdBy: a.created_by,
     serverReachable: a.server_reachable,
     meshConnected: a.mesh_connected,
+    relationship: a.relationship,
+    threat: a.threat,
+    detectionRadiusKm: a.detection_radius_km,
     tracked: a.tracked,
     held: a.held,
     detectedUnknown: a.detected_unknown,
@@ -282,6 +307,19 @@ export function connectionCount(id: string, mesh: MeshStatus | null): number {
  * the map until that lands. The bridge is temporary and should be deleted, not kept.
  */
 export function isUnreachable(asset: Asset, nowMs: number): boolean {
+  // 🔴 A CONTACT IS NEVER UNREACHABLE, AND THIS LINE IS THE WHOLE FIX. Reachability is a
+  // fact about OUR network: it means no path exists from this asset back to a gateway. A
+  // contact was never on that network, so the question does not apply to it, and answering
+  // it anyway put a grey "unreachable" ring on two unidentified contacts.
+  //
+  // ⚠️ THE TWO STATES ARE NOT THE SAME AND WANT DIFFERENT ACTIONS. Ours going quiet means
+  // go and look at what stopped relaying. A contact going quiet means we have lost track of
+  // something we do not control, and the answer is to re-acquire it. `overdue` already says
+  // that, in a word that is true for both.
+  //
+  // This function's own docstring used to call the fallback below temporary. It was not
+  // temporary, it was wrong for a third of the map.
+  if (asset.relationship === "contact") return false;
   // Unreachable propagates: an asset behind an overdue relay is grey even though nothing
   // is wrong with it. Only the server can know that, so there is no fallback for the
   // propagated case, only for the asset's own silence.
@@ -320,14 +358,21 @@ export function isGateway(asset: Asset): boolean {
  * speed. Normalising everything to one unit would make every number slightly unfamiliar
  * to whoever actually cares about it, and would invent precision in the conversion.
  */
+/**
+ * 🔑 ONE STORED FIELD, AND THE UNIT IS A DISPLAY DECISION. Speed is kept as `speed_kmh`
+ * everywhere and rendered in the unit its kind is actually spoken in: knots at sea and in
+ * the air, km/h on the ground. This used to read three different props with three different
+ * names, mirroring a three-way lookup on the server, so one quantity needed the same
+ * conversion table in two places and either could miss a case.
+ */
+const KNOTS_KINDS = new Set<string>(["vessel", "aircraft"]);
+const KM_PER_KNOT = 1.852;
+
 export function speedOf(asset: Asset): string | null {
-  const p = asset.props ?? {};
-  if (typeof p.speed_kn === "number") return `${p.speed_kn} kn`;
-  if (typeof p.speed_kmh === "number") return `${p.speed_kmh} km/h`;
-  // A drone reports the speed it cruises at rather than a measured instantaneous one, so
-  // it is labelled as such instead of being passed off as the same measurement.
-  if (typeof p.cruise_kmh === "number") return `${p.cruise_kmh} km/h cruise`;
-  return null;
+  const kmh = (asset.props ?? {}).speed_kmh;
+  if (typeof kmh !== "number") return null;
+  if (KNOTS_KINDS.has(asset.kind)) return `${Math.round(kmh / KM_PER_KNOT)} kn`;
+  return `${Math.round(kmh)} km/h`;
 }
 
 /** Latitude and longitude, in the form an operator would read one out. */
@@ -462,6 +507,29 @@ export interface MeshStatus {
    */
   serverReachable: string[];
   unreachable: string[];
+  /**
+   * Which sensor is currently holding which contact.
+   *
+   * 🔑 THE SECOND GRAPH OVER THE SAME ASSETS, and it answers the question the mesh graph
+   * cannot: not "can this asset talk to us" but "how do we know that thing is there".
+   * Computed on the server for the same reason the links are, the client holds no sensor
+   * table and no ranges.
+   */
+  detections: Detection[];
+}
+
+export interface Detection {
+  sensorId: string;
+  contactId: string;
+  distanceKm: number;
+  /**
+   * Does this detection actually reach us?
+   *
+   * 🔒 FALSE MEANS THE SENSOR HOLDS IT AND THE REPORT CANNOT GET HOME, which the console
+   * must not draw as knowledge. It is shipped rather than filtered away because the
+   * coverage view exists to reveal exactly that gap behind a control.
+   */
+  reported: boolean;
 }
 
 export async function fetchMesh(): Promise<MeshStatus> {
@@ -481,6 +549,12 @@ export async function fetchMesh(): Promise<MeshStatus> {
     meshCapable: body.mesh_capable as number,
     serverReachable: (body.server_reachable ?? []) as string[],
     unreachable: (body.unreachable ?? []) as string[],
+    detections: ((body.detections ?? []) as Record<string, unknown>[]).map((d) => ({
+      sensorId: d.sensor_id as string,
+      contactId: d.contact_id as string,
+      distanceKm: d.distance_km as number,
+      reported: Boolean(d.reported),
+    })),
   };
 }
 

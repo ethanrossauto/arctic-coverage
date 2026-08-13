@@ -28,15 +28,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from . import domain
+
 # How long each kind may go unheard before it counts as overdue, because the kinds report
 # on different rhythms. One global threshold would either call every patrol overdue or
 # never notice a dead node: a mesh node beacons continuously, a Ranger patrol checks in
 # when it stops moving.
 #
-# ⚠️ `radar` IS ABSENT ON PURPOSE, NOT BY OMISSION. Those sites are not on the mesh at
-# all, which is the interoperability problem stated as data rather than as prose. An asset
-# cannot be overdue to a network it was never on, and giving them a threshold would make
-# twelve sites permanently overdue and bury the four that really are.
 # 🔑 EVERY ONE OF THESE IS A NUMBER OF MISSED BEACONS, NOT A GUESS. Everything reports
 # every five seconds, so a threshold is really "how many reports may go missing before an
 # operator should be told", and each is defensible in one sentence:
@@ -189,7 +187,50 @@ def decorate(row: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
     now = now or datetime.now(UTC)
     row["overdue"] = is_overdue(row, now)
     row["flag"] = flag_for(row, now)
+
+    # 🔑 RELATIONSHIP AND THREAT ARE DERIVED HERE, NOT STORED, for the same reason `overdue`
+    # is: they are a function of what a thing IS plus what the data says about it, so a
+    # stored copy is one more place for the answer to drift. `relationship` comes straight
+    # off the kind declaration; `threat` is the separate axis.
+    #
+    # 🔑 WHY TWO FIELDS RATHER THAN ONE `owned` FLAG. Under a single boolean a NORAD radar
+    # site and an unidentified vessel are both "not ours", and telling those apart is most
+    # of what this display is for. One is a known fixed installation somebody else operates;
+    # the other is a contact that will not say what it is.
+    spec = domain.spec(row.get("kind"))
+    if spec is not None:
+        row["relationship"] = spec.relationship
+        row["threat"] = _threat_of(row, spec)
+
+    # Derived for the same reason as the two above: the answer exists in the sensor model
+    # and reading `props` alone missed every node.
+    #
+    # ⚠️ LOCAL IMPORT, like `refresh` below and for the same reason: `detect` imports this
+    # module, so naming it at the top would be a cycle. The line below is what the module
+    # docstring means by sitting under everything that needs it.
+    from . import detect  # noqa: PLC0415
+
+    reach = detect.sensor_range_km(row)
+    if reach is not None:
+        row["detection_radius_km"] = reach
     return row
+
+
+def _threat_of(row: dict[str, Any], spec: domain.KindSpec) -> str:
+    """How this thing should be regarded, which is not the same as who operates it.
+
+    ⚠️ `unknown` IS THE DEFAULT FOR A CONTACT AND THAT IS THE HONEST ANSWER. A contact
+    nobody has judged has not been judged; calling it friendly because nothing said
+    otherwise would put a judgement on the screen that no person made.
+    """
+    if spec.relationship != "contact":
+        return "friendly"
+    hostile = (row.get("props") or {}).get("hostile")
+    if hostile is True:
+        return "hostile"
+    if hostile is False:
+        return "friendly"
+    return "unknown"
 
 
 # 🔴 A WORLD WHOSE ASSETS NEVER REPORT AGAIN FREEZES SOLID, AND THAT WAS THE STATE OF IT.

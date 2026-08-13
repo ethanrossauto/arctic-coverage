@@ -278,12 +278,12 @@ def _nodes() -> list[Asset]:
             stale_minutes, battery = _NODE_STALENESS.get(
                 node_id, (_REPORTING, 55 + (i * 7) % 40)
             )
-            props = {
-                "cluster": cluster_key,
+            # A mast carries a sensor and sits in a cluster. It does not carry a power
+            # source or a charge level: both were written here and read by nothing, which
+            # is telemetry the display invented rather than telemetry it receives.
+            props: dict[str, Any] = {
                 "cluster_name": cluster_name,
                 "payload": _PAYLOADS[(i - 1) % len(_PAYLOADS)],
-                "power_source": "solar_wind" if i % 3 else "primary_battery",
-                "battery_pct": battery,
             }
             if node_id in _BACKHAUL_NODES:
                 props["backhaul"] = "satellite"
@@ -372,10 +372,6 @@ def _patrols() -> list[Asset]:
             # a long way from anything, reporting every five seconds through their own uplink.
             last_heard_minutes_ago=_REPORTING,
             props={
-                "members": 14,
-                "progress_pct": 48,
-                "next_waypoint": "Prince of Wales Strait north",
-                "transport": "atv",
                 "speed_kmh": 22,
                 "backhaul": "satellite",
             },
@@ -391,7 +387,7 @@ def _patrols() -> list[Asset]:
             # 25 km of a mast, so it is heard only when something bridges it. That is the
             # case a drone at the midpoint exists to demonstrate.
             last_heard_minutes_ago=19.0,
-            props={"members": 6, "progress_pct": 22, "next_waypoint": "Cape Martyr", "transport": "snowmobile", "speed_kmh": 18},
+            props={"speed_kmh": 18},
         ),
         Asset(
             id="patrol-cambridge",
@@ -401,7 +397,7 @@ def _patrols() -> list[Asset]:
             lon=cambridge_loop[1][1],
             geometry=line(cambridge_loop),
             last_heard_minutes_ago=316.0,  # overdue: the check-in question, embodied
-            props={"members": 5, "progress_pct": 61, "next_waypoint": "Collinson Peninsula", "transport": "atv", "speed_kmh": 20},
+            props={"speed_kmh": 20},
         ),
     ]
 
@@ -416,14 +412,14 @@ def _patrols() -> list[Asset]:
 
 def _uas() -> list[Asset]:
     bases = [
-        ("uas-inuvik", "Daymark 01", "Inuvik", 310, "on_station"),
-        ("uas-yellowknife", "Daymark 02", "Yellowknife", 260, "ready"),
-        ("uas-iqaluit", "Daymark 03", "Iqaluit", 295, "ready"),
-        ("uas-rankin", "Daymark 04", "Rankin Inlet", 180, "maintenance"),
-        ("uas-resolute", "Daymark 05", "Resolute Bay", 340, "on_station"),
+        ("uas-inuvik", "Daymark 01", "Inuvik", "on_station"),
+        ("uas-yellowknife", "Daymark 02", "Yellowknife", "ready"),
+        ("uas-iqaluit", "Daymark 03", "Iqaluit", "ready"),
+        ("uas-rankin", "Daymark 04", "Rankin Inlet", "maintenance"),
+        ("uas-resolute", "Daymark 05", "Resolute Bay", "on_station"),
     ]
     out = []
-    for uid, name, base, endurance, state in bases:
+    for uid, name, base, state in bases:
         lat, lon = SETTLEMENTS[base]
         out.append(
             Asset(
@@ -435,12 +431,14 @@ def _uas() -> list[Asset]:
                 alt_m=0.0 if state != "on_station" else 3200.0,
                 status="maintenance" if state == "maintenance" else "nominal",
                 last_heard_minutes_ago=_REPORTING,
+                # `state` is gone because top-level `status` already carries maintenance,
+                # and two columns for one fact is how they end up disagreeing. `base`,
+                # `endurance_min_remaining` and the eo_ir payload went with it: a drone is
+                # not a sensor in this model, so the payload decided nothing, and endurance
+                # was an indirection standing in front of one question, how far can it go.
                 props={
-                    "base": base,
-                    "state": state,
-                    "endurance_min_remaining": endurance,
-                    "cruise_kmh": 140,
-                    "payload": "eo_ir",
+                    "speed_kmh": 140,
+                    "flight_radius_km": 174.0,
                 },
             )
         )
@@ -493,13 +491,7 @@ _NARROWS: list[tuple[str, str, float, float, int]] = [
 def _hydrophones() -> list[Asset]:
     out = []
     for i, (key, name, lat, lon, depth) in enumerate(_NARROWS, start=1):
-        # The two units that are currently holding a contact. They are the reason the
-        # other eight are in the water.
-        detected = i in _DETECTING_UNITS
-        props = {
-            "array": "Lancaster Sound barrier",
-            "position_in_line": i,
-            "depth_m": depth,
+        props: dict[str, Any] = {
             # 🔑 THE SENSOR RADIUS, WHICH IS NOT THE RADIO RANGE. About 18 km of useful
             # underwater detection against a quiet vessel here. Entirely separate from how
             # this unit reaches the mesh, which it does over RF through its surface buoy
@@ -507,8 +499,6 @@ def _hydrophones() -> list[Asset]:
             # footprints very nearly touch and a transit crosses the line rather than
             # slipping between two of them.
             "detection_radius_km": 18,
-            "last_detection_minutes_ago": 22 if detected else None,
-            "battery_pct": 40 + (i * 13) % 55,
         }
         if i == _ARRAY_BACKHAUL_INDEX:
             props["backhaul"] = "satellite"
@@ -618,11 +608,9 @@ def _dark_contacts() -> list[Asset]:
                 last_heard_minutes_ago=22.0,
                 props={
                     "classification": "unknown",
-                    "flag": None,
-                    "speed_kn": speed,
+                                        "speed_kmh": round(speed * 1.852, 1),
                     "heading_deg": 270,
                     "held_by": f"hyd-{_NARROWS[unit - 1][0]}",
-                    "track_source": "acoustic",
                     # Running dark through a chokepoint is the behaviour that earns this
                     # label. It is a property of an ordinary vessel rather than a kind of
                     # its own, so nothing in terrain, motion, detection or the mesh has to
@@ -662,11 +650,9 @@ def _dark_contacts() -> list[Asset]:
             last_heard_minutes_ago=14.0,
             props={
                 "classification": "unknown",
-                "flag": None,
-                "speed_kn": 11.0,
+                                "speed_kmh": round(11.0 * 1.852, 1),
                 "heading_deg": 250,
                 "emitting": False,
-                "track_source": "electro-optical",
                 "hostile": True,
             },
         )
@@ -685,7 +671,7 @@ def _vessels() -> list[Asset]:
         ("vsl-tundra-maru", "Tundra Maru", "cargo", "Liberia", True, _NORTHERN_ROUTE, 8, 13.0),
     ]
     out = _dark_contacts()
-    for vid, name, classification, flag, ais, route, idx, speed in specs:
+    for vid, name, classification, _flag, ais, route, idx, speed in specs:
         lat, lon = route[idx]
         # A non-broadcasting contact is held by a sensor, not by its own report, so
         # its track is only what was observed: the route up to where it is now.
@@ -707,14 +693,11 @@ def _vessels() -> list[Asset]:
                 last_heard_minutes_ago=3.0 if ais else 22.0,
                 props={
                     "classification": classification,
-                    "flag": flag,
-                    "speed_kn": speed,
+                    "speed_kmh": round(speed * 1.852, 1),
                     "heading_deg": 270 if route is _NORTHERN_ROUTE else 250,
-                    "route": "northern" if route is _NORTHERN_ROUTE else "southern",
-                    # Provenance matters: a contact nobody can name is more
+                                        # Provenance matters: a contact nobody can name is more
                     # interesting when you know which sensor is holding it.
-                    "first_detected_by": "hyd-barrow" if not ais and route is _NORTHERN_ROUTE
-                    else ("hyd-victoria" if not ais else "ais"),
+
                 },
             )
         )
@@ -788,16 +771,19 @@ def _radars() -> list[Asset]:
                 # than inventing a heartbeat keeps "what has gone quiet" honest,
                 # since a radar site cannot be overdue to a network it is not on.
                 last_heard_minutes_ago=None,
+                # 🔑 ONE FIELD, AND IT DECIDES SOMETHING. This block used to carry eight
+                # props: a designator, a place name that repeated the asset's own name, an
+                # operator, an `owned: false`, a radar type, a coverage class that restated
+                # the range, an inferred-from note and a position accuracy. Nothing read any
+                # of them. `owned` is now `domain.KINDS["radar"].relationship`, and the
+                # range is the one number the detection model actually uses.
+                #
+                # ⚠️ `detection_radius_km`, not `range_km`, because that is the name
+                # `detect._range_for` overrides on and the hydrophone array already uses it.
+                # Two names for a sensor's reach is how a number ends up quoted in the
+                # interface while a different one is doing the work.
                 props={
-                    "designator": designator,
-                    "place": place,
-                    "operator": "NORAD",
-                    "owned": False,
-                    "radar_type": "AN/FPS-117" if is_main else "AN/FPS-124",
-                    "range_km": 470 if is_main else 110,
-                    "coverage_class": "long_range" if is_main else "short_range",
-                    "class_inferred_from": "historic -M main-station designator",
-                    "position_accuracy": "approximate",
+                    "detection_radius_km": 470 if is_main else 110,
                 },
             )
         )
@@ -843,7 +829,7 @@ _LAUNCH_SITES: list[tuple[str, str, str, int, int]] = [
 
 def _launch_sites() -> list[Asset]:
     out = []
-    for key, name, settlement, runway, based in _LAUNCH_SITES:
+    for key, name, settlement, _runway, _based in _LAUNCH_SITES:
         lat, lon = SETTLEMENTS[settlement]
         out.append(
             Asset(
@@ -856,16 +842,10 @@ def _launch_sites() -> list[Asset]:
                 status="nominal",
                 last_heard_minutes_ago=_REPORTING,
                 props={
-                    "settlement": settlement,
-                    "runway_m": runway,
                     # Every launch site is a way out of the theatre. Carried as a property
                     # rather than inferred from the kind, so one field answers "is this a
                     # gateway" for a launch site, a sensor node and a hydrophone alike.
                     "backhaul": "satellite",
-                    "uas_capacity": 2,
-                    "uas_based": based,
-                    "fuel_state": "full" if based else "limited",
-                    "position_accuracy": "settlement centroid",
                 },
             )
         )
@@ -959,9 +939,8 @@ def _aircraft() -> list[Asset]:
                     "emitting": emitting,
                     "transponder": emitting,
                     "hostile": classification == "unknown",
-                    "speed_kn": speed,
-                    "altitude_m": alt,
-                },
+                    "speed_kmh": round(speed * 1.852, 1),
+                                    },
             )
         )
     return out
@@ -969,7 +948,7 @@ def _aircraft() -> list[Asset]:
 
 def _ground_parties() -> list[Asset]:
     out = []
-    for gid, name, classification, emitting, lat, lon, size in _GROUND_PARTIES:
+    for gid, name, classification, emitting, lat, lon, _size in _GROUND_PARTIES:
         out.append(
             Asset(
                 id=gid,
@@ -984,8 +963,9 @@ def _ground_parties() -> list[Asset]:
                     "classification": classification,
                     "emitting": emitting,
                     "hostile": classification == "unknown",
-                    "party_size": size,
-                    "transport": "on foot",
+                    # It moves, so it has a speed. `motion._DRIFT_SPEED_KMH` already used
+                    # 4 km/h for this kind; the seed simply never wrote it down.
+                    "speed_kmh": 4,
                 },
             )
         )

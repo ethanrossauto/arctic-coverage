@@ -134,13 +134,26 @@ MAX_TOKENS = 2048
 # raises `LLMUnavailable` like any other transport failure, and the caller answers with
 # what the deterministic tier can still do. The operator loses the reasoning layer for one
 # utterance; they do not lose the application.
-TIMEOUT_S = 30.0
+#
+# 🔑 FIFTEEN, DOWN FROM THIRTY, BECAUSE THE MEASUREMENT CAME IN. A probe across 88
+# phrasings put this tier at a 7.0 s median and an 11.8 s p90, so fifteen clears the
+# measured tail with room and still fires long before a person decides the interface is
+# broken. Thirty was chosen when there was no distribution to choose against.
+TIMEOUT_S = 15.0
 
-# 🔑 NO RETRY, DOWN FROM ONE, BECAUSE THE CEILING ABOVE WENT UP. At twelve seconds a
-# second attempt was nearly free; at thirty it puts the worst case at a minute, which is
-# the "the interface has stopped" failure the ceiling exists to prevent. One honest
-# refusal beats two silent waits, and the deterministic tier is still there underneath.
-MAX_RETRIES = 0
+# 🔑 ONE RETRY, UP FROM NONE, BECAUSE THE CEILING ABOVE CAME DOWN. The pair is what
+# matters rather than either number: 15 s twice is the same 30 s worst case that was
+# already accepted, so this buys a survivable transient at no cost to the ceiling.
+#
+# ⚠️ THE FAILURE THIS EXISTS FOR IS REAL AND WAS OBSERVED. A single upstream timeout, with
+# no second attempt, is a visible dead stop for whoever is watching, and the tier answered
+# normally minutes either side of it. One transport hiccup should not be indistinguishable
+# from an outage.
+#
+# ⚠️ AND IT MUST NOT GO TO TWO. The reason no-retry was chosen originally still holds: a
+# retry on a ceiling high enough to hide a broken component turns "tier 2 does not work"
+# into "tier 2 is slow", which is strictly harder to find.
+MAX_RETRIES = 1
 
 # USD per token, per model. Published list prices, written as a rate rather than a
 # per-million figure so the arithmetic below has no hidden factor of a million in it.
@@ -260,6 +273,9 @@ DATA_TOOLS = [
     "entity_history",
     "mesh_status",
     "backhaul_status",
+    # The world's own history: what was changed and what was refused. Distinct from
+    # `entity_history`, which is one asset's track across time rather than the log.
+    "recent_activity",
     "coverage",
     "show_unknown",
     "show_overlay",
@@ -799,7 +815,67 @@ class ReplayProvider:
 
 
 class LLMUnavailable(RuntimeError):
-    """No provider could answer. Distinct from a bad answer, and reported differently."""
+    """No provider could answer. Distinct from a bad answer, and reported differently.
+
+    🔑 IT CARRIES THE DIAGNOSIS, NOT JUST THE SENTENCE. A tier-2 failure used to reach the audit
+    log as one string, so the row said "tier 2 unavailable: APITimeoutError: Request timed out"
+    and every question worth asking of it went unanswered: was that the client's own ceiling or
+    an upstream refusal, how long did the operator wait, was it the first attempt or the retry,
+    which model, and did the provider give a request id to quote.
+
+    🔴 THE ONE THAT MATTERS MOST IS THE ELAPSED TIME, and this file already records why. A
+    timeout that fires at the ceiling means the call was slow; a failure that returns in 200 ms
+    means the request itself was refused, and the two need opposite responses. Without the
+    number they read identically, which is exactly how a broken schema once presented itself as
+    "tier 2 takes 36 seconds" rather than as "tier 2 does not work".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str | None = None,
+        model: str | None = None,
+        elapsed_ms: int | None = None,
+        status: int | None = None,
+        request_id: str | None = None,
+        attempts: int | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind or type(self).__name__
+        self.model = model
+        self.elapsed_ms = elapsed_ms
+        self.status = status
+        self.request_id = request_id
+        self.attempts = attempts
+        self.timeout_s = timeout_s
+
+    def as_params(self) -> dict[str, Any]:
+        """The structured half, for the audit row. Absent fields are left out rather than
+        written as null: a column of nulls reads as "we looked and found nothing"."""
+        found = {
+            "error": self.kind,
+            "model": self.model,
+            "elapsed_ms": self.elapsed_ms,
+            "status": self.status,
+            "request_id": self.request_id,
+            "attempts": self.attempts,
+            "timeout_s": self.timeout_s,
+            # 🔑 THE READING, COMPUTED HERE SO THE LOG DOES NOT NEED ARITHMETIC. Anything that
+            # spent the whole ceiling is a slow or unreachable upstream; anything that came back
+            # fast was refused, and a refusal is usually ours to fix.
+            "verdict": (
+                "hit the client ceiling: upstream slow or unreachable"
+                if self.elapsed_ms is not None
+                and self.timeout_s is not None
+                and self.elapsed_ms >= int(self.timeout_s * 1000)
+                else "returned before the ceiling: the request itself was refused"
+                if self.elapsed_ms is not None
+                else None
+            ),
+        }
+        return {k: v for k, v in found.items() if v is not None}
 
 
 class AnthropicProvider:
@@ -852,7 +928,19 @@ class AnthropicProvider:
                 messages=messages,
             )
         except Exception as exc:  # noqa: BLE001 - any transport failure is "tier 2 unavailable"
-            raise LLMUnavailable(f"{type(exc).__name__}: {exc}") from exc
+            # ⚠️ THE ELAPSED TIME IS MEASURED ACROSS EVERY ATTEMPT THE SDK MADE, not one. With
+            # `max_retries=1` a ceiling failure reads as roughly twice `TIMEOUT_S`, which is the
+            # number an operator actually waited and the one worth logging.
+            raise LLMUnavailable(
+                f"{type(exc).__name__}: {exc}",
+                kind=type(exc).__name__,
+                model=self.model,
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                status=getattr(exc, "status_code", None),
+                request_id=getattr(exc, "request_id", None),
+                attempts=MAX_RETRIES + 1,
+                timeout_s=TIMEOUT_S,
+            ) from exc
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 

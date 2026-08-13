@@ -99,6 +99,13 @@ export interface CommandEntry {
   thinking?: string;
   /** The parser tried, could not resolve it, and the model was asked instead. */
   escalatedFrom?: string;
+  /**
+   * A quiet line teaching the deterministic phrasing that reaches the same tool.
+   *
+   * Styled down rather than up: it is worth reading once and worth ignoring forever after,
+   * so it must not compete with the answer it sits under.
+   */
+  hint?: boolean;
 }
 
 /**

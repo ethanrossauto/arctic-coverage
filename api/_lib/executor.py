@@ -44,7 +44,7 @@ import time
 import uuid
 from typing import Any
 
-from . import db
+from . import db, grammar
 from .tools import REGISTRY, Ambiguous, ToolError, ToolResult, Unresolved
 
 # A plan longer than this is not a plan, it is a loop, and the model does not get one.
@@ -269,10 +269,14 @@ def _required(fn: Any) -> list[str]:
     ]
 
 
-# What the parser writes when the operator said "this" or "the current zoom window"
+# What the grammar writes when the operator said "this" or "the current zoom window"
 # instead of naming something. The plan stays a plain data structure that means nothing
-# until it meets the context, which is what lets the parser stay free of live state.
-VIEWPORT = "__viewport__"
+# until it meets the context, which is what lets tier 1 stay free of live state.
+#
+# ⚠️ THREE OF THE FOUR ARE DECLARED IN `grammar` AND RE-EXPORTED HERE, because the grammar is
+# what emits them and this module is what binds them. Re-exported rather than moved outright so
+# every existing `executor.VIEWPORT` keeps resolving; there is one declaration either way.
+VIEWPORT = grammar.VIEWPORT
 SELECTION = "__selected__"
 
 # 🔴 WHAT THE LAST COMMAND ANSWERED WITH. "List them" means the three things you just
@@ -287,7 +291,7 @@ SELECTION = "__selected__"
 # 🔑 BOUND TO THE PREVIOUS RESULT SET, NOT TO THE PREVIOUS SENTENCE. Re-parsing the earlier
 # utterance would be a second guess at a question that has already been answered exactly;
 # the ids that came back are the only true record of what "them" refers to.
-RESULT = "__result__"
+RESULT = grammar.RESULT
 
 # 🔴 THE ASSET THIS PLAN IS ABOUT, once one of its own steps has resolved it. The other
 # three placeholders are answered by the CLIENT: the viewport and the selection come in on
@@ -299,7 +303,7 @@ RESULT = "__result__"
 # to it, select it, and open its detail. The filter step needs the asset's id, the parser
 # only ever had the words "daymark 01", and the id does not exist until a step has run. So
 # the first step to name an asset fixes the subject and the rest of the plan refers to it.
-SUBJECT = "__subject__"
+SUBJECT = grammar.SUBJECT
 
 # The words people actually use for the thing they are looking at. Deixis is not a corner
 # case in a map application: "this", "it", "that one" are how anyone refers to the asset

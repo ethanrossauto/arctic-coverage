@@ -18,6 +18,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { ALL_KINDS, fetchAssets, fetchMesh } from "./assets";
 import { setCommandRunner } from "./commandRunner";
+import { HelperSheet, helperMuted, setMuted } from "./HelperSheet";
 import type { AssetKind } from "./assets";
 import { RECENT_IDS, useStore } from "./store";
 import type { AssetTrack, CameraTarget } from "./store";
@@ -88,6 +89,13 @@ interface CommandResponse {
   /** Present only when the parser tried, failed to resolve, and the model was asked. */
   escalated_from?: string;
   /**
+   * After a model answer only: the deterministic phrasing that reaches the same tool.
+   *
+   * ⚠️ NOT A TRANSLATION OF THE QUESTION. The tool is what matches, not the sentence, so
+   * the line is worded as "reachable without the model" rather than "next time say this".
+   */
+  teach?: { tool: string; say: string }[];
+  /**
    * Why the answer is what it is. Present on both tiers, with different keys on each.
    *
    * ⚠️ THE KEY IS `thinking`, AND I HAD THIS WRONG. This renderer originally read
@@ -102,14 +110,36 @@ interface CommandResponse {
     model?: string;
     latency_ms?: number;
     cost_usd?: number;
-    /** Tier 1: which branch matched, and what it took out of the sentence. */
+    /** Tier 1: which tool answered, and what it took out of the sentence. */
     matched?: string;
     extracted?: Record<string, unknown>;
     /**
-     * 🔑 THE MOST VALUABLE FIELD HERE. Words the parser threw away. Two utterances
-     * differing only by "on foot" returned identical answers because the phrase was
-     * silently dropped, and on a misheard voice command an invented asset name shows up
-     * as an extracted parameter nobody asked for. Both are invisible without this.
+     * The declared sentence that answered, which is exactly what the reference card prints.
+     *
+     * 🔑 THE ONE FIELD AN OPERATOR CAN ACT ON. "matched list_entities" names a function nobody
+     * says out loud; the phrasing that answered them is repeatable, and seeing it here is the
+     * card arriving at the moment they are already looking at the screen.
+     */
+    grammar?: string;
+    /**
+     * Why tier 1 handed over, present only when it did.
+     *
+     * 🔑 ITS EXISTENCE IS THE MESSAGE, and it replaced `ignored` below. Tier 1 is an exact
+     * grammar now: it cannot half-match, so there are no dropped words to name. What it can
+     * say is whether the sentence was NEAR a declared command, which is the difference between
+     * "say it the printed way and it is instant and free" and "this genuinely needed the
+     * model".
+     */
+    declined?: string;
+    /**
+     * Words the parser threw away.
+     *
+     * ⚠️ NO LONGER SENT, AND KEPT HERE FOR THE ROWS THAT ALREADY CARRY IT. Tier 1 was a pile
+     * of patterns that could match part of a sentence, so two utterances differing only by "on
+     * foot" returned identical answers with the phrase silently dropped, and this list was how
+     * that became visible. An anchored grammar accounts for every word or produces no plan, so
+     * nothing computes this any more. The audit log still holds it on older commands, and what
+     * those rows say about what happened then is still true.
      */
     ignored?: string[];
     /**
@@ -127,6 +157,8 @@ interface CommandResponse {
     parser?: {
       matched?: string;
       extracted?: Record<string, unknown>;
+      grammar?: string;
+      declined?: string;
       ignored?: string[];
     };
   };
@@ -158,9 +190,12 @@ function thinkingOf(body: CommandResponse): string | undefined {
   // the model concluded, and separately, here is a tier that apparently did nothing.
   const p = t.parser;
   if (p?.ignored?.length) {
+    // Only reachable for a command answered before the grammar landed; see `ignored` above.
     lines.push(
       `parser: dropped ${p.ignored.map((w) => `"${w}"`).join(", ")} → asked the model`,
     );
+  } else if (p?.declined) {
+    lines.push(`parser: ${p.declined} → asked the model`);
   } else if (p?.matched) {
     lines.push(`parser: matched ${p.matched} → asked the model`);
   }
@@ -169,7 +204,8 @@ function thinkingOf(body: CommandResponse): string | undefined {
   }
 
   if (t.reasoning) lines.push(`${p ? "model:  " : ""}${t.reasoning}`);
-  if (t.matched) lines.push(`matched: ${t.matched}`);
+  if (t.grammar) lines.push(`matched: "${t.grammar}" → ${t.matched}, no model call`);
+  else if (t.matched) lines.push(`matched: ${t.matched}`);
   if (t.extracted && Object.keys(t.extracted).length) {
     lines.push(`extracted: ${paramList(t.extracted)}`);
   }
@@ -208,14 +244,6 @@ function readable(v: unknown): string {
   if (v === "__selected__") return "the selected asset";
   return typeof v === "string" ? v : JSON.stringify(v);
 }
-
-/** Rotated through the placeholder, so the field suggests what this thing can do. */
-const EXAMPLES = [
-  "mesh status",
-  "show me the drones",
-  "what is not broadcasting",
-  "which assets are overdue",
-];
 
 /**
  * How long a command may run before the transcript says something, in milliseconds.
@@ -297,10 +325,23 @@ export function CommandBar() {
   const [waiting, setWaiting] = useState(false);
   const activityRef = useRef<HTMLDivElement>(null);
   const [recording, setRecording] = useState(false);
+
+  /**
+   * The command reference, opened by the two gestures that both mean "I am about to give a
+   * command": putting the cursor in the box, and pressing the microphone.
+   *
+   * ⚠️ `muted` SUPPRESSES THE AUTOMATIC OPENING ONLY. The card is still reachable from the
+   * ? button, which is why the control says "don't open automatically" rather than
+   * "disable": one click that hid a reference permanently, with no way back, would be a
+   * trap rather than a preference.
+   */
+  const [helperOpen, setHelperOpen] = useState(false);
+  const [muted, setMutedState] = useState(helperMuted);
   const [micError, setMicError] = useState<string | null>(null);
   /** Live input level, 0 to 1. Shown while recording so "it is listening" is visible. */
   const [level, setLevel] = useState(0);
 
+  const assets = useStore((s) => s.assets);
   const log = useStore((s) => s.commandLog);
   const append = useStore((s) => s.appendCommand);
   const setAssets = useStore((s) => s.setAssets);
@@ -350,11 +391,15 @@ export function CommandBar() {
   }, [log, waiting, expanded]);
   const recorder = useRef<MediaRecorder | null>(null);
 
-  // Focus the field on load. This is the primary interface, so landing with the cursor
-  // anywhere else would be asking the operator to hunt for it.
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+  // 🔑 THE FIELD IS NOT FOCUSED ON LOAD, AND THE REFERENCE CARD IS WHY. It used to be: this
+  // is the primary interface, so landing with the cursor in it saved a click. Once the card
+  // existed that became inconsistent, because the two states disagreed about what was
+  // happening. The cursor said "you are typing a command"; the card, which opens on exactly
+  // that intent, said nothing. One of them had to be wrong, and it is cheaper to lose a
+  // click than to have the console assert two different things about the same moment.
+  //
+  // So the page lands inert: typing does nothing until the operator says so by clicking in,
+  // and when they do, both the cursor and the card agree.
 
   async function run(
     utterance: string,
@@ -447,6 +492,23 @@ export function CommandBar() {
         escalatedFrom: body.escalated_from,
       });
       if (asking) setClarify(fx.clarify!);
+
+      // 🔑 THE OTHER HALF OF THE REFERENCE CARD, AND THE HALF THAT STICKS. The card teaches
+      // before, when somebody thinks to look; this teaches at the moment the lesson has a
+      // cost attached, which is when a person actually remembers it. Both are built from
+      // one canonical phrasing per tool, so they cannot disagree.
+      //
+      // ⚠️ SUCCESSES ONLY. After a refusal the operator has a problem to solve, and a note
+      // about a cheaper way to have failed is noise.
+      if (body.ok && !asking && body.teach?.length) {
+        const says = body.teach.map((x) => `"${x.say}"`).join(", ");
+        append({
+          role: "system",
+          text: `Reachable without the model: ${says}`,
+          ok: true,
+          hint: true,
+        });
+      }
 
       // 🔒 BUILT FROM THE RESPONSE, NEVER FROM WHAT WAS SENT. The plan that ran is the
       // resolved one and may differ from what was said, and the ids that came back are the
@@ -722,7 +784,10 @@ export function CommandBar() {
           ref={activityRef}
         >
           {(expanded ? log : log.slice(-LATEST_EXCHANGE)).map((e, i) => (
-            <div key={i} className={`entry ${e.role}${e.ok === false ? " bad" : ""}`}>
+            <div
+              key={i}
+              className={`entry ${e.role}${e.ok === false ? " bad" : ""}${e.hint ? " hint" : ""}`}
+            >
               <span className="marker">{e.role === "user" ? (e.source === "voice" ? "🎤" : "›") : "·"}</span>
               <span className="etext">
                 {e.text}
@@ -813,19 +878,52 @@ export function CommandBar() {
         </div>
       )}
 
+      {/* 🔑 ONE FOCUS REGION, INPUT AND CARD TOGETHER, and this is the whole trick. React's
+          onFocus and onBlur are focusin and focusout, so they bubble: the wrapper sees
+          focus enter and leave the group as a unit. Closing on the input's own blur would
+          mean clicking the card blurs the input and closes the card out from under the
+          click, which is the classic version of this bug. `relatedTarget` is where focus
+          went next; if it is still inside this element, nothing has actually left. */}
+      <div
+        className="cmdgroup"
+        onFocus={() => {
+          if (!muted) setHelperOpen(true);
+        }}
+        onBlur={(ev) => {
+          if (!ev.currentTarget.contains(ev.relatedTarget as Node | null)) setHelperOpen(false);
+        }}
+      >
+        <HelperSheet
+          open={helperOpen}
+          assets={assets}
+          onMute={() => {
+            setMuted(true);
+            setMutedState(true);
+            setHelperOpen(false);
+          }}
+        />
+
       <form
         className="cmdbar"
         onSubmit={(ev) => {
           ev.preventDefault();
           const t = text;
           setText("");
+          // The answer deserves the space, and the line under it that names the tier-1
+          // phrasing is what carries the teaching from here.
+          setHelperOpen(false);
           void run(t, "typed");
         }}
       >
         <button
           type="button"
           className={`mic${recording ? " live" : ""}`}
-          onClick={() => void toggleMic()}
+          onClick={() => {
+            // Pressing the microphone is the same intent as clicking into the box, and it
+            // is the case the card matters most for: you can read it while you speak.
+            if (!muted && !recording) setHelperOpen(true);
+            void toggleMic();
+          }}
           disabled={busy && !recording}
           title={recording ? "Stop and send" : "Speak a command. Audio is sent to a cloud model"}
           aria-label={recording ? "Stop recording" : "Record a spoken command"}
@@ -854,15 +952,47 @@ export function CommandBar() {
              browser, and the browser is not the only caller. */
           maxLength={1000}
           disabled={busy}
-          placeholder={busy ? "working…" : `try: ${EXAMPLES[log.length % EXAMPLES.length]}`}
+          /* ⚠️ THE ROTATING EXAMPLE THAT USED TO LIVE HERE IS GONE. It cycled four
+             suggestions through this box, which is the same job the reference card does at
+             the same moment and does properly: four hand-written phrasings that nothing
+             checked, against every phrasing the parser answers, verified by the suite. Two
+             teaching mechanisms competing in one square inch, and this was the weaker. */
+          placeholder={busy ? "working…" : "type a command, or press ? for the list"}
           onChange={(e) => setText(e.target.value)}
+          /* 🔴 CLICK AS WELL AS FOCUS, AND THE PAGE LANDS IN EXACTLY THE STATE THAT NEEDS
+             IT. The field is focused on load, so the first click on it moves focus from
+             nowhere to nowhere and fires no focus event at all: the operator clicks the
+             box they were told to use and nothing happens. Focus covers tabbing in, this
+             covers clicking a field that already has the cursor. */
+          onClick={() => {
+            if (!muted) setHelperOpen(true);
+          }}
           aria-label="Command"
         />
 
         <button type="submit" disabled={busy || !text.trim()}>
           {busy ? "…" : "RUN"}
         </button>
+
+        {/* ⚠️ THE WAY BACK, and it is why the mute control can be one click. A preference
+            that hides something with no visible route to it is not a preference. */}
+        <button
+          type="button"
+          className="helperopen"
+          /* ⚠️ FORCES OPEN RATHER THAN TOGGLING. Focusing this button also fires the
+             group's focus handler, so a toggle read the state the focus had just set and
+             immediately undid it: pressing ? closed the card it had opened, which looked
+             like the button was broken. Its real job is the muted case, where nothing else
+             opens the card; closing is what blur and submit are for. */
+          onClick={() => setHelperOpen(true)}
+          aria-expanded={helperOpen}
+          title="What can I say?"
+          aria-label="Show the command reference"
+        >
+          ?
+        </button>
       </form>
+      </div>
 
       {micError && <div className="micerr">{micError}</div>}
     </div>

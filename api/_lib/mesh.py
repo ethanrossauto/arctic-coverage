@@ -50,6 +50,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from . import domain
+
 # Mean earth radius, km. WGS84 would be spurious precision against a model that already
 # ignores terrain.
 EARTH_R_KM = 6371.0088
@@ -75,9 +77,11 @@ EARTH_R_KM = 6371.0088
 # finding rather than a bug". It was true when they were scattered one per chokepoint and
 # stopped being true when they became a single array spaced to reach each other. A comment
 # describing a finding has to be deleted when the finding is designed out.
-MESH_KINDS: frozenset[str] = frozenset(
-    {"node", "patrol", "uas", "launch_site", "hydrophone"}
-)
+# ⚠️ DERIVED, NOT LISTED. This was a hand-written set, and the paragraph below about the
+# constant that went stale is exactly what happens to hand-written sets. `domain.KINDS`
+# declares `on_mesh` per kind and this follows from it, so a new kind cannot be on the
+# network in one file and off it in another.
+MESH_KINDS: frozenset[str] = domain.MESH_KINDS
 
 # 🔑 WHY A SENSOR CLUSTER CARRIES ITS OWN UPLINK, which is the part worth being able to
 # defend. Above roughly 70 degrees north a geostationary satellite sits below the horizon,

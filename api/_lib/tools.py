@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import db, freshness, terrain
+from . import db, freshness, grammar, terrain
 from . import mesh as meshlib
 
 # --------------------------------------------------------------------------
@@ -142,14 +142,43 @@ class Tool:
     # Whether this tool changes the world. Read-only tools are still logged, because
     # "who looked at what" is part of an audit trail, but only writers touch entities.
     writes: bool = False
+    # 🔑 WHAT AN OPERATOR SAYS TO REACH THIS TOOL IS NOT DECLARED HERE. It used to be, as a
+    # `says` tuple beside each tool, and it was the second copy of a sentence the parser also
+    # had to know: the card said one thing, the parser accepted another, and the suite could
+    # only check that they overlapped. The sentence now lives once, in `grammar.RULES`, and
+    # `says()` below reads it from there. See `grammar.card_sentences`.
+    # Which heading this sits under on the card. Operator intent, not implementation.
+    group: str = "ask"
 
 
 REGISTRY: dict[str, Tool] = {}
 
+#: The card's headings, in the order they are shown. Ordered by how often an operator
+#: reaches for them rather than alphabetically.
+GROUPS: tuple[tuple[str, str], ...] = (
+    ("see", "SEE"),
+    ("look", "LOOK AT"),
+    ("ask", "ASK"),
+    ("do", "DO"),
+)
 
-def tool(name: str, summary: str, params: dict[str, str], writes: bool = False):
+
+def tool(
+    name: str,
+    summary: str,
+    params: dict[str, str],
+    writes: bool = False,
+    group: str = "ask",
+):
     def wrap(fn: Callable[..., ToolResult]) -> Callable[..., ToolResult]:
-        REGISTRY[name] = Tool(name=name, summary=summary, params=params, fn=fn, writes=writes)
+        REGISTRY[name] = Tool(
+            name=name,
+            summary=summary,
+            params=params,
+            fn=fn,
+            writes=writes,
+            group=group,
+        )
         return fn
 
     return wrap
@@ -249,33 +278,16 @@ def _placed_props(kind: str) -> dict[str, Any]:
 
     props: dict[str, Any] = {}
     if kind == "node":
+        # The payload is the only one of these that decides anything: `detect.sensor_for`
+        # reads it to work out what this mast can see. A power source and a battery
+        # percentage were written here too and consulted by nothing.
         props["payload"] = "eo_ir"
-        props["power_source"] = "battery"
-        props["battery_pct"] = 100
-    if kind == "hydrophone":
-        # Quoted on screen beside the array, so it has to agree with where the thing is.
-        props["depth_m"] = 200
     if kind == "uas":
-        props["endurance_min_full"] = 310.0
-        props["endurance_min_remaining"] = 310.0
-        props["battery_pct"] = 100
-        props["state"] = "loitering"
-        props["payload"] = "eo_ir"
+        props["flight_radius_km"] = motion.UAS_FLIGHT_RADIUS_KM
     drift_kmh = motion._DRIFT_SPEED_KMH.get(kind)
     if drift_kmh:
-        # Each kind is reported in the unit its own seeded rows use, so one asset does not
-        # describe itself in knots beside another describing itself in km/h.
-        if kind in ("vessel",):
-            props["speed_kn"] = round(drift_kmh / 1.852)
-        elif kind == "uas":
-            props["cruise_kmh"] = round(drift_kmh)
-        elif kind == "aircraft":
-            props["speed_kn"] = round(drift_kmh / 1.852)
-        else:
-            props["speed_kmh"] = round(drift_kmh)
-    altitude = _PLACED_ALTITUDE_M.get(kind)
-    if altitude:
-        props["altitude_m"] = altitude
+        # One unit stored, whatever the kind. The display decides whether to say knots.
+        props["speed_kmh"] = round(drift_kmh)
     return props
 
 
@@ -512,6 +524,7 @@ def frame_for(points: list[tuple[float, float]]) -> dict[str, Any]:
         "ids": "restrict to these exact assets, for 'list them' after a previous answer",
         "name": "match assets whose name contains this text, for 'how many Daymark are there'",
     },
+    group="see",
 )
 def list_entities(
     kind: str | None = None,
@@ -628,9 +641,109 @@ def list_entities(
 
 
 @tool(
+    "recent_activity",
+    "What has happened in this world recently: assets placed or removed, faults injected or "
+    "cleared, drones tasked, and anything the console refused. Use for 'what changed', "
+    "'what have I done', 'show me the event log'.",
+    {
+        "days": "how far back to look, in days. Fractions are fine: 0.04 is about an hour",
+        "target": "one asset by name or id, to see only what happened to that one",
+    },
+    group="ask",
+)
+def recent_activity(days: float = 1.0, target: str | None = None) -> ToolResult:
+    """The audit log, answered as a sentence instead of pointed at.
+
+    🔑 THE PANEL EXISTED AND NOTHING COULD ASK IT ANYTHING. Seventeen tools and not one read
+    the log, so "what did I just change" had no answer and the parser resolved "show me the
+    event log" to `focus_entity`, hunting for an asset by that name. A capability missing
+    from the tool list reads to the model as a capability that does not exist, which is the
+    same way the log came to deny its own existence once before.
+
+    🔑 IT READS EVERYONE'S HISTORY, AND THAT IS CORRECT HERE. One database means one world,
+    so what happened to it is a shared fact. **Deixis is personal, audit is communal**: "them"
+    must never resolve against a stranger's command, and "what has happened" would be a lie
+    if it hid theirs. Same data, opposite scoping, which is why one lives in the client's
+    `context.recent` and this one does not.
+
+    ⚠️ CHANGES AND REFUSALS ONLY, NOT EVERY READ. Forty rows of somebody listing the
+    hydrophones is not what anyone means by "what has happened", and burying two real edits
+    under them answers the question worse than saying nothing.
+
+    ⚠️ AND IT NAMES A RESET WHEN ONE FALLS INSIDE THE WINDOW. The world returns to the seed
+    after an idle spell, so rows either side of that belong to different worlds and reading
+    them as one history is how you conclude something was deleted that was never there.
+    """
+    rows = db.fetch_events(limit=1000)
+    if not rows:
+        return ToolResult(ok=True, message="nothing has happened here yet", data={"events": []})
+
+    window = max(0.0, float(days)) * 86400.0
+    now = datetime.now(UTC)
+    recent = []
+    for row in rows:
+        stamp = row.get("ts")
+        when = datetime.fromisoformat(stamp) if isinstance(stamp, str) else stamp
+        if when is None:
+            continue
+        if (now - when).total_seconds() <= window:
+            recent.append((when, row))
+
+    reset_at = next(
+        (when for when, row in reversed(recent) if row.get("tool") == "world_reset"), None
+    )
+    if reset_at is not None:
+        recent = [(when, row) for when, row in recent if when >= reset_at]
+
+    if target:
+        asset = _require_one(target, _entities())
+        recent = [
+            (when, row)
+            for when, row in recent
+            if row.get("entity_id") == asset["id"] or asset["name"].lower() in str(row.get("detail", "")).lower()
+        ]
+
+    changed = [
+        (when, row)
+        for when, row in recent
+        if (row.get("tool") in REGISTRY and REGISTRY[row["tool"]].writes)
+        or row.get("result") == "rejected"
+    ]
+
+    if not changed:
+        scope = f" to {target}" if target else ""
+        return ToolResult(
+            ok=True,
+            message=f"nothing has changed{scope} in that window, and nothing was refused",
+            data={"events": [], "considered": len(recent)},
+        )
+
+    lines = []
+    for when, row in changed[-8:]:
+        mins = max(0, int((now - when).total_seconds() // 60))
+        ago = "just now" if mins == 0 else f"{mins} min ago"
+        verb = row.get("tool")
+        detail = str(row.get("detail") or "")[:80]
+        outcome = "refused: " if row.get("result") == "rejected" else ""
+        lines.append(f"{ago}, {verb}: {outcome}{detail}")
+
+    reset_note = ""
+    if reset_at is not None:
+        mins = max(0, int((now - reset_at).total_seconds() // 60))
+        reset_note = f" The world was reset {mins} min ago; anything before that was a different world."
+
+    return ToolResult(
+        ok=True,
+        message=f"{len(changed)} change(s) and refusal(s): " + "; ".join(lines) + reset_note,
+        data={"events": [row for _, row in changed], "count": len(changed)},
+    )
+
+
+@tool(
     "mesh_status",
     "Report radio connectivity: how many links are up, which groups can reach each other, what is isolated.",
     {},
+    group="ask",
 )
 def mesh_status() -> ToolResult:
     st = meshlib.mesh_status(_entities())
@@ -650,6 +763,7 @@ def mesh_status() -> ToolResult:
     "How many assets carry a satellite backhaul terminal, and how many can currently reach "
     "one through the mesh.",
     {},
+    group="ask",
 )
 def backhaul_status() -> ToolResult:
     """Answer "how many assets have a backhaul" both ways, because it has two readings.
@@ -743,6 +857,7 @@ def _connection_stats(entity_id: str) -> dict[str, Any]:
     "describe_entity",
     "Everything known about one asset, including its mesh neighbours and how reliably it has been connected.",
     {"target": "asset name or id"},
+    group="ask",
 )
 def describe_entity(target: str) -> ToolResult:
     rows = _entities()
@@ -822,6 +937,7 @@ MAX_TRACK_POINTS = 400
         "target": "asset name or id",
         "days": "how far back to look, in days. Fractions are fine: 0.5 is the last twelve hours",
     },
+    group="look",
 )
 def entity_history(target: str, days: float = 1.0) -> ToolResult:
     """One asset's recent positions, as a series.
@@ -893,7 +1009,12 @@ def _window_words(minutes: int) -> str:
 # --------------------------------------------------------------------------
 
 
-@tool("focus_entity", "Select one asset and move the camera to it.", {"target": "asset name or id"})
+@tool(
+    "focus_entity",
+    "Select one asset and move the camera to it.",
+    {"target": "asset name or id"},
+    group="look",
+)
 def focus_entity(target: str) -> ToolResult:
     rows = _entities()
     asset = _require_one(target, rows)
@@ -923,6 +1044,7 @@ def focus_entity(target: str) -> ToolResult:
     "frame_entities",
     "Move the camera so that all the named assets are visible at once.",
     {"targets": "list of asset names or ids", "kind": "or frame every asset of one kind"},
+    group="look",
 )
 def frame_entities(targets: list[str] | None = None, kind: str | None = None) -> ToolResult:
     rows = _entities()
@@ -964,6 +1086,7 @@ OVERLAYS: dict[str, str] = {
     "show_overlay",
     "Turn on an environmental overlay, such as measured sea ice, over the current view.",
     {"layer": "ice"},
+    group="see",
 )
 def show_overlay(layer: str = "ice") -> ToolResult:
     """Answer "show me the overlays" without inventing a feed this build does not have.
@@ -1005,6 +1128,7 @@ VIEW_MODES = ("hide", "show", "only", "all")
         "mode": "one of hide, show, only, all",
         "kinds": "list of kinds to act on, such as radar or vessel. Not needed for 'all'",
     },
+    group="see",
 )
 def set_visible_kinds(mode: str = "show", kinds: list[str] | None = None) -> ToolResult:
     """Turn whole kinds off and on, for reading a crowded map.
@@ -1072,7 +1196,12 @@ def set_visible_kinds(mode: str = "show", kinds: list[str] | None = None) -> Too
     )
 
 
-@tool("reset_view", "Return the camera to the default view of the whole Arctic.", {})
+@tool(
+    "reset_view",
+    "Return the camera to the default view of the whole Arctic.",
+    {},
+    group="look",
+)
 def reset_view() -> ToolResult:
     return ToolResult(
         ok=True,
@@ -1111,6 +1240,7 @@ def reset_view() -> ToolResult:
         ),
     },
     writes=True,
+    group="do",
 )
 def place_asset(
     kind: str,
@@ -1241,6 +1371,7 @@ def place_asset(
         "altitude_m": "altitude to hold, in metres",
     },
     writes=True,
+    group="do",
 )
 def task_uas(target: str, lat: float, lon: float, altitude_m: float = 3200.0) -> ToolResult:
     """Task a drone to a station.
@@ -1262,18 +1393,23 @@ def task_uas(target: str, lat: float, lon: float, altitude_m: float = 3200.0) ->
     if asset["status"] == "maintenance":
         raise ToolError(f'{asset["name"]} is in maintenance and cannot be tasked')
 
+    from . import motion  # local: motion imports terrain, same reason as the placement path
+
     props = asset.get("props") or {}
-    endurance = float(props.get("endurance_min_remaining") or 0)
-    cruise = float(props.get("cruise_kmh") or 140)
-    reserve_min = 30.0
+    cruise = float(props.get("speed_kmh") or 140)
+
+    # 🔑 ONE DECLARED RADIUS, NOT A FUEL MODEL. This used to derive the reachable distance
+    # from `endurance_min_remaining`, a reserve and a cruise speed, which meant three stored
+    # numbers and an arithmetic chain standing behind one answer: can it get there and back.
+    # The radius is that answer, stated once. The refusal below is unchanged in what it
+    # tells the operator, and it no longer quotes a fuel figure nothing else consults.
+    radius_km = float(props.get("flight_radius_km") or motion.UAS_FLIGHT_RADIUS_KM)
 
     distance = meshlib.haversine_km(asset["lat"], asset["lon"], lat, lon)
-    radius_km = max(0.0, (endurance - reserve_min) / 2.0 / 60.0 * cruise)
     if distance > radius_km:
         raise ToolError(
             f'{asset["name"]} cannot reach that station: {distance:.0f} km out against a '
-            f'{radius_km:.0f} km radius on {endurance:.0f} minutes of fuel, and it has to '
-            "come back"
+            f"{radius_km:.0f} km radius, and it has to come back"
         )
 
     eta_min = distance / cruise * 60.0
@@ -1293,10 +1429,8 @@ def task_uas(target: str, lat: float, lon: float, altitude_m: float = 3200.0) ->
                 # these two. Removing it while it has a reader would turn a working guard
                 # into a dead one, so it goes when the reader has moved.
                 "motion_frozen": True,
-                "state": "on_station",
                 "station": [lat, lon],
                 "eta_min": round(eta_min, 1),
-                "endurance_min_remaining": round(endurance - eta_min, 1),
             },
             # 🔴 CARRIED THROUGH, NOT CLEARED. This wrote None, so tasking a drone erased
             # its heartbeat and quietly removed it from overdue accounting for good: the
@@ -1342,6 +1476,7 @@ def _detect_module() -> Any:
     "coverage",
     "What the sensor network can and cannot currently see, including contacts nothing is holding.",
     {},
+    group="see",
 )
 def coverage() -> ToolResult:
     """Answer "what are we not seeing", which is the question this network exists for.
@@ -1418,10 +1553,105 @@ def coverage() -> ToolResult:
 
 
 @tool(
+    "edit_asset",
+    "Change one field on one asset. Only fields the schema declares editable, and only on "
+    "kinds they apply to.",
+    {
+        "target": "asset name or id",
+        "field": "which field to change, by its declared name",
+        "value": "the new value, as text; numbers are parsed",
+    },
+    writes=True,
+    group="do",
+)
+def edit_asset(target: str, field: str, value: str) -> ToolResult:
+    """One field, one asset, checked against the declaration rather than against a list here.
+
+    🔑 THE SCHEMA DECIDES WHAT MAY BE EDITED, NOT THIS FUNCTION. `fields.py` says where each
+    value came from, and origin decides the capability: `observed` and `derived` are never
+    editable, because editing an observed value falsifies the record and a derived one is
+    edited through its inputs or it simply disagrees with them on the next read. Hardcoding
+    a list of editable names here would be a second copy of that decision, and it would go
+    stale the first time a field changed origin, which `heading_deg` did within the hour.
+
+    ⚠️ MOUSE ONLY, AND THE REASON IS THE EDITS THEMSELVES. Most of what is editable is a
+    CHOICE from a short closed list: a payload is one of the sensors that exist, a backhaul is
+    on or off. That is a dropdown, and a dropdown is precisely what voice and typing are worst
+    at. Saying "electro optical infrared" reliably is harder than clicking it, and a near miss
+    does not fail loudly, it sets a field to a string no sensor answers to.
+
+    There is a second reason and it is worth knowing, but it is the smaller one: a generic
+    set-a-field needs a field name and a value, two more entries in `llm.STEP_PARAMS`, which
+    sits at 13 against a ceiling that returns `400 Schema is too complex` at 15. Exposing this
+    would have taken tier 2 down for every utterance while the whole suite stayed green,
+    because the replay provider never sends a schema.
+    """
+    from . import fields as fieldlib
+
+    spec = fieldlib.BY_NAME.get(field)
+    if spec is None:
+        known = ", ".join(sorted(f.name for f in fieldlib.FIELDS if f.editable))
+        raise ToolError(f"there is no field called {field}. Editable fields are: {known}")
+    if not spec.editable:
+        origins = " or ".join(spec.origins)
+        raise ToolError(
+            f"{spec.label} is {origins}, so it is not something to set: it is what the "
+            "sensors reported or what the model worked out"
+        )
+
+    rows = _entities()
+    asset = _require_one(target, rows)
+    if not spec.applies_to(asset["kind"]):
+        raise ToolError(f'{spec.label} does not apply to a {asset["kind"]}')
+
+    parsed: Any = value
+    if spec.choices and value not in spec.choices:
+        raise ToolError(
+            f'{spec.label} is one of {", ".join(spec.choices)}, and "{value}" is not'
+        )
+    if spec.type == "number":
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ToolError(f'{spec.label} is a number, and "{value}" is not one') from exc
+        if parsed < 0:
+            raise ToolError(f"{spec.label} cannot be negative")
+    elif spec.type == "boolean":
+        parsed = str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    was = (asset.get("props") or {}).get(field)
+    # ⚠️ EVERY COLUMN THE ROW ALREADY HAD, NOT JUST THE ONES BEING CHANGED. `insert_entity`
+    # is an upsert over the full row, so a key left out is not "unchanged", it is missing:
+    # dropping `created_by` and `last_heard` failed the write outright. Copying the asset and
+    # overlaying one prop is the only shape that cannot silently lose a column.
+    db.insert_entity(
+        {
+            **{
+                k: asset.get(k)
+                for k in (
+                    "id", "kind", "name", "geometry", "ais_reporting",
+                    "lat", "lon", "alt_m", "status", "created_by", "last_heard",
+                )
+            },
+            "props": {**(asset.get("props") or {}), field: parsed},
+        }
+    )
+    unit = f" {spec.unit}" if spec.unit else ""
+    before = "unset" if was is None else f"{was}{unit}"
+    return ToolResult(
+        ok=True,
+        message=f'{asset["name"]}: {spec.label} {before} to {parsed}{unit}',
+        data={"id": asset["id"], "field": field, "from": was, "to": parsed},
+        entity_id=asset["id"],
+    )
+
+
+@tool(
     "remove_asset",
     "Remove an asset from the world. Works on anything, seeded or placed by an operator.",
     {"target": "asset name or id"},
     writes=True,
+    group="do",
 )
 def remove_asset(target: str) -> ToolResult:
     """Take one asset off the map.
@@ -1475,6 +1705,7 @@ SILENCE_BACKDATE_MINUTES = 6 * 60
         "fault": "silent, or maintenance",
     },
     writes=True,
+    group="do",
 )
 def inject_fault(target: str, fault: str = "silent") -> ToolResult:
     """Introduce a failure so the operator can watch the picture respond.
@@ -1527,6 +1758,7 @@ def inject_fault(target: str, fault: str = "silent") -> ToolResult:
     "Repair an asset: bring it back into service and mark it as reporting again.",
     {"target": "asset name or id"},
     writes=True,
+    group="do",
 )
 def clear_fault(target: str) -> ToolResult:
     """Undo a fault, so the operator can watch the picture heal.
@@ -1591,15 +1823,88 @@ def schemas() -> list[dict[str, Any]]:
     removed disappears from both at once.
     """
     return [
-        {"name": t.name, "summary": t.summary, "params": t.params, "writes": t.writes}
+        {
+            "name": t.name,
+            "summary": t.summary,
+            "params": t.params,
+            "writes": t.writes,
+            "says": says(t.name),
+            "group": t.group,
+        }
         for t in REGISTRY.values()
     ]
+
+
+def says(name: str) -> list[str]:
+    """The sentences the reference card prints for one tool.
+
+    🔑 READ FROM THE GRAMMAR, NOT DECLARED BESIDE THE TOOL. This was a `says` tuple on each
+    `@tool`, which made it the second copy of a sentence the parser also had to know: the card
+    could teach one phrasing while tier 1 accepted a different one, and the suite could only
+    check that the two overlapped. Now the sentence exists once and the card is a rendering of
+    the language, so a phrasing the parser does not answer cannot be printed.
+    """
+    return list(grammar.card_sentences().get(name, ()))
+
+
+#: Three or four words saying what a tool DOES, for the reference card.
+#:
+#: 🔑 THE FUNCTION NAME IS NOT THE ANSWER TO "which of these do I want".
+#: `list_entities`, `describe_entity` and `focus_entity` are schema words, and an operator
+#: reading "show", "tell me about" and "focus" cannot tell that one lists a set, one opens a
+#: record and one moves the camera. That is the actual confusion, so the card answers it in the
+#: words the choice is made in.
+GLOSS: dict[str, str] = {
+    "list_entities": "lists a kind",
+    "show_unknown": "not announcing",
+    "coverage": "nobody holds these",
+    "show_overlay": "the ice layer",
+    "set_visible_kinds": "hides a kind",
+    "reset_view": "widens out",
+    "frame_entities": "camera, a kind",
+    "focus_entity": "camera, one asset",
+    "entity_history": "one asset's track",
+    "mesh_status": "the link picture",
+    "backhaul_status": "a way out",
+    "describe_entity": "one asset's record",
+    "recent_activity": "what changed",
+    "place_asset": "puts one down",
+    "task_uas": "sends a drone",
+    "remove_asset": "deletes one",
+    "inject_fault": "stops reporting",
+    "clear_fault": "back in service",
+}
+
+
+def reference() -> list[dict[str, Any]]:
+    """The registry arranged the way a person reads it: by intent, not by tool name.
+
+    Groups keep their declared order and drop out entirely when empty, so the card never
+    renders a heading with nothing under it.
+    """
+    out: list[dict[str, Any]] = []
+    for key, label in GROUPS:
+        # 🔑 THE TOOL TRAVELS WITH THE SENTENCE. "Show", "tell" and "focus"
+        # are three verbs an operator cannot tell apart from the sentences alone: one lists a
+        # set, one opens a record, one moves the camera. Naming the function beside the phrase
+        # is the shortest way to say that they are three different things, and it costs a
+        # column on a card that is already grouped by intent.
+        phrases = [
+            {"say": phrase, "tool": GLOSS.get(t.name, t.name)}
+            for t in REGISTRY.values()
+            if t.group == key
+            for phrase in says(t.name)
+        ]
+        if phrases:
+            out.append({"key": key, "label": label, "says": phrases})
+    return out
 
 
 @tool(
     "show_unknown",
     "Contacts not announcing their own identity that the sensor network is actually holding.",
     {},
+    group="see",
 )
 def show_unknown() -> ToolResult:
     """The unidentified contacts the console can legitimately claim to have.

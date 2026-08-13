@@ -1,3 +1,6 @@
+import { useEffect, useState } from "react";
+
+import { runCommand } from "./commandRunner";
 /**
  * What you get when you click an asset.
  *
@@ -61,6 +64,120 @@ interface Row {
   tone?: "warn" | "alert";
 }
 
+/** One field as the server declares it: the shape of an asset, owned server-side. */
+interface FieldSpec {
+  name: string;
+  label: string;
+  applies: string[];
+  note: string;
+  /** Free entry is bounded by this; `number` gets a numeric box. */
+  type: string;
+  /** Origin decides this, on the server. The client never guesses which fields may change. */
+  editable: boolean;
+  /** A closed set means a dropdown. Empty means free entry. */
+  choices: string[];
+  unit: string;
+}
+
+/**
+ * Fetched once per page. The declaration cannot change under a running client, and the
+ * panel opens often enough that refetching it per selection would be a request per click
+ * for an answer that never moves.
+ */
+let cachedSchema: FieldSpec[] | null = null;
+
+function useFieldSchema(): FieldSpec[] | null {
+  const [schema, setSchema] = useState<FieldSpec[] | null>(cachedSchema);
+  useEffect(() => {
+    if (cachedSchema) return;
+    let live = true;
+    void fetch("/api/schema")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        const f = body?.fields as FieldSpec[] | undefined;
+        if (!f || !live) return;
+        cachedSchema = f;
+        setSchema(f);
+      })
+      // No schema, no rows. The panel header still names the asset, which is more useful
+      // than an error about a declaration the operator has never heard of.
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+  return schema;
+}
+
+/**
+ * The one editing control, and it is a dropdown wherever the field is a closed set.
+ *
+ * 🔑 WHY EDITING IS MOUSE-ONLY. Most of what is editable here is a CHOICE: a payload is one
+ * of the sensors that exist, a backhaul is on or off. Picking from a list is what a dropdown
+ * is for and what speech is worst at, and a near-miss by voice does not fail loudly, it sets
+ * a field to a string nothing answers to.
+ *
+ * ⚠️ IT POSTS A PLAN, NOT A SENTENCE, so it never reaches the model and costs no schema.
+ * Same path the place button uses, and the executor validates it the same way.
+ */
+function FieldEditor({
+  spec,
+  asset,
+  onDone,
+}: {
+  spec: FieldSpec;
+  asset: Asset;
+  onDone: () => void;
+}) {
+  const current = asset.props?.[spec.name];
+  const [draft, setDraft] = useState(current === undefined || current === null ? "" : String(current));
+
+  const commit = (value: string) => {
+    if (value !== "" && value !== String(current ?? "")) {
+      runCommand(`set ${spec.label} on ${asset.name} to ${value}`, "ui_button", {
+        plan: [{ tool: "edit_asset", params: { target: asset.id, field: spec.name, value } }],
+      });
+    }
+    onDone();
+  };
+
+  if (spec.choices.length > 0) {
+    return (
+      <select
+        className="bedit-input"
+        autoFocus
+        value={draft}
+        onChange={(e) => commit(e.target.value)}
+        onBlur={onDone}
+      >
+        <option value="">choose…</option>
+        {spec.choices.map((c) => (
+          <option key={c} value={c}>
+            {c}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  return (
+    <input
+      className="bedit-input"
+      autoFocus
+      type={spec.type === "number" ? "number" : "text"}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => commit(draft)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit(draft);
+        // Escape abandons rather than committing, which is what every other editable field
+        // anybody has used does.
+        if (e.key === "Escape") onDone();
+      }}
+    />
+  );
+}
+
 export function AssetBanner() {
   const selectedId = useStore((s) => s.selectedId);
   const assets = useStore((s) => s.assets);
@@ -69,6 +186,11 @@ export function AssetBanner() {
   // ⚠️ ABOVE THE EARLY RETURN, because hooks cannot run conditionally. Reading the clock
   // used to happen after it, which was legal only because `Date.now()` is not a hook.
   const now = useNow();
+  // ⚠️ AND SO IS THIS ONE, for the reason the comment above gives. It was below the early
+  // return, which eslint caught: a hook after a conditional return runs in a different
+  // order on the render where nothing is selected.
+  const schema = useFieldSchema();
+  const [editing, setEditing] = useState<string | null>(null);
 
   const asset: Asset | undefined = assets.find((a) => a.id === selectedId);
   if (!asset) return null;
@@ -78,112 +200,113 @@ export function AssetBanner() {
   const connections = connectionCount(asset.id, mesh);
   const p = asset.props ?? {};
 
+  // Plain English for the wire value. "third_party" is a schema word, not something to put
+  // in front of an operator.
+  // ⚠️ `contact` MAPPED TO null AND THAT WAS THE SAME BUG AS `detects to`: the server had an
+  // answer and the panel said N/A. "Not us" is what the data actually supports for a contact,
+  // since nothing here records who operates a ship we merely observe.
+  const relationshipLabel = (r: string | undefined): string | null =>
+    r === "ours"
+      ? "us"
+      : r === "third_party"
+        ? "another operator"
+        : r === "contact"
+          ? "not us"
+          : null;
+
   const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
   const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
 
-  // Who is holding this contact, under whichever name the seed currently uses.
-  const heldBy = str(p.held_by) ?? str(p.first_detected_by);
-  const battery = num(p.battery_pct);
-  const altitude = num(p.altitude_m) ?? asset.altM;
+  // Who is holding this contact. `first_detected_by` was a second name for the same fact
+  // and went with the props trim.
+  const heldBy = str(p.held_by);
+  const altitude = asset.altM;
 
-  const rows: Row[] = [
-    {
-      label: "last heard",
+  // 🔑 KEYED BY THE FIELD NAME THE SERVER DECLARES, NOT BY A LABEL WRITTEN HERE. The order
+  // and the wording now come from `/api/schema`; this map only knows how to turn one asset
+  // into one value. That split is deliberate: the shape of an asset is a domain fact and
+  // belongs on the server, while "how do I render a mesh count" is a rendering fact and
+  // belongs here. `test_fields.py` pins the two lists together so neither can grow a member
+  // the other has not heard of.
+  const values: Record<string, { value: Row["value"]; tone?: Row["tone"] }> = {
+    relationship: { value: relationshipLabel(asset.relationship) },
+    threat: {
+      value: str(asset.threat),
+      tone: asset.threat === "hostile" ? "alert" : asset.threat === "unknown" ? "warn" : undefined,
+    },
+    classification: { value: str(p.classification) },
+    last_heard: {
       value: heard === null ? null : ago(heard),
-      title: "how long since this asset reported",
       tone: ring === "unreachable" ? "warn" : undefined,
     },
-    {
-      label: "connections",
-      // Radar sites are not on the mesh at all, so zero is a fact about the network for a
-      // node and a meaningless one for them. Only shown where the question applies.
-      value: asset.kind === "radar" ? null : connections === 0 ? "none" : connections,
-      title: "how many assets it can reach directly on the mesh right now",
+    connections: {
+      value: connections === 0 ? "none" : connections,
       tone: connections === 0 ? "warn" : undefined,
     },
-    {
-      label: "in range of",
-      // Its own row rather than a fourth ring: being out of radio range is a different
-      // problem from not reaching us, and it wants a different answer.
-      value: asset.meshConnected === false ? "nothing" : null,
-      title: "no neighbour is close enough to talk to, whatever its health",
-      tone: "warn",
+    mesh_connected: { value: asset.meshConnected === false ? "nothing" : null, tone: "warn" },
+    avg_gateway_minutes: {
+      value: num(p.avg_gateway_minutes) === null ? null : duration(num(p.avg_gateway_minutes)!),
     },
-    {
-      label: "avg connected",
-      value:
-        num(p.avg_gateway_minutes) === null ? null : duration(num(p.avg_gateway_minutes)!),
-      title: "mean length of an unbroken spell with a live path to a gateway",
-    },
-    {
-      label: "broadcasting",
+    ais_reporting: {
       value: asset.aisReporting === null ? null : asset.aisReporting ? "yes, AIS" : "NO AIS",
       tone: asset.aisReporting === false ? "alert" : undefined,
     },
-    {
-      label: "emitting",
+    emitting: {
       // The air and land equivalent of the AIS question: is it announcing itself at all.
       value: typeof p.emitting === "boolean" ? (p.emitting ? "yes" : "NO") : null,
       tone: p.emitting === false ? "alert" : undefined,
     },
-    {
-      label: "confirmed",
-      // 🔒 Spelled out rather than left to the ring, because the two buckets have different
-      // answers: one is a link to fix, the other is a contact nothing can see.
+    confirmed: {
+      // 🔒 Spelled out rather than left to the ring: one bucket is a link to fix, the other
+      // is a contact nothing can see, and they want different answers.
       value:
         unknownState(asset) === "detected_not_reported"
           ? "NO, report cannot reach us"
           : unknownState(asset) === "untracked"
             ? "NO, held by nothing"
             : null,
-      title: "whether the sensor network can actually confirm this contact",
       tone: "alert",
     },
-    {
-      label: "held by",
-      // Provenance is what makes an unidentified contact actionable rather than alarming.
-      value: heldBy,
-      title: "the sensor holding this contact",
-    },
-    { label: "track from", value: str(p.track_source) },
-    { label: "class", value: str(p.classification) },
-    { label: "speed", value: speedOf(asset) },
-    { label: "heading", value: num(p.heading_deg) === null ? null : `${num(p.heading_deg)}°` },
-    { label: "altitude", value: altitude === null ? null : `${altitude} m` },
-    { label: "depth", value: num(p.depth_m) === null ? null : `${num(p.depth_m)} m` },
-    {
-      label: "battery",
-      value: battery === null ? null : `${battery}%`,
-      tone: battery !== null && battery < 30 ? "warn" : undefined,
-    },
-    {
-      label: "endurance",
+    held_by: { value: heldBy },
+    speed_kmh: { value: speedOf(asset) },
+    heading_deg: { value: num(p.heading_deg) === null ? null : `${num(p.heading_deg)}\u00b0` },
+    alt_m: { value: altitude === null ? null : `${altitude} m` },
+    detection_radius_km: {
+      // Top level, not props: the server computes the EFFECTIVE range, because a node's
+      // comes from its payload through the sensor table rather than from the seed.
       value:
-        num(p.endurance_min_remaining) === null
-          ? null
-          : duration(num(p.endurance_min_remaining)!),
-      title: "flight time remaining",
+        typeof asset.detectionRadiusKm === "number" ? `${asset.detectionRadiusKm} km` : null,
     },
-    { label: "state", value: str(p.state) },
-    { label: "party", value: num(p.party_size) ?? num(p.members) },
-    { label: "transport", value: str(p.transport) },
-    { label: "next", value: str(p.next_waypoint) },
-    {
-      label: "detects to",
-      value: num(p.detection_radius_km) === null ? null : `${num(p.detection_radius_km)} km`,
-      title: "how far this sensor can hold a contact",
+    flight_radius_km: {
+      value: num(p.flight_radius_km) === null ? null : `${num(p.flight_radius_km)} km`,
     },
-    { label: "range", value: num(p.range_km) === null ? null : `${num(p.range_km)} km` },
-    { label: "operator", value: str(p.operator) },
-    // ⚠️ `props.flag` is the vessel's COUNTRY and has nothing to do with the asset's
-    // condition flag. Labelled "registry" so the two senses never collide on screen.
-    { label: "registry", value: str(p.flag) },
-    { label: "cluster", value: str(p.cluster_name) ?? str(p.cluster) },
-    { label: "payload", value: str(p.payload) },
-    { label: "position", value: positionOf(asset), title: "latitude and longitude" },
-  ];
+    payload: { value: str(p.payload) },
+    cluster_name: { value: str(p.cluster_name) },
+    backhaul: { value: str(p.backhaul) },
+    position: { value: positionOf(asset) },
+  };
 
-  const shown = rows.filter((r) => r.value !== null && r.value !== undefined);
+  // 🔑 EVERY ASSET SHOWS EVERY FIELD, IN ONE ORDER, AND N/A WHERE IT DOES NOT APPLY.
+  // Ethan's call, and the reason is stronger than tidiness: a panel that lists only what
+  // happens to be populated cannot tell an operator the difference between "this has no
+  // depth" and "nobody filled that in". Dropping empty rows made absence and decision look
+  // identical on screen, which is the same fault the domain model had.
+  //
+  // ⚠️ IT PROVED ITSELF IMMEDIATELY. With every row shown, `held by` reads N/A on a ground
+  // party while the map draws three dotted lines from sensors holding it. That contradiction
+  // was always there; filtering the empty rows is what kept it off the screen.
+  const rowsOf = (schema ?? []).map((f) => ({
+    spec: f,
+    applies: f.applies.length === 0 || f.applies.includes(asset.kind),
+  }));
+
+  const shown: Row[] = (schema ?? []).map((f) => ({
+    label: f.label,
+    title: f.note || undefined,
+    ...(f.applies.length === 0 || f.applies.includes(asset.kind)
+      ? (values[f.name] ?? { value: null })
+      : { value: null }),
+  }));
 
   return (
     <aside className="banner" aria-label={`Details for ${asset.name}`}>
@@ -210,12 +333,50 @@ export function AssetBanner() {
       </div>
 
       <dl>
-        {shown.map((r) => (
+        {shown.map((r, i) => {
+          const meta = rowsOf[i];
+          // 🔑 THE SERVER DECIDES WHAT MAY BE EDITED. `editable` comes off the declaration,
+          // where it is derived from the field's origin: observed and derived values never
+          // get a pencil, because editing what a sensor reported falsifies the record and a
+          // derived value would simply disagree with its inputs on the next read.
+          const canEdit = meta?.applies && meta.spec.editable;
+          return (
           <div key={r.label} className="brow">
             <dt title={r.title}>{r.label}</dt>
-            <dd className={r.tone}>{r.value}</dd>
+            {/* N/A is styled down: it is the absence of a fact, not a fact, and it must not
+                read with the same weight as a real value on a dense panel. */}
+            {editing === meta?.spec.name ? (
+              <dd>
+                <FieldEditor
+                  spec={meta.spec}
+                  asset={asset}
+                  onDone={() => setEditing(null)}
+                />
+              </dd>
+            ) : r.value === null || r.value === undefined ? (
+              <dd className="na">
+                {canEdit && (
+                  <button className="bedit" onClick={() => setEditing(meta.spec.name)}
+                          title={`set ${meta.spec.label}`} aria-label={`Edit ${meta.spec.label}`}>
+                    ✎
+                  </button>
+                )}
+                N/A
+              </dd>
+            ) : (
+              <dd className={r.tone}>
+                {canEdit && (
+                  <button className="bedit" onClick={() => setEditing(meta.spec.name)}
+                          title={`change ${meta.spec.label}`} aria-label={`Edit ${meta.spec.label}`}>
+                    ✎
+                  </button>
+                )}
+                {r.value}
+              </dd>
+            )}
           </div>
-        ))}
+          );
+        })}
       </dl>
     </aside>
   );

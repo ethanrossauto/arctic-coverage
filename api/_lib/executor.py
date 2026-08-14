@@ -397,10 +397,10 @@ def _bind_subject(params: dict[str, Any], subject: str | None) -> dict[str, Any]
 def _with_ids(result: ToolResult) -> dict[str, Any]:
     """Guarantee `data.ids` on any result that names an entity.
 
-    🔴 ONE PLACE, NOT EIGHT. Only `list_entities` and `show_unknown` filled this in, and
-    every other entity-bearing tool left it out: `describe_entity`, `focus_entity`,
-    `entity_history`, `place_asset` and the four writers all know exactly which asset they
-    acted on and none of them said so in a field anybody could read generically.
+    🔴 ONE PLACE, NOT EIGHT. Only `list_entities` filled this in, and every other
+    entity-bearing tool left it out: `describe_entity`, `focus_entity`, `entity_history`,
+    `place_asset` and the four writers all know exactly which asset they acted on and none of
+    them said so in a field anybody could read generically.
 
     🔑 WHY IT MATTERS BEYOND TIDINESS. `data.ids` is what the client accumulates into the
     conversation history, and it is what "list them" binds to. Without this, "tell me about
@@ -787,10 +787,11 @@ def _resubmit(
 ) -> list[dict[str, Any]] | None:
     """The same request with the vague word replaced by one id.
 
-    Substitution is by value rather than by parameter name: the ambiguous phrase is
-    whatever the operator typed, and it arrives in `target` for most tools and inside
-    `targets` for `frame_entities`. Matching on the value finds it in both without this
-    function needing a table of which parameter each tool resolves.
+    Substitution is by value rather than by parameter name: the ambiguous phrase is whatever
+    the operator typed, and it arrives in `target` for every tool that takes one. Matching on
+    the value rather than the key means this function needs no table of which parameter each
+    tool resolves, and it kept working unchanged when `frame_entities` and its list-valued
+    `targets` were deleted, which is the property worth keeping.
 
     🔒 RETURNS None RATHER THAN A PLAN THAT WOULD ASK THE SAME QUESTION AGAIN. If nothing
     could be substituted, offering the option anyway would give the operator a button

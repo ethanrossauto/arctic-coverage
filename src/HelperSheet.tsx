@@ -28,14 +28,19 @@ interface RefGroup {
   key: string;
   label: string;
   /**
-   * The sentence and the tool it reaches.
+   * The sentence, the tool it reaches, and what that tool does.
    *
    * 🔑 THE TOOL IS SHOWN BESIDE THE PHRASE because three of these verbs are indistinguishable
-   * from the sentences alone: "show" lists a set, "tell me about" opens one asset's record, and
-   * "focus" moves the camera to it. An operator who cannot tell them apart types the wrong one
-   * and reads the answer as a fault in the console.
+   * from the sentences alone. That was literally true while four commands opened with "show";
+   * the language gives every tool its own verb now, so the name beside the phrase confirms the
+   * choice rather than rescuing it. Still worth printing: an operator scanning for the right
+   * command reads the names, not the sentences.
+   *
+   * ⚠️ `does` IS SEPARATE FROM `tool` AND USED NOT TO BE. The server sent the gloss in the
+   * `tool` field, so the card printed "not announcing" in the position a reader takes for a
+   * function name. Two fields means the line can say which is which.
    */
-  says: { say: string; tool: string }[];
+  says: { say: string; tool: string; does: string }[];
 }
 
 /**
@@ -140,9 +145,14 @@ export function HelperSheet({
         </button>
       </div>
 
-      {/* ⚠️ TWO COLUMNS BECAUSE ONE WAS TALLER THAN THE CARD. In a single column the DO
-          group and the live kinds fell below a scroll nobody would go looking for, which
-          on a reference card is the same as not being there. */}
+      {/* 🔴 ONE COLUMN, AND IT WAS TWO. The two-column version was a fix for the card
+          overflowing its own height, and it worked by making every line narrow enough that
+          only a three-word fragment fitted beside the sentence. That traded the thing the
+          card is for: a reader in the middle of choosing between two phrasings could see
+          neither what the tool was called nor what it did.
+
+          ⚠️ SO THE HEIGHT PROBLEM IS BACK AND IS SOLVED WHERE IT BELONGS, on `max-height`
+          in the stylesheet, rather than by folding the content in half. */}
       {groups === null ? (
         <p className="helperwait">loading…</p>
       ) : (
@@ -154,7 +164,10 @@ export function HelperSheet({
                 {g.says.map((s) => (
                   <li key={s.say}>
                     <span className="helpersay">{s.say}</span>{" "}
-                    <span className="helpertool">{s.tool}</span>
+                    <span className="helpertool">
+                      ({s.tool}
+                      {s.does ? ` - ${s.does}` : ""})
+                    </span>
                   </li>
                 ))}
               </ul>

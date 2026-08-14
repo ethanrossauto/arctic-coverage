@@ -45,7 +45,7 @@ def test_no_utterance_is_claimed_by_two_rules():
         "list the vessels",
         "show me the overdue nodes",
         "which nodes are down",
-        "show the flights in the current zoom window",
+        "list the flights in the current zoom window",
         "show only the vessels",
         "show everything",
         "isolate the drones",
@@ -55,13 +55,13 @@ def test_no_utterance_is_claimed_by_two_rules():
         "take down the alert node",
         "mark daymark 03 unserviceable",
         "place an unknown vessel at 74.2 -84.0",
-        "place a hydrophone with a backhaul at 74.3 -84.2",
-        "send survey 03 to 73.2 -95.9 at 500 metres",
+        "emplace a hydrophone with a backhaul at 74.3 -84.2",
+        "vector survey 03 to 73.2 -95.9 at 500 metres",
         "where has daymark 01 been in the last 3 days",
         "what has happened in the last 12 hours",
         "show me the event log",
-        "tell me about this",
-        "where has this asset been",
+        "readout on this",
+        "track history on this asset",
     ]
     for utterance in corpus:
         claimed = [rule.template for rule in grammar.all_matches(utterance)]
@@ -75,11 +75,11 @@ def test_no_utterance_is_claimed_by_two_rules():
         ("show me the event log", "answered as an asset named 'event log'"),
         ("show me all unkowns", "answered as an asset named 'all unkowns'"),
         ("show me all unknowns", "a filter over many things read as one target"),
-        ("focus on the entire world", "answered as an asset named 'entire world'"),
+        ("slew to on the entire world", "answered as an asset named 'entire world'"),
         ("show me the whole arctic", "a camera command read as an asset search"),
         ("hide everything except the radar", "highlighted four contacts and hid nothing"),
         (
-            "focus fls alert and hide everything else",
+            "slew to fls alert and hide everything else",
             "the second instruction swallowed into the first asset's name",
         ),
         ("now just the ones that are overdue", "narrowing ignored, all sixteen returned"),
@@ -89,7 +89,7 @@ def test_no_utterance_is_claimed_by_two_rules():
             "'dark' read as the AIS filter",
         ),
         ("what is a backhaul", "a definition answered with eleven asset names"),
-        ("place a hydrophone with its own satellite terminal at 74.3 -84.2", "flag lost silently"),
+        ("emplace a hydrophone with its own satellite terminal at 74.3 -84.2", "flag lost silently"),
         ("show me everything that has gone quiet, then reset the view", "second action dropped"),
     ],
 )
@@ -131,7 +131,7 @@ def test_a_name_slot_refuses_a_second_instruction():
     """"Focus FLS Alert and hide everything else" resolved to an asset called "fls alert and hide
     everything else": it matched nothing, and the dropped instruction could not even be reported,
     because every word of it sat inside a parameter value and therefore counted as used."""
-    for text in ("fls alert and hide everything else", "daymark 01 then zoom out",
+    for text in ("fls alert and declutter everything else", "daymark 01 then go wide",
                  "daymark 01 also frame it"):
         assert grammar.SLOTS["asset"].read(text) is None, text
 
@@ -194,7 +194,7 @@ def test_a_rule_referring_to_a_slot_it_does_not_carry_fails_at_import():
     sentence with no duration in it would raise `KeyError` inside `match`, on whichever utterance
     happened to reach that rule: a 500 on one phrasing, and nothing else would notice."""
     bad = grammar.Rule(
-        "show the {kind}", (("list_entities", {"kind": "{kind}", "days": "{duration}"}),)
+        "list the {kind}", (("list_entities", {"kind": "{kind}", "days": "{duration}"}),)
     )
     with pytest.raises(ValueError, match="which no slot in it produces"):
         grammar._validate((grammar._compile(bad),))
@@ -202,10 +202,10 @@ def test_a_rule_referring_to_a_slot_it_does_not_carry_fails_at_import():
 
 def test_a_template_notation_error_fails_at_import_rather_than_matching_oddly():
     with pytest.raises(ValueError, match="unknown slot"):
-        grammar._compile(grammar.Rule("show the {colour}", (("list_entities", {}),)))
+        grammar._compile(grammar.Rule("list the {colour}", (("list_entities", {}),)))
     with pytest.raises(ValueError, match="appears twice"):
         grammar._compile(
-            grammar.Rule("frame the {kind} and the {kind}", (("frame_entities", {}),))
+            grammar.Rule("list the {kind} and the {kind}", (("list_entities", {}),))
         )
 
 
@@ -217,7 +217,7 @@ def test_the_notation_cannot_express_a_synonym():
     down`, and `fix` beside `repair` and `restore`. Both notations are gone, and a template still
     carrying one is an error rather than a rule matching a literal bracket.
     """
-    for template in ("show [me] the {kind}", "(show|list) the {kind}", "show the {kind} please|now"):
+    for template in ("show [me] the {kind}", "(show|list) the {kind}", "list the {kind} please|now"):
         with pytest.raises(ValueError, match="one wording per tool"):
             grammar._compile(grammar.Rule(template, (("list_entities", {}),)))
 
@@ -259,13 +259,13 @@ def test_punctuation_is_not_a_wording_and_politeness_is():
     droppable filler word IS a second wording, though, and one wording per tool means one, so
     the wrapper went the same way as the optional "me" it was one word away from.
 
-    Punctuation and whitespace are not words. "Mesh status?" typed and "mesh status" spoken are the
+    Punctuation and whitespace are not words. "Comms check?" typed and "comms check" spoken are the
     same sentence, and treating them as two would fail on the transcriber's own output.
     """
-    assert parser.parse("mesh status?") is not None
-    assert parser.parse("  mesh   status  ") is not None
-    assert parser.parse("Mesh Status.") is not None
+    assert parser.parse("comms check?") is not None
+    assert parser.parse("  comms   check  ") is not None
+    assert parser.parse("Comms Check.") is not None
 
-    for said in ("please show the hydrophones", "can you show the hydrophones",
-                 "show the hydrophones please", "show me the hydrophones"):
+    for said in ("please list the hydrophones", "can you list the hydrophones",
+                 "list the hydrophones please", "show me the hydrophones"):
         assert parser.parse(said) is None, said

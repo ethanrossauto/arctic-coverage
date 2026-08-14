@@ -87,6 +87,50 @@ body {
 @media (max-width: 1250px) {
   .strip.bottom .centred { position: static; transform: none; }
 }
+/* 🔑 PUSHED TO THE FAR END, so it reads as a note about the page rather than as a fourth
+   control. Sitting directly after the toggle it looked like a label belonging to it, which
+   is the one reading it must not have: the toggle hides contacts, and this describes the
+   whole console.
+
+   ⚠️ IT DISAPPEARS RATHER THAN WRAPPING. The top strip has no fixed height, so a wrapped
+   sentence grows the bar instead of clipping, and the controls it sits beside jump down a
+   line. Below the breakpoint there is not room for both, and the controls are the ones
+   somebody came to use. Measured rather than guessed; see the media query. */
+.strip .about {
+  margin-left: auto;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.strip .about.short { display: none; }
+/* Measured: 40px of clearance at 1250 and a second header line at 1210, where the toggle's
+   own label wraps rather than the note. Same breakpoint the footer's centred item uses, so
+   the two rows give up at the same width instead of at two arbitrary ones. */
+@media (max-width: 1250px) {
+  .strip .about.long { display: none; }
+  .strip .about.short { display: inline; }
+}
+/* 🔑 ITS OWN LINE ONCE THE ROW IS FULL. `flex-basis: 100%` puts the note on the next line
+   instead of squeezing it to nothing, and `flex-wrap` on the strip is what lets that line
+   exist.
+
+   ⚠️ 1100 IS MEASURED, AND MY FIRST GUESS OF 820 WAS WRONG BY A LOT. The controls need 592px
+   and the short note 191px, so arithmetic says they part company around 800 and they do not:
+   the header takes a second line at 1024 and OVERFLOWS ITS OWN WIDTH by 35px at 860, because
+   the toggle's label starts wrapping long before the row runs out of room and the note is
+   `nowrap` so it refuses to give any back. Measured at 1101 the note still sits inline with
+   41px of clearance; at 1024 it does not.
+
+   ⚠️ THE WRAP ALSO FIXES SOMETHING THAT PREDATES THIS NOTE. With the row unable to wrap, the
+   header overflowed its own width by 36px at 390 and 66px at 360: the controls ran off the
+   right edge of the screen with nothing to scroll them back. */
+@media (max-width: 1100px) {
+  .strip { flex-wrap: wrap; }
+  .strip .about.short {
+    flex-basis: 100%;
+    margin-left: 0;
+    white-space: normal;
+  }
+}
 .brand { color: var(--accent); letter-spacing: 0.14em; font-weight: 600; }
 .sep { flex: 0 0 1px; height: 14px; background: var(--line); }
 .dim { color: var(--dim); margin-left: auto; }
@@ -716,7 +760,11 @@ b.alert { color: var(--err); }
 
 .helper {
   position: absolute; bottom: calc(100% + 6px); left: 0; right: 0;
-  max-height: 52vh; overflow-y: auto;
+  /* 🔑 RAISED FROM 52vh WHEN THE CARD WENT TO ONE COLUMN. Measured, the content is 601px:
+     52vh hid 114px of it below a scroll on a 940px window and 187px on an 800px one, and the
+     bottom of this card is where the DO group and the live kinds live. The card floats above
+     the command bar, so the ceiling is what fits between it and the header, not the window. */
+  max-height: 68vh; overflow-y: auto;
   padding: 9px 11px 7px;
   background: var(--panel);
   backdrop-filter: blur(6px);
@@ -738,7 +786,12 @@ b.alert { color: var(--err); }
 
 /* Two columns, and sections never split across the break: a heading stranded at the foot
    of one column with its list at the head of the next reads as two different things. */
-.helperbody { columns: 2; column-gap: 20px; }
+/* 🔴 ONE COLUMN. This was `columns: 2` to keep the card inside its own height, and the cost
+   was paid by the line: at half width there was room for the sentence and a three-word
+   fragment, so the tool's real name and what it does could not both be printed. The card
+   exists to answer "which of these do I want", and that was the answer. Height is bounded by
+   `max-height` on `.helper` instead, which scrolls rather than truncating. */
+.helperbody { columns: 1; }
 .helpergroup { margin-bottom: 8px; break-inside: avoid; -webkit-column-break-inside: avoid; }
 .helpergroup h4 {
   margin: 0 0 3px; font-size: 9px; letter-spacing: 0.12em; color: var(--dim); font-weight: 400;

@@ -26,6 +26,27 @@ import { useDeadReckoning } from "./useDeadReckoning";
 import { useWorld } from "./useWorld";
 import { COUNTDOWN_VISIBLE_S, formatCountdown, resetWorld } from "./world";
 
+/**
+ * One sentence saying what this is, for a visitor who followed a link here.
+ *
+ * ⚠️ IT HAS TO SURVIVE BEING READ IN A TOP BAR, which rules out the phrasing that already
+ * exists in the page's meta description. "A natural-language interface to a deployable
+ * sensor picture" is accurate and is written for a search result, not for a person glancing
+ * at a header: it is three noun phrases deep before it says anything you can picture. The
+ * two say the same thing and neither is the other's summary.
+ */
+const ABOUT = "A portfolio demo: an Arctic sensor network you can drive by typing or talking to it.";
+
+/**
+ * The same sentence for a screen that cannot hold the long one.
+ *
+ * ⚠️ IT IS NOT AN ABBREVIATION, IT IS THE SAME CLAIM SHORTER. Cutting the long line at a
+ * comma would leave "an Arctic sensor network", which describes the map and drops the only
+ * part a visitor cannot work out by looking: that the thing takes commands. So the short
+ * version keeps the verb and gives up the framing instead.
+ */
+const ABOUT_SHORT = "Arctic sensor network demo, driven by typed or spoken commands.";
+
 export default function App() {
   const assets = useStore((s) => s.assets);
   const mesh = useStore((s) => s.mesh);
@@ -255,6 +276,23 @@ export default function App() {
           />
           HIDE UNDETECTED UNKNOWN
         </label>
+
+        {/* 🔑 FOR SOMEONE WHO ARRIVED FROM A LINK AND HAS NO IDEA WHAT THIS IS. Everything
+            else on screen assumes you already know: the strip counts assets, the command bar
+            waits for a command, and the globe is a globe. A visitor who followed "my other
+            portfolio project" from somewhere else lands on all of that with no sentence
+            telling them what they are looking at or that they can type into it.
+
+            ⚠️ IT SAYS "DEMO" ON PURPOSE. A console that looks operational and is not sets an
+            expectation it then fails, and an employer who works out for themselves that this
+            is a build rather than a product has learned it in the least flattering order. */}
+        {/* 🔑 TWO LENGTHS, BOTH IN THE MARKUP, SWAPPED BY CSS. The visitor this line exists
+            for is as likely to arrive on a phone as on a desktop, and the desktop sentence
+            does not fit beside the controls much below a laptop. Rendering both and letting
+            the stylesheet choose keeps the decision next to the widths that force it, in the
+            one file that can measure them. */}
+        <span className="about long">{ABOUT}</span>
+        <span className="about short">{ABOUT_SHORT}</span>
       </header>
 
       <AssetBanner />

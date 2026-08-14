@@ -277,7 +277,6 @@ DATA_TOOLS = [
     # `entity_history`, which is one asset's track across time rather than the log.
     "recent_activity",
     "coverage",
-    "show_unknown",
     "show_overlay",
     "set_visible_kinds",
     "place_asset",
@@ -300,21 +299,24 @@ DATA_TOOLS = [
 # which the deterministic parser already handles, so tier 2 sees them almost never.
 VIEW_TOOLS = ["reset_view", "none"]
 
-# 🔑 `focus_entity` AND `frame_entities` ARE DELIBERATELY ABSENT FROM BOTH LISTS, and the
-# reason is the same correction that emptied VIEW_TOOLS.
+# 🔑 `focus_entity` IS DELIBERATELY ABSENT FROM BOTH LISTS, and the reason is the same
+# correction that emptied VIEW_TOOLS.
 #
-# Once the executor started framing the camera on whatever a plan returned, both of them
-# became a second way to say something the model can already say. "Focus Daymark 03" is
-# `describe_entity`, which selects the asset, frames it, and answers the question the
-# operator was about to ask next. "Frame all the drones" is `list_entities(kind='uas')`,
-# which highlights them and frames them. Offering the pair as well would put two correct
-# answers in the enum for one request and make the choice between them arbitrary, which
-# is exactly the axis that was removed for being a thing the model could get wrong for
-# no gain.
+# Once the executor started framing the camera on whatever a plan returned, it became a second
+# way to say something the model can already say: "slew to Daymark 03" is `describe_entity`,
+# which selects the asset, frames it, and answers the question the operator was about to ask
+# next. Offering it as well would put two correct answers in the enum for one request and make
+# the choice between them arbitrary, which is exactly the axis that was removed for being a
+# thing the model could get wrong for no gain.
 #
-# They stay in the registry because the parser reaches them directly and a button may
-# call either. Reachable from the deterministic tier, absent from the enumerated one, on
-# purpose rather than by omission.
+# It stays in the registry because the parser reaches it directly. Reachable from the
+# deterministic tier, absent from the enumerated one, on purpose rather than by omission.
+#
+# ⚠️ `frame_entities` USED TO BE NAMED HERE TOO AND NO LONGER EXISTS AT ALL (2026-08-14). The
+# argument in this comment is the one that eventually deleted it: a tool the model must never be
+# offered, because the executor already does its job, is a tool worth asking harder questions
+# about. `show_unknown` went the same day and for a different reason: no verb of its own could
+# be written for it.
 
 # 🔴 THE SIZE OF THIS BAG IS A HARD CONSTRAINT, NOT A STYLE PREFERENCE, and finding that
 # out cost a working tier 2. Structured output refuses a schema past a complexity ceiling,
@@ -572,10 +574,11 @@ def system_prompt() -> str:
         # parameter will ever cover every comparison somebody thinks of.
         # 🔴 THE VIEW FILTER WORKS BY KIND AND NOTHING ELSE, AND NOT SAYING SO PRODUCED A
         # CONFIDENT WRONG ANSWER. Asked to hide everything except the unknown contacts, the
-        # model chose `show_unknown`, which highlights them and changes no visibility at
-        # all, and then announced "Showing the three unknown contacts" over a tool result
-        # that said four. Nothing was hidden, the sentence claimed otherwise, and the two
-        # halves of the reply disagreed with each other.
+        # model chose the unknown-contacts tool, which highlighted them and changed no
+        # visibility at all, and then announced "Showing the three unknown contacts" over a
+        # tool result that said four. Nothing was hidden, the sentence claimed otherwise, and
+        # the two halves of the reply disagreed with each other. (That tool is gone now; the
+        # stated limit below is what actually fixed this and it still applies to `coverage`.)
         #
         # ⚠️ THE FIX IS A STATED LIMIT, NOT A NEW CAPABILITY. "Unknown" is a property of a
         # contact rather than a kind, so `set_visible_kinds` genuinely cannot express it,
@@ -607,7 +610,7 @@ def system_prompt() -> str:
         "contact and NOT a kind, so none of them can be hidden or shown with it. If the",
         "operator asks to hide or show only by one of those properties, return no steps and",
         "say plainly in one sentence that the view filters by kind, and name what you CAN do:",
-        "list or highlight those contacts. Never answer such a request with show_unknown or",
+        "list or highlight those contacts. Never answer such a request with coverage or",
         "list_entities and describe it as hiding or showing something.",
         "",
         "THE WORLD. Every request carries 'world': one entry per asset with its id, name,",
@@ -745,7 +748,7 @@ def system_prompt() -> str:
         # 🔑 THE SUMMARY TOOLS NOW HAND BACK THE IDS THEY COUNTED, so the second question is
         # answerable without recomputing anything: the ids of the previous answer arrive as
         # '__result__', and `list_entities` takes them.
-        "A summary command (coverage, mesh_status, backhaul_status, show_unknown) answers with",
+        "A summary command (coverage, mesh_status, backhaul_status) answers with",
         "counts and a few names. If the operator then asks WHICH ones, asks for the FULL or",
         "ENTIRE list, or asks to show or name something the last answer counted, do NOT run",
         "the summary again: it will return the same sentence. Use list_entities with 'ids' set",

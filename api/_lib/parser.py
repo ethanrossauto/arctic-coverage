@@ -68,12 +68,12 @@ UNSUPPORTED: list[tuple[str, str]] = [
         # answers. The suite runs every suggestion below through the grammar for that reason.
         "there is no live air traffic feed here, and nothing on this display fetches "
         "anything at runtime, deliberately. The aircraft on this map are the ones in the "
-        'world itself; try "show the aircraft"',
+        'world itself; try "list the aircraft"',
     ),
     (
         r"\bforecast\b|\bwind speed\b|\btemperature\b|\bprecipitation\b|\bstorm\b",
         "there is no weather forecast here. What this display has is measured sea "
-        'ice concentration; try "show the ice"',
+        'ice concentration; try "overlay the ice"',
     ),
 ]
 

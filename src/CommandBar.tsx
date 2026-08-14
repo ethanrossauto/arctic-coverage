@@ -290,7 +290,7 @@ const LATEST_EXCHANGE = 5;
  * whitespace are stripped from both sides before comparing, which leaves exactly the
  * difference worth announcing: a word that was swapped, added or dropped. "hide everything
  * except for unknowns" against "hide everything except UNKNOWN 01, UNKNOWN 02" still
- * differs and still speaks up. "mesh status" against "Mesh status." does not.
+ * differs and still speaks up. "comms check" against "Comms check." does not.
  *
  * ⚠️ DIGITS ARE NOT PUNCTUATION AND ARE DELIBERATELY KEPT. "daymark oh three" becoming
  * "Daymark 03" is a real substitution, and it is one of the two the vocabulary hint exists

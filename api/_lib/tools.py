@@ -26,7 +26,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import db, freshness, grammar, terrain
 from . import mesh as meshlib
@@ -1040,39 +1040,16 @@ def focus_entity(target: str) -> ToolResult:
     )
 
 
-@tool(
-    "frame_entities",
-    "Move the camera so that all the named assets are visible at once.",
-    {"targets": "list of asset names or ids", "kind": "or frame every asset of one kind"},
-    group="look",
-)
-def frame_entities(targets: list[str] | None = None, kind: str | None = None) -> ToolResult:
-    rows = _entities()
-    if kind:
-        chosen = [r for r in rows if r["kind"] == kind]
-    else:
-        chosen = [_require_one(t, rows) for t in (targets or [])]
-    points = [(r["lat"], r["lon"]) for r in chosen if r["lat"] is not None]
-    if not points:
-        raise ToolError("none of those assets have a position to frame")
-    camera = frame_for(points)
-    # ⚠️ THE SPREAD IS REPORTED ONLY WHEN IT IS KNOWN AND MEANS SOMETHING. It used to say
-    # "framing 1 assets across 0.0 km", which is wrong twice: the plural on one, and a
-    # distance across a single point, which has no extent to measure. Worse, `frame_for`
-    # returns no `spread_km` at all when the points share no common centre, and the old
-    # `.get(..., 0)` turned that absence into a confident "across 0 km" for assets spread
-    # around the globe. A number nobody computed must not be printed as a measurement.
-    spread = camera.get("spread_km")
-    noun = "asset" if len(points) == 1 else "assets"
-    if len(points) > 1 and spread:
-        message = f"framing {len(points)} {noun} across {spread} km"
-    else:
-        message = f"framing {len(points)} {noun}"
-    return ToolResult(
-        ok=True,
-        message=message,
-        ui_effects={"camera": camera, "highlight": [r["id"] for r in chosen]},
-    )
+# 🔴 `frame_entities` WAS HERE AND IS GONE (2026-08-14). It moved the camera to hold a set,
+# which `executor._frame_results` already does to whatever ANY plan returned: "list the patrols"
+# framed the patrols before this tool was reached, so FRAME and LIST were one camera move behind
+# two verbs. It had good lingo and no action of its own, which is the half of the
+# unique-vocabulary test that is easy to miss.
+#
+# ⚠️ ITS ONE UNIQUE CAPABILITY WENT WITH IT AND IS WORTH NAMING: `targets` framed an arbitrary
+# LIST of assets, where `list_entities` filters. "Frame Daymark 01 and Eureka 02" is now a tier-2
+# sentence. It was never sayable on tier 1 anyway, and `targets` was never in the model's schema,
+# so what actually changed is that the model reaches the same camera through `list_entities`.
 
 
 # The environmental layers this build actually has. Sea ice is measured satellite data,
@@ -1847,32 +1824,60 @@ def says(name: str) -> list[str]:
     return list(grammar.card_sentences().get(name, ()))
 
 
-#: Three or four words saying what a tool DOES, for the reference card.
+class Card(NamedTuple):
+    """How one tool is printed on the reference card."""
+
+    #: 🔴 A NAME, NOT THE IDENTIFIER. `list_entities` is a Python symbol: it names the function
+    #: to whoever maintains this file and nothing at all to the operator reading the card, who
+    #: is deciding between two phrasings and has no reason to care what the callable is called.
+    #: An identifier printed in a product is a seam showing.
+    label: str
+    #: What it does, in the words the choice between two tools is made in.
+    #:
+    #: ⚠️ NOT the `summary` beside each `@tool`. That one is written for the model choosing a
+    #: tool from seventeen, so it enumerates parameters and edge cases and runs to three lines.
+    #: A card is read at a glance.
+    does: str
+
+
+#: The card's own vocabulary: one name and one description per tool.
 #:
 #: 🔑 THE FUNCTION NAME IS NOT THE ANSWER TO "which of these do I want".
 #: `list_entities`, `describe_entity` and `focus_entity` are schema words, and an operator
 #: reading "show", "tell me about" and "focus" cannot tell that one lists a set, one opens a
 #: record and one moves the camera. That is the actual confusion, so the card answers it in the
 #: words the choice is made in.
-GLOSS: dict[str, str] = {
-    "list_entities": "lists a kind",
-    "show_unknown": "not announcing",
-    "coverage": "nobody holds these",
-    "show_overlay": "the ice layer",
-    "set_visible_kinds": "hides a kind",
-    "reset_view": "widens out",
-    "frame_entities": "camera, a kind",
-    "focus_entity": "camera, one asset",
-    "entity_history": "one asset's track",
-    "mesh_status": "the link picture",
-    "backhaul_status": "a way out",
-    "describe_entity": "one asset's record",
-    "recent_activity": "what changed",
-    "place_asset": "puts one down",
-    "task_uas": "sends a drone",
-    "remove_asset": "deletes one",
-    "inject_fault": "stops reporting",
-    "clear_fault": "back in service",
+#:
+#: 🔑 ONE TABLE, NOT TWO. The name and the description are read together, printed together and
+#: rewritten together, so keeping them in two dicts keyed by the same string would be two copies
+#: of one decision and an invitation for a tool to have half an entry.
+#:
+#: ⚠️ SEVERAL NAMES ARE ALREADY THE COMMAND WORD, and where that happens the card reads
+#: `"sitrep" (Sitrep - what has changed in this world)`. The repetition is the message: the word
+#: you say IS the thing you are reaching.
+CARD: dict[str, Card] = {
+    "list_entities": Card("Asset List", "lists or counts a set of assets"),
+    "coverage": Card("Coverage Gaps", "what the network is NOT seeing"),
+    "show_overlay": Card("Ice Overlay", "draws the measured sea ice"),
+    "set_visible_kinds": Card("Display Filter", "hides or shows a whole kind"),
+    "reset_view": Card("Wide View", "camera back to the whole Arctic"),
+    "focus_entity": Card("Slew To Asset", "camera onto one asset, and selects it"),
+    "entity_history": Card("Track History", "where one asset has been"),
+    "mesh_status": Card("Comms Check", "radio links, groups, and what is isolated"),
+    # The description was shortened to one line on the card. Measured: the longer wording was
+    # the only one that wrapped, and a wrapped description reads as a second command rather
+    # than as a note on the first.
+    "backhaul_status": Card("Satcom Check", "satellite terminals, and who can reach one"),
+    "describe_entity": Card("Asset Readout", "the full record for one asset"),
+    "recent_activity": Card("Sitrep", "what has changed in this world"),
+    "place_asset": Card("Emplace", "puts a new asset on the map"),
+    "task_uas": Card("Vector Drone", "sends a drone to a position"),
+    "remove_asset": Card("Scrub Asset", "deletes one asset"),
+    "inject_fault": Card("Deadline", "makes an asset go silent, or unserviceable"),
+    "clear_fault": Card("Restore", "brings an asset back into service"),
+    # Mouse only, so it prints on no card. Named here anyway: the table is the one place a
+    # tool's operator-facing name lives, and a tool missing from it is what the suite checks.
+    "edit_asset": Card("Field Edit", "changes one declared field on one asset"),
 }
 
 
@@ -1887,10 +1892,23 @@ def reference() -> list[dict[str, Any]]:
         # 🔑 THE TOOL TRAVELS WITH THE SENTENCE. "Show", "tell" and "focus"
         # are three verbs an operator cannot tell apart from the sentences alone: one lists a
         # set, one opens a record, one moves the camera. Naming the function beside the phrase
-        # is the shortest way to say that they are three different things, and it costs a
-        # column on a card that is already grouped by intent.
+        # is the shortest way to say that they are three different things.
+        #
+        # 🔴 THE NAME AND THE DESCRIPTION ARE TWO FIELDS NOW, AND THEY USED TO BE ONE. `tool`
+        # carried the gloss and fell back to the identifier, so the card printed "not
+        # announcing" where a reader had every reason to think they were seeing a name, and the
+        # two tools with no gloss printed a raw Python symbol instead. A field called `tool`
+        # that usually does not hold the tool reads fine until somebody needs the actual name.
+        #
+        # ⚠️ `tool` IS THE OPERATOR'S NAME FOR IT, NOT THE IDENTIFIER. `list_entities` names the
+        # function to whoever maintains this file; the card is read by somebody choosing what to
+        # say, and a Python symbol on a console is a seam showing.
         phrases = [
-            {"say": phrase, "tool": GLOSS.get(t.name, t.name)}
+            {
+                "say": phrase,
+                "tool": CARD[t.name].label if t.name in CARD else t.name,
+                "does": CARD[t.name].does if t.name in CARD else "",
+            }
             for t in REGISTRY.values()
             if t.group == key
             for phrase in says(t.name)
@@ -1900,87 +1918,17 @@ def reference() -> list[dict[str, Any]]:
     return out
 
 
-@tool(
-    "show_unknown",
-    "Contacts not announcing their own identity that the sensor network is actually holding.",
-    {},
-    group="see",
-)
-def show_unknown() -> ToolResult:
-    """The unidentified contacts the console can legitimately claim to have.
-
-    🔑 AN UNKNOWN IS A CONTACT THAT IS NOT SELF-REPORTING, and that question is already
-    answered for all three contact kinds: AIS for a vessel, a transponder for an aircraft,
-    an emitter for a ground party. `detect.coverage_summary` splits exactly that set, so
-    nothing new is computed here and there is no second definition of "unknown" to keep in
-    step with the first.
-
-    🔴 ONLY `tracked` IS RETURNED AS THE ANSWER, and the two buckets left out are the whole
-    point of the tool:
-
-        tracked                 not talking, a sensor holds it, the report gets home  -> YES
-        detected_not_reported   a sensor holds it and CANNOT deliver the report       -> no
-        untracked               nothing holds it and it is not talking                -> no
-
-    ⚠️ `detected_not_reported` IS THE COUNTER-INTUITIVE EXCLUSION, and it is the strict
-    reading on purpose: if the report is not reaching you, you do not have the contact. A
-    sensor holding something it cannot deliver is a link fault, not coverage. So the
-    default display claims only what actually arrived.
-
-    🔒 `untracked` IS AN HONESTY PROBLEM, NOT JUST A FILTER. Nothing holds it and it is not
-    talking, so the console **cannot legitimately know it exists**: that set is read out of
-    the seeded world, not derived from the sensor network. Putting it behind a deliberate
-    act means the default view asserts nothing it cannot support, which is the same rule
-    the ice layer and the relay figures already follow. It must never re-enter a default
-    count, summary or status line.
-
-    Both excluded lists still travel in `data`, because the client's reveal toggle needs
-    them and a second round trip to fetch what was already computed would be waste.
-    """
-    detect = _detect_module()
-    summary = getattr(detect, "coverage_summary", None) if detect else None
-    if summary is None:
-        raise ToolError(
-            "this display does not identify contacts. What it can show: "
-            "asset status, mesh connectivity, and which contacts are not broadcasting"
-        )
-
-    out = summary(_entities())
-    by_id = {r["id"]: r for r in _entities()}
-
-    covered = list(out.get("tracked", []))
-    stranded = list(out.get("detected_not_reported", []))
-    unheld = list(out.get("untracked", []))
-
-    rows = [by_id[i] for i in covered if i in by_id]
-    message = f"{len(covered)} unknown contact{'' if len(covered) == 1 else 's'} held by the network"
-    if stranded or unheld:
-        # ⚠️ NAMED, NOT SILENTLY DROPPED. The operator is being shown a smaller set than
-        # exists, and a display that quietly narrows what it claims is the failure this
-        # whole distinction is meant to prevent. Saying how many were withheld, and why,
-        # costs one clause.
-        message += f"; {len(stranded) + len(unheld)} more cannot be confirmed from the network alone"
-
-    return ToolResult(
-        ok=True,
-        message=message,
-        data={
-            "ids": covered,
-            "names": [r["name"] for r in rows],
-            "points": [
-                [r["lat"], r["lon"]]
-                for r in rows
-                if r.get("lat") is not None and r.get("lon") is not None
-            ],
-            # The reveal buckets. Present so a toggle costs no round trip; never counted
-            # in `ids`, which is what the default view asserts.
-            "detected_not_reported": stranded,
-            "untracked": unheld,
-            "counts": {
-                "covered": len(covered),
-                "detected_not_reported": len(stranded),
-                "untracked": len(unheld),
-            },
-        },
-        ui_effects={"highlight": covered},
-    )
+# 🔴 `show_unknown` WAS HERE AND IS GONE (2026-08-14). It answered "which unidentified contacts
+# do we actually hold", which is one bucket of `detect.coverage_summary` — the same call
+# `coverage` makes, whose answer already names that bucket ("N held by a sensor"). Two tools, one
+# computation, one of them a subset of the other's sentence.
+#
+# 🔑 IT IS THE CLEANEST CASE OF THE UNIQUE-VOCABULARY TEST. No verb of its own could be written
+# for it: the only honest sentence is "list the unknowns", and that is `list_entities` with a
+# filter. A tool that cannot earn a word is a filter wearing a tool's clothes.
+#
+# ⚠️ THE STRICT READING SURVIVES, WHICH IS THE PART WORTH KEEPING. `coverage` reports all four
+# buckets separately, so `detected_not_reported` (a sensor holds it and cannot deliver) and
+# `untracked` (nothing holds it) are still never folded into what the console claims to see. That
+# distinction was this tool's real content and it lives in `detect.coverage_summary`, where it
+# always did.

@@ -413,7 +413,34 @@ _WHAT_THIS_IS = (
     "backhaul, measured sea ice and unidentified contacts."
 )
 #: Three commands that always work, including when the metered layer does not.
-_TRY_THESE = '"mesh status", "which assets are overdue", or "show me the drones"'
+#:
+#: 🔴 TWO OF THE THREE DID NOT WORK, AND THIS IS THE ONE LINE WHERE THAT IS UNFORGIVABLE
+#: (found 2026-08-14). It read `"mesh status", "which assets are overdue", "show me the
+#: drones"`, and `parser.parse` returns None for the last two: they escalate to tier 2. So the
+#: sentence shown to an operator BECAUSE tier 2 is unavailable recommended two commands that
+#: need tier 2.
+#:
+#: They were written against the keyword parser, which matched "overdue" anywhere and dropped
+#: "me" as filler. The anchored grammar does neither, and nothing failed when it landed because
+#: no test read this constant back through the parser. There is one now.
+#:
+#: ⚠️ SO IT IS DERIVED, NOT TYPED. Taking the sentences from the grammar means this cannot go
+#: stale again the next time the language changes, which it just did.
+_TRY_THESE = ", ".join(f'"{s}"' for s in grammar.suggestions())
+
+#: What the operator is told when tier 2 was asked and did not answer.
+#:
+#: 🔴 TIER 2 EITHER ANSWERS OR SAYS THIS. IT NEVER HANDS BACK TO THE PARSER. Both failure
+#: paths used to end in a tier-1 sentence: the direct one returned `tier: "parser"` with a
+#: line about the reasoning layer, and the escalation returned None so the operator was shown
+#: the parser's own refusal about a name that does not exist. Neither says the thing that
+#: actually happened, and the second is worse than saying nothing: the parser's refusal is
+#: what the escalation exists to keep off the screen, so it arrives looking like an answer.
+#:
+#: ⚠️ VERBATIM, NOT DRESSED. `_dressed` exists to replace the machine's vocabulary with
+#: something a visitor can read, and this sentence is already that. Appending the console
+#: blurb and a list of examples after it would bury the one instruction it gives.
+_TIER_TWO_UNREACHABLE = "Unable to reach Claude servers, please use deterministic commands only"
 
 #: What a caller is told when the database cannot be reached.
 #:
@@ -586,6 +613,55 @@ def _log_tier2_failed(
             + f": {exc}"
         ),
     )
+
+
+def _tier_two_unreachable(
+    exc: llmlib.LLMUnavailable,
+    *,
+    handed_over: dict[str, Any] | None = None,
+    command_id: str | None = None,
+) -> JSONResponse:
+    """The one answer a failed tier-2 call gives, on both of the paths that reach it.
+
+    🔑 ONE FUNCTION BECAUSE THERE ARE TWO WAYS IN, and they have drifted apart before. The
+    direct path and the escalation both call the model, both can fail, and each used to
+    answer that failure in its own way, so what an operator saw depended on whether the
+    parser had guessed wrong first. `_teach` is here for the same reason.
+
+    ⚠️ tier IS "llm", AND THAT IS THE CORRECTION. The direct path reported `tier: "parser"`
+    on a failed model call, which puts the parser's chip on a line the parser had nothing to
+    do with: the sentence was one it declined, and the tier chip is how this console makes
+    "the model runs only when it earns its latency" checkable on screen. A chip that names
+    the wrong tier makes the claim unreadable. The audit row already says `tier="llm",
+    result="error"`, so the response now agrees with the log.
+
+    🔑 THE WAIT IS PART OF THE ANSWER. A timeout at the client ceiling is the failure an
+    operator actually notices, because they sat through it. `latency_ms` is already measured
+    on the exception and renders in the trace as the seconds they waited, which is the
+    difference between "this is broken" and "this took 30 seconds and then broke".
+    """
+    thinking: dict[str, Any] = {"tier": "llm"}
+    if exc.model:
+        thinking["model"] = exc.model
+    if exc.elapsed_ms is not None:
+        thinking["latency_ms"] = exc.elapsed_ms
+    # 🔑 WHY THE MODEL WAS CALLED AT ALL, kept for the same reason a successful escalation
+    # keeps it: without it the trace reads as a model that failed for no stated reason, when
+    # what happened is that tier 1 declined first. Nested rather than merged, because these
+    # are the parser's findings on a response whose tier is the model's.
+    if handed_over and (handed_over.get("matched") or handed_over.get("declined")):
+        thinking["parser"] = handed_over
+
+    body: dict[str, Any] = {
+        "ok": False,
+        "summary": _TIER_TWO_UNREACHABLE,
+        "tier": "llm",
+        "results": [],
+        "thinking": thinking,
+    }
+    if command_id:
+        body["command_id"] = command_id
+    return JSONResponse(body, status_code=200, headers={"cache-control": "no-store"})
 
 
 def _log_tier1(
@@ -819,7 +895,11 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
         # plan left to keep, and no dropped-word list left to test. `fallback` went with it:
         # what it protected was the case where tier 1 had *something* and the model was
         # unavailable, and tier 1 now either has the answer or has nothing.
-        fallback: list[dict] | None = None
+        #
+        # ⚠️ IT SURVIVED AS A VARIABLE THAT WAS ALWAYS None, AND THAT WAS NOT HARMLESS: three
+        # branches below still read it, so the code went on describing a fallback this design
+        # no longer has, and two of those branches could never run. Tier 2 now either answers
+        # or says it could not be reached, which is the rule the dead variable was contradicting.
 
         if plan is None:
             # ---- TIER 2 ----------------------------------------------------
@@ -836,7 +916,11 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                 source=req.source, command_id=command_id,
                 parent_command_id=req.parent_command_id,
             )
-            if blocked and fallback is None:
+            # ⚠️ THE GUARD IS NOT A TIER-2 FAILURE AND KEEPS ITS OWN SENTENCE. A rate limit
+            # or a page on somebody else's domain has a specific, true thing to say, and it
+            # is already worded for a person. Replacing it with "unable to reach Claude
+            # servers" would be a lie about a system that is working exactly as configured.
+            if blocked:
                 return JSONResponse(
                     {"ok": False, "summary": _dressed(blocked), "tier": "parser", "results": []},
                     status_code=200, headers={"cache-control": "no-store"},
@@ -844,11 +928,6 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
 
             selection = None
             try:
-                # A spend guard that fired is the same situation as a model that will not
-                # answer: tier 2 is not available for this utterance. Funnelling both into
-                # one path is what stops the fallback below existing in two versions.
-                if blocked:
-                    raise llmlib.LLMUnavailable(blocked)
                 selection = llmlib.default_provider().select(
                     req.utterance,
                     _model_context(req.context, heard=req.heard, running=req.utterance),
@@ -861,27 +940,13 @@ def command(req: CommandRequest, request: Request) -> JSONResponse:
                     command_id=command_id,
                     parent_command_id=req.parent_command_id,
                 )
-                if fallback is None:
-                    return JSONResponse(
-                        {
-                            "ok": False,
-                            "summary": _dressed(
-                                "The reasoning layer is not answering right now, so I only have "
-                                "the deterministic commands"
-                            ),
-                            "tier": "parser",
-                            "results": [],
-                            "thinking": thinking,
-                        },
-                        status_code=200,
-                        headers={"cache-control": "no-store"},
-                    )
-                # ⚠️ THE PARTIAL MATCH IS BETTER THAN NOTHING, BUT ONLY BECAUSE IT ARRIVES
-                # LABELLED. `thinking.ignored` names the words that did not land and
-                # `degraded` says why the better answer was not available, so the operator
-                # is looking at an answer that admits what it is.
-                plan, tier = fallback, "parser"
-                thinking["degraded"] = f"tier 2 unavailable: {exc}"
+                # 🔴 THIS USED TO ANSWER AS TIER 1. The line said the reasoning layer was not
+                # answering and then wore the parser's chip, which is the one tier that had
+                # already declined this sentence. Tier 2 was asked, tier 2 failed, and the
+                # response says so.
+                return _tier_two_unreachable(
+                    exc, handed_over=thinking, command_id=command_id
+                )
 
             if selection is not None:
                 plan = selection.to_plan()
@@ -1181,11 +1246,18 @@ def _escalate_to_tier_two(
 ) -> JSONResponse | None:
     """Re-run the utterance through the model. None means "keep the original refusal".
 
-    🔑 EVERY FAILURE PATH RETURNS None RATHER THAN AN ERROR. The operator already has a
-    true, readable answer: the thing they named does not exist. If the model is rate
-    limited, unavailable, or produces nothing runnable, the right outcome is that original
-    sentence, not a worse one about the escalation. An optimisation that can only improve
-    the answer or leave it alone is one nobody has to reason about at 3am.
+    🔴 A FAILED CALL NO LONGER RETURNS None, AND THAT IS THE CORRECTION. This used to treat
+    every failure as "keep tier 1's sentence", on the reasoning that the operator already had
+    a true, readable answer and an optimisation that can only improve things is one nobody
+    has to reason about at 3am. The reasoning was wrong about which sentence they had. Tier 1
+    got here by naming something that does not exist, so its refusal is not a true answer to
+    the question, it is the dead end this whole path exists to keep off the screen. Handing it
+    back dressed as the reply meant a model outage looked like the parser confidently saying
+    no. Tier 2 either answers or says it could not be reached.
+
+    ⚠️ None STILL MEANS "KEEP THE ORIGINAL REFUSAL", for the cases where the model was never
+    the problem: no utterance to re-run, an answer with nothing sayable in it, or a database
+    failure the caller reports its own way.
 
     🔗 THE WHOLE CHAIN IS LOGGED UNDER THE FIRST COMMAND'S ID, so the audit trail reads
     guess, escalation, answer. That is the same `parent_command_id` the clarification round
@@ -1199,11 +1271,27 @@ def _escalate_to_tier_two(
 
     parent = first.get("command_id")
 
-    if _tier_two_blocked(
+    # ⚠️ A BLOCKED CALL ANSWERS TOO, AND FOR THE SAME REASON A FAILED ONE DOES. From the
+    # operator's seat there is no difference between a model that could not be reached and one
+    # that was not allowed to run: either way tier 2 did not answer, and falling through here
+    # put the parser's dead end on screen. It keeps the guard's own wording rather than the
+    # sentence above, because a rate limit is a true and specific thing to say.
+    blocked = _tier_two_blocked(
         client_ip=client_ip, origin=origin, utterance=req.utterance,
         source=req.source, command_id=parent,
-    ):
-        return None
+    )
+    if blocked:
+        return JSONResponse(
+            {
+                "ok": False,
+                "command_id": parent,
+                "summary": _dressed(blocked),
+                "tier": "parser",
+                "results": [],
+            },
+            status_code=200,
+            headers={"cache-control": "no-store"},
+        )
 
     # 🔑 THE ESCALATION TELLS THE MODEL WHAT THE PARSER LEARNED THE HARD WAY, and without
     # this it is simply the same call twice. The system prompt instructs the model to pass
@@ -1231,7 +1319,11 @@ def _escalate_to_tier_two(
             command_id=parent,
             parent_command_id=parent,
         )
-        return None
+        # 🔴 THE PARSER'S REFUSAL IS NOT THE ANSWER TO FALL BACK TO. It is the reason this
+        # call was made: tier 1 resolved the operator's words to something that does not
+        # exist. Showing it after a failed model call tells them their words matched nothing,
+        # when what happened is that the tier which might have understood them was down.
+        return _tier_two_unreachable(exc, command_id=parent)
 
     plan = selection.to_plan()
     db.log_event(

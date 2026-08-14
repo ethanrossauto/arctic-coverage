@@ -187,6 +187,22 @@ HARD_TO_HEAR: tuple[str, ...] = (
     "unknowns",     # "no ones"
     # Domain jargon: rare enough in ordinary speech to be worth the weight.
     "overdue", "nominal", "fault", "maintenance", "not broadcasting", "dark",
+    # 🔴 THE COMMAND VERBS THEMSELVES, WHICH ORDINARY VERBS NEVER NEEDED TO BE (2026-08-14).
+    # `_LIKELY` already carries every literal word in the grammar, so these are hinted the day
+    # they are declared; that is the mechanism and it is not enough on its own. It hands the
+    # model the word without saying the word is hard, and the whole argument of this tuple is
+    # that weight goes where the EAR fails. "Show", "hide" and "fix" never failed. Half of the
+    # operator vocabulary does, and a misheard verb loses the entire command even when every
+    # name in it was heard perfectly.
+    "slew",         # "slue", "sue", "through", and "slew to" -> "slow to"
+    "emplace",      # "in place" -- the worst one here: a real phrase, in this exact context
+    "sitrep",       # "sit rep", "sit rap"
+    "satcom",       # "sat com", "sad com"
+    "comms",        # "comes", "combs", and "comms check" -> "comes check"
+    "declutter",    # "de clutter", "the clutter"
+    "readout",      # "read out"
+    "scrub",        # "scrap", "scrubbed"
+    "deadline",     # ordinary enough, but "dead line" splits it and the command is one word
 )
 
 #: The rest of the likely vocabulary: the command words themselves. Ordinary English, rarely

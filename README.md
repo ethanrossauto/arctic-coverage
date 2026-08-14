@@ -14,16 +14,17 @@ Live: **[coverage.skryer.ca](https://coverage.skryer.ca)**
 
 ## What it does today
 
-- **Typed and spoken commands** answered through one registry of 19 validated tools. "Show me what is
-  not broadcasting", "fly Daymark 05 to Barrow Strait", "where has the Resolute patrol been",
-  "what are we not seeing".
-- **A two-tier command path built on a declared command language.** The first tier answers 18
-  sentences with no model call at all, exactly one per tool, each anchored to the whole utterance, so
-  it either recognises a request completely or hands it over. Anything outside the language goes to a language model, which
+- **Typed and spoken commands** answered through one registry of 17 validated tools. Say it the
+  declared way and it is instant and free, or say it any other way and the model works it out:
+  "show me what is not broadcasting", "fly Daymark 05 to Barrow Strait", "what are we not seeing".
+- **A two-tier command path built on a declared command language.** The first tier answers 16
+  sentences with no model call at all, exactly one per tool, each opening with a verb no other
+  sentence uses, each anchored to the whole utterance, so it either recognises a request completely
+  or hands it over. Anything outside the language goes to a language model, which
   proposes a plan as JSON and never touches state directly. The reference card in the console prints
   the language, one canonical sentence per tool, and is rendered from the same table the parser matches
   against.
-- **A question instead of a guess.** "Tell me about Daymark" names five drones, so the console asks
+- **A question instead of a guess.** "Readout on Daymark" names five drones, so the console asks
   which one and offers each as a button carrying the command with it. Answering costs a click rather
   than a retyped sentence, and the question comes from the deterministic tier, so it is immediate and
   free.
@@ -381,10 +382,19 @@ touch the database.
 **As a runtime component.** The second tier of the command path is `claude-opus-5`. It proposes a plan
 as JSON and never touches state: a validator resolves every referenced entity against live data and
 rejects anything that does not resolve, on the principle that a hallucinated value must never reach
-real state on the model's word alone. The first tier is a declared command language, 18 sentences
+real state on the model's word alone. The first tier is a declared command language, 16 sentences
 matched exactly and printed in full on the reference card, which is faster and cheaper and means the app still works when the model is
 unavailable. Measured locally across 88 phrasings, tier 1 answers in a median 1.3 seconds against 7.2
 for tier 2.
+
+**Every sentence opens with a verb no other sentence uses**, and that is the rule for whether a tool
+exists rather than a style preference. Four commands used to begin with `show`, which told an
+operator nothing about which of four things they were about to get. Applying the rule deleted two
+tools: one could be given no verb of its own, because it was a filter over another tool's results,
+and one had a perfectly good verb attached to a camera move the executor already performs on every
+answer. The vocabulary is borrowed rather than invented, so a word is guessable by anyone who has
+used a console before: a display is decluttered, a sensor is slewed, aircraft are vectored, equipment
+is emplaced, and a deadlined asset is one out of service.
 
 ⚠️ **The share answered without a model call fell a long way when that tier became exact, and the
 number is worth reading carefully rather than as a regression.** An earlier version matched keywords

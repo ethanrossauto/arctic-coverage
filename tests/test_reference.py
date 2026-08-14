@@ -65,6 +65,70 @@ def test_each_tool_shows_exactly_one_phrasing():
     assert not extra, f"one phrasing per tool on the card; these have another count: {extra}"
 
 
+def test_no_two_sentences_open_with_the_same_word():
+    """🔴 THE RULE THAT DECIDES WHETHER A TOOL EXISTS AT ALL (Ethan, 2026-08-14).
+
+    Four sentences used to start with `show`: the asset list, the ice overlay, coverage and the
+    unknown contacts. An operator hearing "show" learned nothing about which of four things they
+    were about to get, and the reference card had to carry a gloss per line to undo a collision
+    the language itself had created.
+
+    🥇 IT IS ALSO THE REDUNDANCY TEST, WHICH IS WHY IT IS PINNED RATHER THAN LEFT AS A HABIT. A
+    tool that cannot be given a verb nobody else uses is a filter or a synonym wearing a tool's
+    clothes: `show_unknown` failed it and was deleted the same day. The next tool to be added
+    here has to earn a word before it can earn a sentence.
+    """
+    openings: dict[str, list[str]] = {}
+    for rule in grammar.RULES:
+        openings.setdefault(rule.template.split()[0], []).append(rule.template)
+    clashes = {word: says for word, says in openings.items() if len(says) > 1}
+    assert not clashes, f"one verb, several commands: {clashes}"
+
+
+def test_the_commands_a_refusal_offers_are_commands_tier_one_answers():
+    """🔴 THE ONE PLACE A STALE EXAMPLE IS UNFORGIVABLE, and it was stale for weeks.
+
+    This list is printed when tier 2 is unavailable, described as commands that work "including
+    when the metered layer does not". Two of its three did not parse at all: they were written
+    against the keyword parser, which matched "overdue" anywhere in a sentence and dropped "me"
+    as filler, and nothing re-read them when the grammar became anchored. So the sentence shown
+    to an operator BECAUSE the model was down recommended two commands that need the model.
+    """
+    offered = grammar.suggestions()
+    assert offered, "a refusal that suggests nothing is not doing its job"
+    for command in offered:
+        plan = parser.parse(command)
+        assert plan is not None, (
+            f"a refusal offers {command!r} as a command that works without the model, "
+            "and tier 1 does not answer it"
+        )
+
+
+def test_every_tool_has_an_operator_facing_name():
+    """A tool the card cannot name prints its Python identifier at a visitor.
+
+    🔴 THE FALLBACK IS THE REASON THIS EXISTS. `reference()` drops back to `t.name` when a tool
+    is missing from `CARD`, which is the right thing for it to do and completely silent: the
+    card renders, nothing errors, and one line reads `(list_entities - )` in a panel that is
+    the first thing a stranger opens. A new tool is exactly when this happens, and a new tool
+    is exactly when nobody is looking at the reference card.
+    """
+    missing = sorted(set(tools.REGISTRY) - set(tools.CARD))
+    assert not missing, (
+        f"{missing} have no entry in CARD, so the reference card would print their Python "
+        "identifier and an empty description"
+    )
+
+
+def test_no_two_tools_share_an_operator_facing_name():
+    """Two tools with one name is the confusion the card exists to remove."""
+    seen: dict[str, list[str]] = {}
+    for name, card in tools.CARD.items():
+        seen.setdefault(card.label, []).append(name)
+    clashes = {label: names for label, names in seen.items() if len(names) > 1}
+    assert not clashes, f"one name, two tools: {clashes}"
+
+
 def test_every_phrasing_belongs_to_a_real_group():
     known = {key for key, _ in tools.GROUPS}
     wrong = sorted(

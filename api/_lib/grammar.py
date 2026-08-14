@@ -339,53 +339,80 @@ def _one(tool: str, **params: Any) -> tuple[tuple[str, dict[str, Any]], ...]:
 # all go to the model. Every one of them is a real capability reached through the tool's own
 # parameters, so tier 2 answers them; what is gone is the deterministic route. That is the price
 # of a language an operator can hold in their head, and it was chosen deliberately.
+# 🔴 EVERY SENTENCE STARTS WITH A VERB NOBODY ELSE USES, AND THAT IS THE SELECTION RULE FOR
+# WHETHER A TOOL EXISTS AT ALL (Ethan, 2026-08-14: *"you cant have three tools all starting with
+# 'show', its confusing... if it cant have unique lingo, it probably doesnt belong as a new
+# tool"*).
+#
+# Four sentences used to open with `show`: the asset list, the ice overlay, coverage and the
+# unknown contacts. An operator hearing "show" learned nothing about which of four things they
+# were about to get, and the card had to carry a gloss per line to undo the collision the
+# language had created. A distinct verb says it in the first word.
+#
+# 🥇 IT IS ALSO A BETTER TEST FOR REDUNDANCY THAN READING THE CODE WAS. Applied to the two tools
+# that went, they failed for different reasons and neither was obvious from the implementations:
+#
+#   show_unknown    no verb of its own exists, because it is not a different action. The only
+#                   honest sentence is "list the unknowns", which is `list_entities` with a
+#                   filter, and `coverage gaps` already reports that bucket in its answer.
+#   frame_entities  a verb DOES exist and "frame the patrols" is good lingo. It fails the other
+#                   half: `executor._frame_results` frames whatever any plan returned, so FRAME
+#                   and LIST are one camera move. A distinct word with no distinct action is a
+#                   synonym in a costume, which is what this table was cut from 45 rules to
+#                   avoid.
+#
+# ⚠️ AND IT SAVED TWO I HAD ALREADY WRITTEN OFF. `backhaul_status` shares its whole computation
+# with `mesh_status`, and `clear_fault` is `inject_fault` with the fault taken away, so both read
+# as merge candidates from the code. `comms check` against `satcom check`, and `deadline` against
+# `restore`, are four words an operator would never confuse: distinct question, distinct verb,
+# keep the tool. The lingo knew something the call graph did not.
+#
+# 🔑 THE VOCABULARY IS REAL, NOT INVENTED. Declutter is a tactical-display function, a sensor is
+# slewed, aircraft are vectored, the Army emplaces equipment, and a deadlined vehicle is one out
+# of service. Borrowing the words means an operator who has used a console before can guess
+# them, and everybody else has the card.
 RULES: tuple[Rule, ...] = (
     # --- see: what is on the map -------------------------------------------
-    Rule("show the {kind}", _one("list_entities", kind="{kind}")),
-    Rule("show the unknowns", _one("show_unknown")),
-    Rule("show coverage", _one("coverage")),
-    Rule("show the ice", _one("show_overlay", layer="ice")),
-    Rule("hide the {kinds}", _one("set_visible_kinds", mode="hide", kinds="{kinds}")),
+    Rule("list the {kind}", _one("list_entities", kind="{kind}")),
+    Rule("coverage gaps", _one("coverage")),
+    Rule("overlay the ice", _one("show_overlay", layer="ice")),
+    Rule("declutter the {kinds}", _one("set_visible_kinds", mode="hide", kinds="{kinds}")),
     # --- look at: where the camera points ----------------------------------
     # 🔴 A CAMERA COMMAND MUST NEVER REACH THE MODEL. It carries no domain question at all, so
     # there is nothing for a reasoning model to reason about, and it is the first thing anyone
     # tries on a map: "zoom the map out completely" once took 7.8 seconds against 1.9 for
     # anything this tier answers.
-    Rule("zoom out", _one("reset_view")),
-    Rule("frame the {kind}", _one("frame_entities", kind="{kind}"), example={"kind": "patrols"}),
-    Rule("focus {asset}", _one("focus_entity", target="{asset}")),
+    Rule("go wide", _one("reset_view")),
+    Rule("slew to {asset}", _one("focus_entity", target="{asset}")),
     # The window is stated rather than left to the tool's default, so the trace and the audit
     # row say which day was asked about. A parameter this tier chose silently is a parameter
     # nobody can check afterwards.
-    Rule("where has {asset} been", _one("entity_history", target="{asset}", days=1.0)),
+    Rule("track history on {asset}", _one("entity_history", target="{asset}", days=1.0)),
     # --- ask: what the console knows ---------------------------------------
-    Rule("mesh status", _one("mesh_status")),
-    Rule("backhaul status", _one("backhaul_status")),
-    Rule("tell me about {asset}", _one("describe_entity", target="{asset}")),
-    # ⚠️ `history` IS DELIBERATELY NOT ONE OF THESE WORDS. "Where has Daymark 01 been" is one
+    Rule("comms check", _one("mesh_status")),
+    Rule("satcom check", _one("backhaul_status")),
+    Rule("readout on {asset}", _one("describe_entity", target="{asset}")),
+    # ⚠️ `history` IS DELIBERATELY NOT ONE OF THESE WORDS. "Track history on Daymark 01" is one
     # asset's track; this is the world's log, and they are different answers.
-    Rule("what has happened recently", _one("recent_activity", days=1.0)),
+    Rule("sitrep", _one("recent_activity", days=1.0)),
     # --- do: change the world ----------------------------------------------
     Rule(
-        "place a {placeable} at {coord}",
+        "emplace a {placeable} at {coord}",
         _one("place_asset", kind="{placeable}", lat="{lat}", lon="{lon}"),
     ),
     Rule(
-        "send {asset} to {coord}",
+        "vector {asset} to {coord}",
         _one("task_uas", target="{asset}", lat="{lat}", lon="{lon}"),
         example={"asset": "a drone"},
     ),
-    Rule("remove {asset}", _one("remove_asset", target="{asset}"),
+    Rule("scrub {asset}", _one("remove_asset", target="{asset}"),
          example={"asset": "Marker 01"}),
-    # 🔑 THE VOCABULARY IS WHAT AN OPERATOR SAYS, NOT WHAT THE TOOL IS CALLED. Nobody types
-    # "inject a fault"; they say kill it.
-    #
     # ⚠️ ONE OF THE TWO FAULTS IS SAYABLE HERE, and that follows from one sentence per tool:
     # `fault` is a parameter, and this sentence fixes it to `silent`. Putting an asset
     # unserviceable is the same tool with the other value, so it goes to the model.
-    Rule("kill {asset}", _one("inject_fault", target="{asset}", fault="silent"),
+    Rule("deadline {asset}", _one("inject_fault", target="{asset}", fault="silent"),
          example={"asset": "node-barrow-05"}),
-    Rule("fix {asset}", _one("clear_fault", target="{asset}"),
+    Rule("restore {asset}", _one("clear_fault", target="{asset}"),
          example={"asset": "node-barrow-05"}),
 )
 
@@ -607,6 +634,31 @@ def card_sentences() -> dict[str, list[str]]:
     for compiled in COMPILED:
         out.setdefault(compiled.rule.tool, []).append(compiled.sentence)
     return out
+
+
+#: Tools worth suggesting to somebody who has just been refused, in the order they are offered.
+#:
+#: 🔑 THESE THREE BECAUSE THEY NEED NO ARGUMENT AND NO ASSET. A refusal is the worst moment to
+#: hand somebody a sentence with a slot in it: they have to invent a value, and inventing one
+#: that resolves is exactly what they just failed at.
+_SUGGESTED: tuple[str, ...] = ("comms check", "coverage gaps", "sitrep")
+
+
+def suggestions() -> list[str]:
+    """Sentences to offer an operator whose command was refused. Every one is checked.
+
+    🔴 THIS EXISTS BECAUSE THE HAND-TYPED VERSION WAS WRONG WHERE IT MATTERED MOST. `index.py`
+    carried three example commands described as "always work, including when the metered layer
+    does not", and two of them did not parse at all: they were written for the keyword parser
+    and never re-read when the grammar became anchored. The one line whose whole job is to be
+    reachable when tier 2 is down recommended two commands that need tier 2.
+
+    🔒 SO IT FILTERS AGAINST THE LANGUAGE RATHER THAN TRUSTING THE LIST. A name here that stops
+    being a declared sentence drops out silently rather than being offered, and the suite asserts
+    the result is not empty. Getting this wrong quietly is what happened last time.
+    """
+    declared = {compiled.sentence for compiled in COMPILED}
+    return [s for s in _SUGGESTED if s in declared]
 
 
 #: What a kind is called when a sentence has to name it out loud. The lexicon maps many words

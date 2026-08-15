@@ -80,7 +80,14 @@ async def one_connection_per_request(request: Request, call_next: Any) -> Any:
     without knowing it exists, which is the only version of this that stays true after
     somebody adds an endpoint in a hurry. The scope opens nothing by itself, so a request
     that never touches the database still pays nothing.
+
+    🔑 IT ALSO WARMS THE REASONING PATH, for the same reason it holds the connection: this
+    is the one place every request passes through. The first request an instance serves is
+    almost never the command, it is the page asking for entities, and that is exactly the
+    moment worth spending on the handshake nobody is waiting for yet. See
+    `llm.warm_in_background`, which returns immediately and costs nothing.
     """
+    llmlib.warm_in_background()
     with db.request_scope():
         return await call_next(request)
 

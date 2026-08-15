@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -656,6 +658,103 @@ def test_a_failed_tier_two_says_so_instead_of_answering_as_tier_1(world, log, mo
     # Why the model was called at all. Without it the trace shows a model failing for no
     # stated reason, when tier 1 declined first and that is the whole story.
     assert body["thinking"]["parser"]["declined"]
+
+
+def test_a_ceiling_failure_says_which_half_of_the_call_stalled():
+    """🔴 WRITTEN AFTER A LIVE FAILURE THE PREVIOUS FIELDS STILL COULD NOT EXPLAIN. A first
+    command of the day spent both attempts against the ceiling and the row said "upstream slow
+    or unreachable", which is two diagnoses joined by an `or`: slow is the provider, unreachable
+    is DNS, TLS or a cold connect on our side, and they are fixed in different files.
+
+    ⚠️ THE ELAPSED TIME CANNOT SEPARATE THEM, which is why this is its own field rather than
+    more arithmetic on the numbers already there. Both halves fire at exactly the ceiling. The
+    SDK collapses both into one `APITimeoutError` and chains the transport error underneath,
+    so the answer is one attribute away and was simply never read.
+    """
+    connect = llm.LLMUnavailable(
+        "APITimeoutError: Request timed out",
+        kind="APITimeoutError",
+        elapsed_ms=30_451,
+        attempts=2,
+        timeout_s=15.0,
+        cause="ConnectTimeout",
+    ).as_params()
+    assert connect["cause"] == "ConnectTimeout"
+    assert "not the model" in connect["verdict"], "never reached them: ours to fix"
+
+    read = llm.LLMUnavailable(
+        "APITimeoutError: Request timed out",
+        kind="APITimeoutError",
+        elapsed_ms=30_451,
+        attempts=2,
+        timeout_s=15.0,
+        cause="ReadTimeout",
+    ).as_params()
+    assert read["cause"] == "ReadTimeout"
+    assert "the provider was slow" in read["verdict"], "they had it and did not answer"
+
+    # 🔑 THE OLD READING SURVIVES WHEN THERE IS NOTHING TO SHARPEN IT WITH. A provider error
+    # raised on its own has no chained cause, and the honest answer then is still the `or`.
+    blind = llm.LLMUnavailable(
+        "APITimeoutError: Request timed out",
+        kind="APITimeoutError",
+        elapsed_ms=30_451,
+        attempts=2,
+        timeout_s=15.0,
+    ).as_params()
+    assert "cause" not in blind, "absent, not null: a null reads as 'we looked and found nothing'"
+    assert "upstream slow or unreachable" in blind["verdict"]
+
+
+def test_the_reasoning_path_is_warmed_once_per_instance_and_off_the_request_path(monkeypatch):
+    """🔴 THE FIRST COMMAND OF THE DAY IS THE ONE THAT FAILED, and it is the worst one to lose.
+    A cold instance pays for the SDK import, the name lookup and the handshake, and the operator
+    paid it by waiting out both attempts. The fix is to pay it before anyone asks.
+
+    ⚠️ WHAT THIS PINS IS THE THREE PROPERTIES THAT MAKE IT SAFE TO PUT IN MIDDLEWARE, because
+    each of them, broken, is worse than the stall it replaces: it must not block the request, it
+    must not raise into a route that never wanted the model, and it must not fire per request.
+    Warming per visitor would buy a real model call, at real cost, on an instance already warm.
+    """
+    monkeypatch.setattr(llm, "_warmed", threading.Event())
+    calls: list[str] = []
+    monkeypatch.setattr(llm, "_warm", lambda: calls.append("fired"))
+
+    started = time.perf_counter()
+    for _ in range(5):
+        llm.warm_in_background()
+    blocked_ms = (time.perf_counter() - started) * 1000
+
+    for thread in threading.enumerate():
+        if thread.name == "anthropic-warm":
+            thread.join(timeout=5)
+
+    assert calls == ["fired"], "once per instance, however many requests arrive together"
+    assert blocked_ms < 50, "the caller is middleware in front of every route; it cannot wait"
+
+    # 🔑 AND IT IS ACTUALLY WIRED, checked through a real request rather than by calling the
+    # function directly. The whole fix is one line in middleware, which is exactly the kind of
+    # line a later refactor drops without any test noticing: every assertion above would still
+    # pass with nothing calling it at all. `healthz` is the right prover because it is the
+    # route that wants the model least.
+    from api import index
+
+    calls.clear()
+    monkeypatch.setattr(llm, "_warmed", threading.Event())
+    assert TestClient(index.app).get("/api/healthz").status_code == 200
+    for thread in threading.enumerate():
+        if thread.name == "anthropic-warm":
+            thread.join(timeout=5)
+    assert calls == ["fired"], "a request that never touches tier 2 is still what warms it"
+
+    # 🔑 AND THE WARM ITSELF SWALLOWS EVERYTHING, checked against the real function rather than
+    # a stub, because this is the half that runs where nothing is watching. An unreachable
+    # provider must leave no exception behind: nobody is waiting on the result, and the failure
+    # that matters is still logged in full by the call an operator actually made.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-a-real-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(llm, "TIMEOUT_S", 1.0)
+    assert llm._warm() is None
 
 
 def test_a_blocked_tier_two_keeps_the_guards_own_sentence(world, log, monkeypatch):

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -119,9 +120,10 @@ MAX_TOKENS = 2048
 #
 #   4.4  4.8  5.5  6.3  6.4  19.6      median 5.9 s
 #
-# The 19.6 is the first call of a session, before the prompt cache is warm, and it is the
-# one the ceiling has to clear. Thirty seconds is five times the median and comfortably
-# past the cold case, so it cannot fire on a call that was going to succeed.
+# The 19.6 is the first call of a session, and whatever makes a first call cost that much,
+# it is the one a ceiling has to clear. Thirty cleared it comfortably; the paragraph below
+# lowered the ceiling to fifteen, which does not. See the note at the bottom of this block:
+# the first call is now warmed off the request path instead of being given headroom here.
 #
 # ⚠️ IT USED TO BE TWELVE, WITH ONE RETRY, AND THAT PAIR HID A DEAD TIER. The schema in
 # front of it had grown past what structured output accepts, so every call failed; the
@@ -139,6 +141,21 @@ MAX_TOKENS = 2048
 # phrasings put this tier at a 7.0 s median and an 11.8 s p90, so fifteen clears the
 # measured tail with room and still fires long before a person decides the interface is
 # broken. Thirty was chosen when there was no distribution to choose against.
+#
+# 🔒 FIFTEEN IS SETTLED. DO NOT RAISE IT (2026-08-15). It was questioned the same day a cold
+# first call spent both attempts against it and returned nothing, and the answer was to keep
+# the ceiling and remove the cold call instead. ⛔ Raising this is not an available fix for a
+# slow first command; `warm_in_background` at the bottom of this file is.
+#
+# ⚠️ THE PROBE THAT CHOSE FIFTEEN COULD NOT HAVE SEEN THE COLD CASE, and that is worth
+# knowing before anyone re-opens this. It ran 88 unique phrasings twice each, back to back,
+# so at most one of 176 calls was cold and a single sample cannot move a p90. The 7.0 s
+# median and 11.8 s p90 above describe warm calls only, which is the right distribution to
+# size a ceiling against once the cold call is no longer on the operator's path.
+#
+# 🔑 THE ARGUMENT FOR KEEPING IT LOW IS THE ONE ALREADY MADE TWICE ABOVE: a ceiling with
+# enough headroom to swallow the worst case is a ceiling that reports a broken tier as a
+# slow one. Fifteen fires on things that are genuinely wrong, and that is the job.
 TIMEOUT_S = 15.0
 
 # 🔑 ONE RETRY, UP FROM NONE, BECAUSE THE CEILING ABOVE CAME DOWN. The pair is what
@@ -844,6 +861,7 @@ class LLMUnavailable(RuntimeError):
         request_id: str | None = None,
         attempts: int | None = None,
         timeout_s: float | None = None,
+        cause: str | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind or type(self).__name__
@@ -853,32 +871,50 @@ class LLMUnavailable(RuntimeError):
         self.request_id = request_id
         self.attempts = attempts
         self.timeout_s = timeout_s
+        self.cause = cause
 
     def as_params(self) -> dict[str, Any]:
         """The structured half, for the audit row. Absent fields are left out rather than
         written as null: a column of nulls reads as "we looked and found nothing"."""
         found = {
             "error": self.kind,
+            # 🔑 WHICH HALF OF THE CALL BURNED THE TIME, which `error` alone cannot say. The SDK
+            # collapses a stall before the connection is up and a stall waiting for the answer
+            # into one `APITimeoutError`, and the two have opposite fixes: a `ConnectTimeout` is
+            # DNS, TLS or reachability on our side, a `ReadTimeout` is the provider holding the
+            # request open. Kept as the raw underlying exception name rather than interpreted,
+            # because the interpretation is one field below and the raw name is what stays
+            # honest if a future SDK renames its wrappers.
+            "cause": self.cause,
             "model": self.model,
             "elapsed_ms": self.elapsed_ms,
             "status": self.status,
             "request_id": self.request_id,
             "attempts": self.attempts,
             "timeout_s": self.timeout_s,
-            # 🔑 THE READING, COMPUTED HERE SO THE LOG DOES NOT NEED ARITHMETIC. Anything that
-            # spent the whole ceiling is a slow or unreachable upstream; anything that came back
-            # fast was refused, and a refusal is usually ours to fix.
-            "verdict": (
-                "hit the client ceiling: upstream slow or unreachable"
-                if self.elapsed_ms is not None
-                and self.timeout_s is not None
-                and self.elapsed_ms >= int(self.timeout_s * 1000)
-                else "returned before the ceiling: the request itself was refused"
-                if self.elapsed_ms is not None
-                else None
-            ),
+            "verdict": self._verdict(),
         }
         return {k: v for k, v in found.items() if v is not None}
+
+    def _verdict(self) -> str | None:
+        """The reading, computed here so the log does not need arithmetic.
+
+        ⚠️ THE CEILING BRANCH USED TO SAY "upstream slow OR unreachable" AND THAT `or` WAS THE
+        WHOLE PROBLEM. Both halves fire at exactly the same elapsed time, so the number alone
+        can never separate them, and the two point at different code: unreachable is the cold
+        connect path on a fresh instance, slow is the provider. `cause` is what settles it, so
+        the verdict now says which one whenever the SDK handed us a cause to say it with.
+        """
+        if self.elapsed_ms is None:
+            return None
+        hit_ceiling = self.timeout_s is not None and self.elapsed_ms >= int(self.timeout_s * 1000)
+        if not hit_ceiling:
+            return "returned before the ceiling: the request itself was refused"
+        if self.cause == "ConnectTimeout":
+            return "hit the client ceiling before connecting: DNS, TLS or reachability, not the model"
+        if self.cause == "ReadTimeout":
+            return "hit the client ceiling waiting for the answer: the provider was slow"
+        return "hit the client ceiling: upstream slow or unreachable"
 
 
 class AnthropicProvider:
@@ -943,6 +979,11 @@ class AnthropicProvider:
                 request_id=getattr(exc, "request_id", None),
                 attempts=MAX_RETRIES + 1,
                 timeout_s=TIMEOUT_S,
+                # The SDK wraps the transport failure and chains the original, so the phase
+                # that actually stalled is one attribute away. Read defensively: a provider
+                # error raised on its own has no `__cause__` and must not become an
+                # AttributeError inside the handler for another failure.
+                cause=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
             ) from exc
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1027,6 +1068,67 @@ def usage_and_cost(usage: Any, elapsed_ms: int, model: str) -> dict[str, Any]:
         "cost_usd": None if cost is None else round(cost, 6),
         "latency_ms": elapsed_ms,
     }
+
+
+# --------------------------------------------------------------------------
+# Paying the cold cost off the request path
+# --------------------------------------------------------------------------
+#
+# 🔴 THE FAILURE THIS EXISTS FOR IS IN THE AUDIT LOG, TWICE OVER. The first reasoning call
+# after an idle period spent the entire ceiling on both attempts and returned nothing, and
+# the same sentence answered in 3.5 s a minute later. The operator's first command of the
+# day is the one that fails, which is the worst possible one to lose.
+#
+# ⚠️ IT IS NOT THE PROMPT CACHE, AND THE LOG IS WHAT RULES THAT OUT. The call that
+# succeeded wrote the cache fresh too (`cache_read_tokens` 0), so both calls paid the same
+# cache cost and only one of them was slow. What differs is per-instance and in-process:
+# importing the SDK, resolving the provider's name, and the TLS handshake. A fresh instance
+# has done none of the three.
+#
+# 🔑 SO THE WARM IS PER INSTANCE, NOT PER VISITOR AND NOT PER RESET, and both of those
+# alternatives are wrong for reasons worth writing down:
+#   - Per RESET warms nothing that matters. `lifecycle._claim` is atomic, so exactly one
+#     instance wins the reset, and the next command is routed wherever the platform likes.
+#   - Per VISITOR pays a real model call, at real cost, on an instance that is usually
+#     already warm.
+#
+# 💵 AND IT SPENDS NOTHING. `models.list` forces the import, the DNS lookup, the handshake
+# and the auth round trip without a single token, so the expensive half is paid and the
+# billable half never happens. A warm that cost money would be a warm somebody eventually
+# turns off.
+_warmed = threading.Event()
+
+
+def warm_in_background() -> None:
+    """Pay the cold connect cost on a thread, once per instance, before anyone asks.
+
+    ⚠️ NEVER ON THE REQUEST PATH AND NEVER RAISING. The caller is middleware in front of
+    every route, so anything this does slowly or loudly is worse than the problem it fixes:
+    a warm that blocks has simply moved the stall onto the page load, and a warm that
+    raises breaks endpoints that never wanted the model.
+    """
+    # 🔑 SET BEFORE THE THREAD STARTS, NOT AFTER. A cold instance hit by several requests at
+    # once would otherwise pass this check several times and warm several times over. Losing
+    # a warm to a race is harmless; the next instance does it again.
+    if _warmed.is_set():
+        return
+    _warmed.set()
+    threading.Thread(target=_warm, name="anthropic-warm", daemon=True).start()
+
+
+def _warm() -> None:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    try:
+        import anthropic
+
+        anthropic.Anthropic(timeout=TIMEOUT_S, max_retries=0).models.list(limit=1)
+    except Exception:  # noqa: BLE001 - a warm that failed is not news; the real call reports
+        # ⚠️ SILENT ON PURPOSE, and this is the one place in this file where swallowing an
+        # exception is right. Nobody is waiting on this result, and a failed warm changes
+        # nothing except that the next real call pays what it pays today. The failure that
+        # matters is still logged, in full, by the call that an operator actually made.
+        return
 
 
 def default_provider() -> Provider:

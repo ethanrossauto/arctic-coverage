@@ -29,7 +29,7 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ⚠️ PINNED TO THE VERSION THE PROJECT IS DEVELOPED ON. `python-version: '3.x'` would
       # silently move to whatever is current and turn a green tree red with no commit behind

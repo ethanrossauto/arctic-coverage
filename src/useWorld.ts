@@ -30,9 +30,16 @@ export function useWorld(): void {
   const setResetNotice = useStore((s) => s.setResetNotice);
   const setAssets = useStore((s) => s.setAssets);
   const setMesh = useStore((s) => s.setMesh);
+  const phase = useStore((s) => s.phase);
 
   // ---- read the clock, and notice when the world changed underneath us -------------
   useEffect(() => {
+    // 🔒 SILENT ON THE ENTRY SCREEN. This tick is a real database query, and together with
+    // the shell's asset poll it is why the compute could never reach its five-minute suspend
+    // window: one open tab kept it billing for ever. Nothing here is urgent enough to keep a
+    // database awake for somebody who has walked away. See `session.ts`.
+    if (phase !== "live") return;
+
     let live = true;
     // Held in the closure rather than in the store: it is this tab's memory of what it last
     // saw, and putting it in shared state would invite something else to reason about it.
@@ -76,7 +83,7 @@ export function useWorld(): void {
       live = false;
       clearInterval(id);
     };
-  }, [setWorld, setResetNotice, setAssets, setMesh]);
+  }, [phase, setWorld, setResetNotice, setAssets, setMesh]);
 
   // ---- report that a person is deliberately using the display ----------------------
   useEffect(() => {

@@ -55,6 +55,25 @@ export function collectPageProblems(page: Page): PageProblems {
  * React rendered. It is the shortest honest proof that the whole chain from Python
  * through Postgres to the DOM is intact.
  */
+/**
+ * Open the console the way a person does: load the page, then press Enter.
+ *
+ * 🔒 EVERY TEST GOES THROUGH THE REAL ENTRY PATH, AND THERE IS DELIBERATELY NO BYPASS. The
+ * entry screen is not decoration: it is the only route into the app, and it is what lets the
+ * database sleep, so a suite that skipped it would be testing a way in that no visitor has.
+ * `?live=off` is a bypass and is justified in its own comment by two tests that compare
+ * frames; this is not the same kind of thing and should not grow the same escape hatch.
+ *
+ * ⚠️ IT DOES NOT WAIT FOR DATA. Pressing Enter is when the fetches start, so callers still
+ * wait on whatever they actually care about: assets, the ice, or a painted map.
+ */
+export async function openConsole(page: Page, url = "/"): Promise<void> {
+  await page.goto(url);
+  // Keyed on the role and the word, not a class, so restyling the screen does not read as
+  // nineteen broken tests.
+  await page.getByRole("button", { name: "Enter" }).click();
+}
+
 export async function waitForAppLoaded(page: Page): Promise<void> {
   // The colon is optional so this probe survives the strip's label being punctuated. It is
   // a readiness check, not an assertion about wording, and it gates every browser test in

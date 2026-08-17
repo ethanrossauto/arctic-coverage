@@ -23,6 +23,7 @@
 import { create } from "zustand";
 
 import type { Asset, AssetKind, IceLayer, MeshStatus } from "./assets";
+import type { Phase } from "./session";
 import type { WorldStatus } from "./world";
 import type { ViewportBbox } from "./map/bounds";
 
@@ -154,6 +155,27 @@ interface State {
   iceDate: string;
   loading: boolean;
   error: string | null;
+
+  /**
+   * Whether the console is being driven, or is waiting to be entered.
+   *
+   * 🔒 IT GATES EVERY POLL, and that is the only reason it lives in the store rather than in
+   * the shell's own state. See `session.ts` for the invariant it exists to hold: the database
+   * is only ever asleep while this reads `entry`. A timer added later that does not consult
+   * this will quietly keep the compute awake for ever, which is the bug this replaced.
+   */
+  phase: Phase;
+  setPhase: (p: Phase) => void;
+
+  /**
+   * Set while a request has been outstanding longer than `SLOW_REQUEST_MS`.
+   *
+   * ⚠️ NOT AN ERROR, AND NOT THE BOOT CURTAIN. It says the console is waiting on something
+   * that is taking longer than a warm read should, which is a thing to admit rather than to
+   * present as a frozen screen.
+   */
+  waiting: boolean;
+  setWaiting: (v: boolean) => void;
 
   /**
    * What the PLACE control is set to. `kind` non-null means the map is armed.
@@ -339,6 +361,12 @@ export const useStore = create<State>((set) => ({
   setMesh: (m) => set({ mesh: m }),
   setIce: (i) => set({ ice: i }),
   setIceDate: (d) => set({ iceDate: d }),
+  // 🔑 STARTS AT `entry`, so the very first paint is the entry screen and the database is
+  // never asked for anything before somebody has said they want it.
+  phase: "entry",
+  setPhase: (p) => set({ phase: p }),
+  waiting: false,
+  setWaiting: (v) => set({ waiting: v }),
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e, loading: false }),
   setPlacing: (p) => set({ placing: p }),

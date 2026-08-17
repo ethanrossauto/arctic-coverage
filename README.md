@@ -275,6 +275,16 @@ Worth its own section, because the failures this project most wanted to avoid ar
   date, which cost 1.4 MB before the first frame. A visitor now downloads about 14 KB.
 - **Static assets come off a CDN, not through a function.** The basemap is the largest thing this app
   serves, and no request for it should wake a Python process.
+- **The database is allowed to sleep, and the entry screen is what pays for that.** Compute scales to
+  zero after five idle minutes and takes about twelve seconds to come back on the first connection,
+  which is intolerable in front of a live map and unremarkable in front of a screen with a button on
+  it. So the wake starts the moment the page loads, before the bundle has even parsed, and the
+  seconds spent reading that screen are seconds the database is already coming up. After fifteen
+  minutes with nobody touching the console it returns to that screen and every poll stops, which is
+  the same event rather than two: stopping the polling earlier would let the database suspend behind
+  a display that still looked live, and anyone returning in that gap would meet the cold start with
+  nothing explaining it. The alternative was pinging the database around the clock to keep it awake,
+  which works until the monthly compute allowance runs out and then suspends the site for days.
 
 ---
 
@@ -384,8 +394,9 @@ as JSON and never touches state: a validator resolves every referenced entity ag
 rejects anything that does not resolve, on the principle that a hallucinated value must never reach
 real state on the model's word alone. The first tier is a declared command language, 16 sentences
 matched exactly and printed in full on the reference card, which is faster and cheaper and means the app still works when the model is
-unavailable. Measured locally across 88 phrasings, tier 1 answers in a median 1.3 seconds against 7.2
-for tier 2.
+unavailable. Measured locally across 88 phrasings in August 2026, tier 1 answered in a median 1.3
+seconds against 7.0 for tier 2. That run predates the current wording of the language, so read it as
+the shape of the gap between the two tiers rather than as a figure for the sentences above.
 
 **Every sentence opens with a verb no other sentence uses**, and that is the rule for whether a tool
 exists rather than a style preference. Four commands used to begin with `show`, which told an
@@ -401,7 +412,7 @@ number is worth reading carefully rather than as a regression.** An earlier vers
 anywhere in a sentence and caught 23 of those 88. On a set of 21 phrasings kept from that run it
 matched 16, but only **9** of those reached the operator: the other 7 were matched and then escalated
 anyway, by a second mechanism that subtracted a two-hundred-word list of words that did not count as
-dropped and handed over whatever was left. The 18-sentence language serves **3** of the same 21. Of the
+dropped and handed over whatever was left. The 16-sentence language serves **3** of the same 21. Of the
 6 it stopped serving, 2 had been answered with the wrong tool ("what is the threat level" resolved to
 an asset search for something called "threat level") and 4 were correct answers that now cost a model
 call. Both mechanisms are gone, replaced by one that cannot half-match.

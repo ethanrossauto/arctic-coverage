@@ -94,6 +94,20 @@
     </div>
 
     <script>
+      // 🔴 THE EARLIEST POSSIBLE MOMENT TO START THE DATABASE WAKING, and that is the whole
+      // reason this line is here rather than in the app. The compute suspends after five
+      // idle minutes and takes a measured 11.9 s to come back on the first connection, so
+      // every second it starts earlier is a second nobody spends looking at a spinner.
+      //
+      // Running here buys the download and parse of a 325 KB bundle, which is seconds on a
+      // cold load. The entry screen fires the same request when it mounts, for returns later
+      // in the same page life; this one covers the arrival.
+      //
+      // ⚠️ IT MUST STAY FIRE-AND-FORGET. Nothing waits on it and nothing reads the result:
+      // if it fails, the real request behind the Enter button reports the failure properly,
+      // and blocking the page on a warm-up would be worse than the cold start it avoids.
+      fetch("/api/healthz", { cache: "no-store" }).catch(function () {});
+
       // The app calls window.consoleReady() when the map has actually drawn something. Until
       // it does, the watchdog below is what lifts the curtain, so this is safe to ship before
       // anything calls it.

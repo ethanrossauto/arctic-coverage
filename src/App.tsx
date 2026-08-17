@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 
 import { fetchAssets, fetchIce, fetchMesh, isOverdue, MESH_KINDS } from "./assets";
 import { AssetBanner } from "./AssetBanner";
+import { EnterScreen } from "./EnterScreen";
 import { AssetPicker } from "./AssetPicker";
 import { AuditPanel } from "./AuditPanel";
 import { CommandBar } from "./CommandBar";
@@ -21,8 +22,10 @@ import { IceTimebar } from "./IceTimebar";
 import { useStore } from "./store";
 import { PlaceMenu } from "./PlaceMenu";
 import { ViewMenu } from "./ViewMenu";
+import { SLOW_REQUEST_MS } from "./session";
 import { useNow } from "./useNow";
 import { useDeadReckoning } from "./useDeadReckoning";
+import { useIdleReturn } from "./useIdleReturn";
 import { useWorld } from "./useWorld";
 import { COUNTDOWN_VISIBLE_S, formatCountdown, resetWorld } from "./world";
 
@@ -58,6 +61,9 @@ export default function App() {
   const setHideUndetected = useStore((s) => s.setHideUndetected);
   const world = useStore((s) => s.world);
   const resetNotice = useStore((s) => s.resetNotice);
+  const phase = useStore((s) => s.phase);
+  const waiting = useStore((s) => s.waiting);
+  const setWaiting = useStore((s) => s.setWaiting);
   const setResetNotice = useStore((s) => s.setResetNotice);
   const auditOpen = useStore((s) => s.auditOpen);
   const setAuditOpen = useStore((s) => s.setAuditOpen);
@@ -80,22 +86,39 @@ export default function App() {
   // Carries positions forward between the five second fixes. Costs no extra requests; see
   // the module for why polling faster was the wrong answer.
   useDeadReckoning();
+  // Returns to the entry screen after fifteen idle minutes, which is the same event that
+  // stops every poll above. See `session.ts` for why those two cannot be separated.
+  useIdleReturn();
 
   // Assets are the thing an operator is actually looking at, so they load on their
   // own and a failure in any derived layer below must not blank them.
+  //
+  // 🔒 NOT BEFORE THE VISITOR HAS ASKED. On the entry screen this is the request that would
+  // wake the database, and waking it here rather than on that screen's own terms would put
+  // the eleven seconds in front of the map instead of in front of a button.
   useEffect(() => {
+    if (phase !== "live") return;
+    // The first read after a suspend is the one that pays for the compute coming up, so it
+    // is the one that has to be able to say it is waiting. See `SLOW_REQUEST_MS`.
+    const slow = setTimeout(() => setWaiting(true), SLOW_REQUEST_MS);
     fetchAssets()
       .then(setAssets)
-      .catch((e) => setError(String(e)));
-  }, [setAssets, setError]);
+      .catch((e) => setError(String(e)))
+      .finally(() => {
+        clearTimeout(slow);
+        setWaiting(false);
+      });
+    return () => clearTimeout(slow);
+  }, [phase, setAssets, setError, setWaiting]);
 
   // The link graph loads independently, and a failure here is deliberately NOT fatal:
   // you can still see where everything is without knowing what can talk to what.
   useEffect(() => {
+    if (phase !== "live") return;
     fetchMesh()
       .then(setMesh)
       .catch((e) => console.error("mesh graph unavailable", e));
-  }, [setMesh]);
+  }, [phase, setMesh]);
 
   // ⏱️ THE ONLY THING THAT MAKES MOTION VISIBLE. The server advances the position of
   // every asset it is currently hearing from, so the world changes between reads. Fetched
@@ -116,15 +139,22 @@ export default function App() {
   // and a world that moves underneath them turns a real assertion into a flaky one. The
   // honest fix is to stop the world for those tests and say so, not to loosen the
   // comparison until motion no longer trips it.
+  //
+  // 🔒 AND IT STOPS DEAD ON THE ENTRY SCREEN. This timer and the one in `useWorld` were what
+  // made the database's five-minute suspend window unreachable: between them they queried it
+  // every five seconds for as long as a tab existed, so one forgotten tab kept the compute
+  // billing indefinitely. Gating both on `phase` is what lets it sleep at all. See
+  // `session.ts` for the invariant, and note that a timer added later without this check
+  // silently undoes the whole feature.
   const live = new URLSearchParams(location.search).get("live") !== "off";
   useEffect(() => {
-    if (!live) return;
+    if (!live || phase !== "live") return;
     const id = setInterval(() => {
       fetchAssets().then(setAssets).catch(() => {});
       fetchMesh().then(setMesh).catch(() => {});
     }, 5000);
     return () => clearInterval(id);
-  }, [live, setAssets, setMesh]);
+  }, [live, phase, setAssets, setMesh]);
 
   // Ice rebuilds whenever the selected date changes. The whole measurement set is one
   // fetch, cached after the first call, so changing month costs no network at all.
@@ -137,11 +167,19 @@ export default function App() {
   //
   // The assets are what an operator is looking at and the ice is context behind them, so
   // the ice yields. Subsequent changes are immediate: by then there is nothing to race.
+  //
+  // ⛔ AND IT IS NOT PRE-BUILT BEHIND THE ENTRY SCREEN, TEMPTING AS THAT IS. The ice is
+  // static and touches no database, so starting it while somebody reads that screen would be
+  // free in DATABASE terms and would hide the most expensive work in the app. It is rejected
+  // because this build HOLDS THE MAIN THREAD, and the one thing the entry screen must do is
+  // respond to a click. A button that ignores the first press is a worse trade than a layer
+  // that arrives a second late.
   const [iceReady, setIceReady] = useState(false);
   useEffect(() => {
+    if (phase !== "live") return;
     const t = setTimeout(() => setIceReady(true), 600);
     return () => clearTimeout(t);
-  }, []);
+  }, [phase]);
 
   useEffect(() => {
     if (!iceReady) return;
@@ -243,6 +281,32 @@ export default function App() {
     <div className={`app${auditOpen ? " auditopen" : ""}`}>
       <GlobeMap />
 
+      {/*
+        🔒 DRAWN OVER THE SHELL, NOT INSTEAD OF IT. Returning a different tree here would
+        unmount the globe, so coming back would rebuild a basemap that is already in memory
+        and turn a return into a second cold start for no benefit. What costs money is the
+        polling, and `phase` has already stopped that.
+
+        ⚠️ ON A FIRST LOAD THERE IS NOTHING UNDERNEATH ANYWAY, because no fetch has run yet,
+        so this covers an empty map and the visitor sees only the screen.
+      */}
+      {phase === "entry" && <EnterScreen about={ABOUT} />}
+
+      {/*
+        🔒 THE CHROME DOES NOT MOUNT UNTIL SOMEBODY HAS ENTERED, and that is stricter than
+        hiding it. A mounted component runs its effects, and a browser test caught exactly
+        that: the asset banner fetches its field schema on mount, so an unentered console was
+        already talking to the server. That one is harmless in itself, since the endpoint
+        touches no database, but "harmless in itself" is how the polling got there too. Not
+        mounting is a rule that holds for components nobody has written yet.
+
+        ⚠️ THE MAP STAYS UP, DELIBERATELY, and is the one thing outside this gate. It holds a
+        WebGL context and a basemap already in memory, so tearing it down would make every
+        return rebuild it. It fetches nothing on its own; it draws what the store has.
+      */}
+      {phase === "live" && (
+        <>
+
       <header className="strip">
         <span className="brand">ARCTIC COVERAGE</span>
         <span className="sep" />
@@ -340,7 +404,13 @@ export default function App() {
       </IceTimebar>
 
       <footer className="strip bottom">
-        {loading && <span>loading…</span>}
+        {/*
+          ⚠️ TWO DIFFERENT WAITS, SAID DIFFERENTLY. `loading` is the ordinary first read.
+          `waiting` means it has already run past what a warm read costs, which on this
+          deployment almost always means the database is coming back up, and a visitor who is
+          told that reads the pause as thrift rather than as a hang.
+        */}
+        {waiting ? <span>waking the database…</span> : loading && <span>loading…</span>}
         {error && <span className="err">{error}</span>}
 
         {assets.length > 0 && (
@@ -425,6 +495,8 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
     </div>
   );

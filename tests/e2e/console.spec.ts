@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { collectPageProblems, waitForAppLoaded } from "./helpers";
+import { collectPageProblems, openConsole, waitForAppLoaded } from "./helpers";
 
 /**
  * The cheapest high-value test in the repo.
@@ -16,7 +16,7 @@ import { collectPageProblems, waitForAppLoaded } from "./helpers";
 test("the page loads with no console errors and no failed requests", async ({ page }) => {
   const problems = collectPageProblems(page);
 
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
 
   // Give MapLibre a beat past first paint: style validation errors surface during
@@ -62,7 +62,7 @@ test("the basemap and the world both load, and nothing is fetched off-origin", a
   );
 
   pageOrigin = new URL(test.info().project.use.baseURL!).origin;
-  await page.goto("/");
+  await openConsole(page, "/");
   await gotBasemap;
   const entities = await (await gotEntities).json();
   const ice = await (await gotIce).json();
@@ -108,7 +108,7 @@ test("the basemap and the world both load, and nothing is fetched off-origin", a
 test("the console has no serious or critical accessibility violations", async ({ page }) => {
   const { default: AxeBuilder } = await import("@axe-core/playwright");
 
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
 
   const results = await new AxeBuilder({ page })
@@ -133,4 +133,38 @@ test("the console has no serious or critical accessibility violations", async ({
     .join("\n\n");
 
   expect(blocking, `accessibility violations:\n\n${detail}`).toHaveLength(0);
+});
+
+/**
+ * 🔴 THE ENTRY SCREEN IS NOW THE ONLY WAY IN, so it gets its own test rather than being
+ * exercised only as a click on the way to something else.
+ *
+ * What it pins is the thing the feature exists for: **nothing queries the database until a
+ * visitor asks.** That is what lets the compute suspend, and suspending is what stops the
+ * monthly allowance running out. A regression here is invisible on screen and shows up weeks
+ * later as a bill, which is exactly the kind of thing a test has to hold.
+ */
+test("the entry screen asks nothing of the database until Enter is pressed", async ({ page }) => {
+  // Every request the page makes, in order, so the assertion can be about absence.
+  const api: string[] = [];
+  page.on("request", (r) => {
+    const u = new URL(r.url());
+    if (u.pathname.startsWith("/api/")) api.push(u.pathname);
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Enter" }).waitFor({ state: "visible" });
+  // A beat, so a poll that was going to fire has had time to fire and be caught.
+  await page.waitForTimeout(1500);
+
+  // ⚠️ THE WAKE IS EXPECTED AND IS THE POINT. `healthz` runs a real query deliberately: it is
+  // what starts the compute coming up while the visitor reads the screen. What must NOT be
+  // here is the console's own data, because that is the request whose latency a person would
+  // actually be sitting through.
+  expect(api.filter((p) => p !== "/api/healthz"), "no console data before Enter").toEqual([]);
+
+  await page.getByRole("button", { name: "Enter" }).click();
+  await waitForAppLoaded(page);
+
+  expect(api, "entities are fetched once Enter is pressed").toContain("/api/entities");
 });

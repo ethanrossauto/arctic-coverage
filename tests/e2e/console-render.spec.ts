@@ -2,7 +2,7 @@ import { PNG } from "pngjs";
 
 import { expect, test, type Page } from "@playwright/test";
 
-import { landPixelFraction, waitForAppLoaded, waitForIceLoaded } from "./helpers";
+import { landPixelFraction, openConsole, waitForAppLoaded, waitForIceLoaded } from "./helpers";
 
 /**
  * Read the map canvas, cropped to the part of it that is actually map.
@@ -143,7 +143,7 @@ test("the map paints real geometry, not a flat background", async ({ page }) => 
    * Asserted on the LAND FILL COLOUR specifically, because that colour cannot
    * appear unless the source loaded, the worker parsed it and the GPU drew it.
    */
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
   // A healthy polar view is roughly a quarter land. A broken one is zero.
   await expect
@@ -152,7 +152,7 @@ test("the map paints real geometry, not a flat background", async ({ page }) => 
 });
 
 test("server data reaches the UI", async ({ page }) => {
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
 
   // Every count an operator reads at a glance, all of them server data that had to survive
@@ -231,7 +231,7 @@ test("the ice timebar scrubs to a different measurement and the map follows", as
   // budget, not the claim.
   test.setTimeout(150_000);
 
-  await page.goto("/?live=off");
+  await openConsole(page, "/?live=off");
   await waitForAppLoaded(page);
   await waitForMapPainted(page);
 
@@ -294,7 +294,7 @@ test("the timebar only ever offers dates that were actually measured", async ({ 
    * index. A list can be checked on its actual VALUES: every option is compared against
    * the vendored date set, so an invented date would have to appear in both places.
    */
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForIceLoaded(page);
 
   const gotIce = await page.evaluate(async () => {
@@ -328,7 +328,7 @@ test("the projection toggle switches between globe and mercator without erroring
    * base scope. `setProjection` is also the one MapLibre call in this app that
    * silently does nothing if made at the wrong moment.
    */
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
 
   const toggle = page.getByRole("button", { name: /GLOBE|MERCATOR/ });
@@ -361,7 +361,7 @@ test("a pole-centred globe view reports every longitude", async ({ page }) => {
   // command layer is the stronger test anyway: it exercises the thing the readout was only
   // ever evidence FOR, which is that a pole-centred camera reporting every longitude
   // survives all the way into a filter rather than being treated as a bad box.
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
   await waitForMapPainted(page);
 
@@ -423,7 +423,7 @@ test("all nine asset kinds load and reach the map", async ({ page }) => {
   const gotAssets = page.waitForResponse(
     (r) => r.url().includes("/api/entities") && r.status() === 200,
   );
-  await page.goto("/");
+  await openConsole(page, "/");
   const body = await (await gotAssets).json();
 
   const seeded = body.entities.filter((a: { created_by: string }) => a.created_by === "seed");
@@ -473,7 +473,7 @@ test("the non-broadcasting contacts are surfaced, and one is held by nothing", a
   const gotAssets = page.waitForResponse(
     (r) => r.url().includes("/api/entities") && r.status() === 200,
   );
-  await page.goto("/");
+  await openConsole(page, "/");
   const body = await (await gotAssets).json();
 
   const dark = body.entities.filter(
@@ -541,7 +541,7 @@ test("overdue assets are counted, and it is neither none nor all of them", async
    * where nothing is overdue makes the feature undemonstrable; one where everything
    * is overdue makes it meaningless. This asserts the designed middle.
    */
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
   const footer = page.locator(".strip.bottom");
   await expect(footer).toContainText(/overdue \d+/);
@@ -571,7 +571,7 @@ test("asset names are drawn on the map, and nothing is fetched to draw them", as
   const requested: string[] = [];
   page.on("request", (r) => requested.push(r.url()));
 
-  await page.goto("/");
+  await openConsole(page, "/");
   await waitForAppLoaded(page);
   await page.waitForTimeout(3000);
 
@@ -624,7 +624,7 @@ test("the mesh link lines are drawn without anyone asking, and cannot be switche
   // subject. Passing would be a lie and a bare pixel-count failure would send the next
   // person hunting through the toggle. Same rule the CI groups follow: a check that
   // cannot run says so, loudly, and never reads as a clean bill.
-  await page.goto("/?live=off");
+  await openConsole(page, "/?live=off");
   await waitForAppLoaded(page);
   const drawable = await page.evaluate(async () => {
     const [ents, mesh] = await Promise.all([
@@ -683,7 +683,11 @@ test("the mesh link lines are drawn without anyone asking, and cannot be switche
       body: JSON.stringify({ links: [], groups: [], isolated: [], mesh_capable: 0 }),
     }),
   );
+  // ⚠️ A RELOAD LANDS ON THE ENTRY SCREEN, exactly as a fresh visit does, so it has to be
+  // entered again. `openConsole` cannot cover this one: the route mock above is what the
+  // reload exists to apply, and navigating instead of reloading would drop it.
   await page.reload();
+  await page.getByRole("button", { name: "Enter" }).click();
   await waitForAppLoaded(page);
   await waitForMapPainted(page);
   await page.waitForTimeout(3000);
@@ -720,7 +724,7 @@ test("no line is drawn until a command asks for one, and it clears on the next",
    * lane's test to write, and mocking here means this one keeps working while their
    * history module is still landing.
    */
-  await page.goto("/?live=off");
+  await openConsole(page, "/?live=off");
   await waitForAppLoaded(page);
   await waitForMapPainted(page);
 
@@ -811,7 +815,7 @@ test("the radar layer is present, unowned, and never counted as overdue", async 
   const gotAssets = page.waitForResponse(
     (r) => r.url().includes("/api/entities") && r.status() === 200,
   );
-  await page.goto("/");
+  await openConsole(page, "/");
   const body = await (await gotAssets).json();
 
   const radars = body.entities.filter((a: { kind: string }) => a.kind === "radar");
@@ -834,7 +838,7 @@ test("clicking an asset opens its details, and clicking empty map closes them", 
    * Asserted through the API rather than against a hardcoded name, because the seeded world
    * changes and a test that names an asset dies with the next reseed.
    */
-  await page.goto("/?live=off");
+  await openConsole(page, "/?live=off");
   await waitForAppLoaded(page);
   await waitForMapPainted(page);
 
@@ -888,7 +892,7 @@ test("an ambiguous command offers the candidates instead of guessing", async ({ 
    * run, so the server says so honestly, and the UI must branch on `clarify` BEFORE `ok` or
    * the operator gets a red failure line sitting above a row of buttons.
    */
-  await page.goto("/?live=off");
+  await openConsole(page, "/?live=off");
   await waitForAppLoaded(page);
 
   const posted: Record<string, unknown>[] = [];
@@ -965,7 +969,7 @@ test("a follow-up carries the previous answer, so \"them\" means something", asy
    * client carries the previous answer's ids at all. Newest LAST, because the server binds
    * to the final entry and the order is part of the contract.
    */
-  await page.goto("/?live=off");
+  await openConsole(page, "/?live=off");
   await waitForAppLoaded(page);
 
   const posted: Record<string, unknown>[] = [];

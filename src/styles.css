@@ -867,3 +867,62 @@ b.alert { color: var(--err); }
   background: #0b141c; color: var(--text);
   border: 1px solid var(--accent); padding: 1px 4px; width: 100%;
 }
+
+/* ── the entry screen ──────────────────────────────────────────────────────────────
+ *
+ * 🔑 IT DELIBERATELY MATCHES THE BOOT CURTAIN in `index.html`, because on a first load the
+ * two are consecutive and any difference in colour or letter-spacing reads as a flicker
+ * between two different pages rather than one screen settling. The values are duplicated
+ * rather than shared: that curtain has to be styled before this stylesheet is fetched, so
+ * it cannot import anything, and a fifty-line inline copy is the price of it painting
+ * immediately. Change one, look at the other.
+ *
+ * ⚠️ IT SITS ABOVE THE MAP, not instead of it. The shell stays mounted underneath so a
+ * return does not rebuild the globe, which means this has to actually cover it and has to
+ * swallow clicks, or the visitor would be dragging a world they have not entered. */
+.enter {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0b0e14;
+  color: #e6edf3;
+}
+.enter__inner {
+  text-align: center;
+  width: 340px;
+  max-width: calc(100vw - 48px);
+}
+.enter__mark {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+}
+.enter__about {
+  margin: 14px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #8b98a9;
+}
+.enter__go {
+  margin-top: 22px;
+  padding: 9px 34px;
+  font: inherit;
+  font-size: 14px;
+  letter-spacing: 0.1em;
+  color: #0b0e14;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+}
+.enter__go:hover { filter: brightness(1.12); }
+.enter__go:focus-visible { outline: 2px solid #e6edf3; outline-offset: 3px; }
+/* Small, because it explains a delay that most visitors will never notice. */
+.enter__note {
+  margin: 16px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #5d6877;
+}

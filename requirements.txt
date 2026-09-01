@@ -19,4 +19,4 @@
 fastapi==0.141.1
 psycopg[binary]==3.3.4
 anthropic==0.120.2
-google-genai==2.17.0
+google-genai==2.20.0

@@ -17,6 +17,6 @@
 # absent from both manifests for the whole life of the reasoning layer, so tier 2 could
 # never have answered anything, anywhere, and reported itself merely "unavailable".
 fastapi==0.141.1
-psycopg[binary]==3.3.4
+psycopg[binary]==3.3.6
 anthropic==0.120.2
-google-genai==2.17.0
+google-genai==2.25.0
